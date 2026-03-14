@@ -1,16 +1,18 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Token Atlas</title>
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
+
 <body>
   <section id="login-screen" class="screen login-screen">
     <div class="login-card">
       <h1>Token Atlas</h1>
-      <p>输入访问密码后进入系统，也支持通过 URL 参数 `?key=...` 自动尝试登录。</p>
+      <p>输入访问密码后进入系统，也支持通过 URL 参数 <code>?key=...</code> 自动尝试登录。</p>
       <label class="field">
         <span>访问密码</span>
         <input id="password-input" type="password" placeholder="请输入 TOKEN_INDEX_ACCESS_KEY">
@@ -47,11 +49,12 @@
             <select id="sort-select">
               <option value="name-asc">名称升序</option>
               <option value="name-desc">名称降序</option>
-              <option value="mtime-desc">最新修改</option>
+              <option value="mtime-desc">最近修改</option>
               <option value="mtime-asc">最早修改</option>
             </select>
           </label>
           <div class="toolbar-actions">
+            <button id="download-zip-btn" class="btn btn-primary" type="button">打包全部Json账号并下载ZIP文件</button>
             <button id="refresh-btn" class="btn" type="button">刷新</button>
           </div>
         </div>
@@ -96,38 +99,29 @@ Content-Type: application/json
 
           <h3>3. 通过文件名获取详情</h3>
           <pre>GET /json/item?name=文件名.json</pre>
-          <pre>GET /json/item?name=文件名.json&key=你的访问密码</pre>
+          <pre>GET /json/item?name=文件名.json&amp;key=你的访问密码</pre>
 
-          <h3>4. 通过 ID 获取详情</h3>
-          <pre>GET /json/item?id=文件名去掉 .json 后的值</pre>
-          <pre>GET /json/item?id=文件名去掉 .json 后的值&key=你的访问密码</pre>
+          <h3>4. 打包下载当前结果</h3>
+          <pre>POST /json/archive
+Content-Type: application/json
 
-          <h3>5. 通过索引序号获取详情</h3>
-          <pre>GET /json/item?index=0</pre>
-          <pre>GET /json/item?index=0&key=你的访问密码</pre>
+{"names":["a.json","b.json"]}</pre>
+          <pre>不传 names 或传空数组时，返回全部 token 文件的 ZIP。</pre>
 
-          <h3>6. 健康检查</h3>
+          <h3>5. 健康检查</h3>
           <pre>GET /health</pre>
-
-          <h3>7. 页面自动登录</h3>
-          <pre>GET /?key=你的访问密码</pre>
 
           <h3>调用示例</h3>
           <pre>curl -X POST http://127.0.0.1:8000/auth/login -H "Content-Type: application/json" -d "{\"password\":\"your-access-key\"}"</pre>
-          <pre>curl "http://127.0.0.1:8000/auth/login?key=your-access-key" -X POST</pre>
           <pre>curl http://127.0.0.1:8000/json -H "X-Access-Key: your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json?key=your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json/item?index=0" -H "X-Access-Key: your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json/item?index=0&key=your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2&key=your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json&key=your-access-key"</pre>
+          <pre>curl -X POST http://127.0.0.1:8000/json/archive -H "X-Access-Key: your-access-key" -H "Content-Type: application/json" -d "{\"names\":[\"demo.json\"]}" --output token.zip</pre>
         </div>
       </section>
     </main>
   </section>
 
   <footer class="site-footer">
-    <span>© 2026 Token Atlas</span>
+    <span>&copy; 2026 Token Atlas</span>
     <a href="https://github.com/isxlan0/Token-JSON-Provider" target="_blank" rel="noreferrer">GitHub 仓库</a>
   </footer>
 
@@ -140,4 +134,5 @@ Content-Type: application/json
 
   <script src="/assets/app.js" defer></script>
 </body>
+
 </html>

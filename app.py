@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
+import io
 import os
 import threading
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, Header, Query, Response, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -137,6 +140,10 @@ class LoginPayload(BaseModel):
     password: str
 
 
+class ArchivePayload(BaseModel):
+    names: list[str] | None = None
+
+
 class TokenIndexStore:
     def __init__(self, token_dir: Path) -> None:
         self.token_dir = token_dir
@@ -192,6 +199,14 @@ class TokenIndexStore:
                 return self._items[index]
 
             return None
+
+    def list_documents(self, names: list[str] | None = None) -> list[TokenDocument]:
+        with self._lock:
+            if not names:
+                return list(self._items)
+
+            wanted = set(names)
+            return [item for item in self._items if item.name in wanted]
 
     def _load_document(self, path: Path, index: int) -> TokenDocument | None:
         try:
@@ -259,17 +274,10 @@ def verify_access_key(access_key: str | None = Depends(extract_access_key)) -> N
 
 store = TokenIndexStore(TOKEN_DIR)
 observer: Observer | None = None
-app = FastAPI(title="Token Atlas", version="1.0.0")
-app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 
-@app.exception_handler(PermissionError)
-def permission_error_handler(_: Any, __: PermissionError) -> Response:
-    return Response(status_code=status.HTTP_401_UNAUTHORIZED)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     global observer
 
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,17 +288,24 @@ def on_startup() -> None:
     observer.schedule(event_handler, str(TOKEN_DIR), recursive=False)
     observer.start()
 
+    try:
+        yield
+    finally:
+        if observer is None:
+            return
 
-@app.on_event("shutdown")
-def on_shutdown() -> None:
-    global observer
+        observer.stop()
+        observer.join(timeout=5)
+        observer = None
 
-    if observer is None:
-        return
 
-    observer.stop()
-    observer.join(timeout=5)
-    observer = None
+app = FastAPI(title="Token Atlas", version="1.0.0", lifespan=lifespan)
+app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+
+@app.exception_handler(PermissionError)
+def permission_error_handler(_: Any, __: PermissionError) -> Response:
+    return Response(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
 @app.get("/", response_class=FileResponse)
@@ -355,6 +370,32 @@ def get_health() -> dict[str, Any]:
         "token_count": snapshot["count"],
         "updated_at": snapshot["updated_at"],
     }
+
+
+@app.post("/json/archive", dependencies=[Depends(verify_access_key)])
+def download_archive(payload: ArchivePayload | None = Body(default=None)) -> StreamingResponse:
+    documents = store.list_documents(payload.names if payload else None)
+
+    if not documents:
+        error_json = json.dumps({"detail": "No token files available for archive."}).encode("utf-8")
+        return Response(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=error_json,
+            media_type="application/json",
+        )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in documents:
+            file_path = TOKEN_DIR / item.name
+            if not file_path.exists():
+                continue
+            archive.writestr(item.name, file_path.read_bytes())
+
+    buffer.seek(0)
+    filename = f"token-atlas-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
 
 
 if __name__ == "__main__":

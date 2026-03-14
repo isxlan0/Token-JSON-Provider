@@ -80,12 +80,26 @@ body {
   border-radius: 8px;
   background: #fff;
   cursor: pointer;
+  transition: background-color 0.2s ease, border-color 0.2s ease, opacity 0.2s ease;
+}
+
+.btn:hover {
+  background: #f9fafb;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .btn-primary {
   background: #2563eb;
   border-color: #2563eb;
   color: #fff;
+}
+
+.btn-primary:hover {
+  background: #1d4ed8;
 }
 
 .message {
@@ -149,6 +163,13 @@ body {
 
 .toolbar {
   margin-bottom: 12px;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-left: auto;
 }
 
 .grow {
@@ -252,6 +273,15 @@ pre {
   .topbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .toolbar-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .toolbar-actions .btn {
+    flex: 1;
   }
 
   .data-layout {
