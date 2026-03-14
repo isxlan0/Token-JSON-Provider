@@ -245,10 +245,15 @@ def get_expected_access_key() -> str:
     return os.getenv(ACCESS_KEY_ENV, DEFAULT_ACCESS_KEY)
 
 
-def verify_access_key(
+def extract_access_key(
     x_access_key: str | None = Header(default=None, alias=ACCESS_KEY_HEADER),
-) -> None:
-    if x_access_key != get_expected_access_key():
+    key: str | None = Query(default=None),
+) -> str | None:
+    return x_access_key or key
+
+
+def verify_access_key(access_key: str | None = Depends(extract_access_key)) -> None:
+    if access_key != get_expected_access_key():
         raise PermissionError
 
 
@@ -294,8 +299,12 @@ def get_home() -> FileResponse:
 
 
 @app.post("/auth/login")
-def login(payload: LoginPayload = Body(...)) -> Response:
-    if payload.password != get_expected_access_key():
+def login(
+    payload: LoginPayload | None = Body(default=None),
+    key: str | None = Query(default=None),
+) -> Response:
+    access_key = key or (payload.password if payload else None)
+    if access_key != get_expected_access_key():
         raise PermissionError
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)

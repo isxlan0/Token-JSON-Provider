@@ -105,6 +105,7 @@ function applyFilters() {
     if (sortMode === "name-asc") {
       return left.name.localeCompare(right.name);
     }
+
     if (sortMode === "name-desc") {
       return right.name.localeCompare(left.name);
     }
@@ -188,19 +189,18 @@ function logout(message = "已退出登录") {
 }
 
 async function login() {
-  const password = elements.passwordInput.value.trim();
+  await loginWithKey(elements.passwordInput.value.trim());
+}
+
+async function loginWithKey(password) {
   if (!password) {
     setLoginMessage("请输入访问密码");
     return;
   }
 
   try {
-    const response = await fetch("/auth/login", {
+    const response = await fetch(`/auth/login?key=${encodeURIComponent(password)}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ password }),
     });
 
     if (response.status !== 204) {
@@ -281,6 +281,13 @@ function init() {
   clearData();
   showLoggedIn(false);
   switchTab("data");
+
+  const autoKey = new URLSearchParams(window.location.search).get("key");
+  if (autoKey) {
+    elements.passwordInput.value = autoKey;
+    setLoginMessage("检测到 key 参数，正在自动登录...");
+    loginWithKey(autoKey);
+  }
 }
 
 init();

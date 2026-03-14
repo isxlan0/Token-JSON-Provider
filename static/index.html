@@ -10,7 +10,7 @@
   <section id="login-screen" class="screen login-screen">
     <div class="login-card">
       <h1>Token Atlas</h1>
-      <p>输入访问密码后进入系统。</p>
+      <p>输入访问密码后进入系统，也支持通过 URL 参数 `?key=...` 自动尝试登录。</p>
       <label class="field">
         <span>访问密码</span>
         <input id="password-input" type="password" placeholder="请输入 TOKEN_INDEX_ACCESS_KEY">
@@ -79,36 +79,48 @@
       <section id="view-docs" class="tab-view">
         <div class="panel docs-panel">
           <h2>接口文档</h2>
-          <p>受保护接口都需要请求头：</p>
+          <p>受保护接口支持两种鉴权方式，任选其一：</p>
           <pre>X-Access-Key: 你的访问密码</pre>
+          <pre>?key=你的访问密码</pre>
 
           <h3>1. 登录校验</h3>
           <pre>POST /auth/login
 Content-Type: application/json
 
 {"password":"你的访问密码"}</pre>
+          <pre>POST /auth/login?key=你的访问密码</pre>
 
           <h3>2. 获取全部索引</h3>
           <pre>GET /json</pre>
+          <pre>GET /json?key=你的访问密码</pre>
 
           <h3>3. 通过文件名获取详情</h3>
           <pre>GET /json/item?name=文件名.json</pre>
+          <pre>GET /json/item?name=文件名.json&key=你的访问密码</pre>
 
           <h3>4. 通过 ID 获取详情</h3>
           <pre>GET /json/item?id=文件名去掉 .json 后的值</pre>
+          <pre>GET /json/item?id=文件名去掉 .json 后的值&key=你的访问密码</pre>
 
           <h3>5. 通过索引序号获取详情</h3>
           <pre>GET /json/item?index=0</pre>
+          <pre>GET /json/item?index=0&key=你的访问密码</pre>
 
           <h3>6. 健康检查</h3>
           <pre>GET /health</pre>
 
+          <h3>7. 页面自动登录</h3>
+          <pre>GET /?key=你的访问密码</pre>
+
           <h3>调用示例</h3>
           <pre>curl -X POST http://127.0.0.1:8000/auth/login -H "Content-Type: application/json" -d "{\"password\":\"your-access-key\"}"</pre>
+          <pre>curl "http://127.0.0.1:8000/auth/login?key=your-access-key" -X POST</pre>
           <pre>curl http://127.0.0.1:8000/json -H "X-Access-Key: your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json?key=your-access-key"</pre>
           <pre>curl "http://127.0.0.1:8000/json/item?index=0" -H "X-Access-Key: your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2" -H "X-Access-Key: your-access-key"</pre>
-          <pre>curl "http://127.0.0.1:8000/json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json" -H "X-Access-Key: your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json/item?index=0&key=your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2&key=your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json&key=your-access-key"</pre>
         </div>
       </section>
     </main>

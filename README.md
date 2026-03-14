@@ -7,7 +7,8 @@
 - 监听 `token/` 目录的新增、修改、删除
 - 自动生成索引，返回 `index`、`id`、`name`、`path`、`size`、`mtime`、`encoding`、`keys`
 - 支持通过 `name`、`id`、`index` 获取完整 JSON 内容
-- 前端使用最简登录界面，密码正确后才显示数据
+- 受保护接口支持 `X-Access-Key` 请求头或 `key` 查询参数
+- 前端支持输入密码登录，也支持 `/?key=your-access-key` 自动登录
 - 前端内置“文档”标签页，列出全部调用方式
 - 访问密码错误或缺失时，接口返回 `401`，不返回任何数据体
 - 提供交互式 `client_demo.py`，可按数字菜单调用接口
@@ -105,13 +106,12 @@ python .\client_demo.py
 ## 前端使用说明
 
 1. 打开首页 `/`
-2. 输入访问密码
-3. 点击“登录”
-4. 登录成功后进入单独的应用界面
-5. 顶部 `数据` / `文档` 标签可切换页面
-6. 在 `数据` 页中查看索引和 JSON 详情
-7. 在 `文档` 页中查看全部接口和调用示例
-8. 如果密码错误或失效，前端会自动清空数据并退回未登录状态
+2. 输入访问密码，或直接访问 `/?key=your-access-key`
+3. 登录成功后进入单独的应用界面
+4. 顶部 `数据` / `文档` 标签可切换页面
+5. 在 `数据` 页中查看索引和 JSON 详情
+6. 在 `文档` 页中查看全部接口和调用示例
+7. 如果密码错误或失效，前端会自动清空数据并退回未登录状态
 
 ## 接口说明
 
@@ -130,6 +130,12 @@ Content-Type: application/json
 }
 ```
 
+也支持直接使用查询参数：
+
+```http
+POST /auth/login?key=your-access-key
+```
+
 返回：
 
 - 成功：`204 No Content`
@@ -137,16 +143,28 @@ Content-Type: application/json
 
 ### 2. 获取全部索引
 
-请求头：
+鉴权方式一：
 
 ```text
 X-Access-Key: your-access-key
+```
+
+鉴权方式二：
+
+```text
+key=your-access-key
 ```
 
 接口：
 
 ```http
 GET /json
+```
+
+或：
+
+```http
+GET /json?key=your-access-key
 ```
 
 返回示例：
@@ -176,10 +194,18 @@ GET /json
 GET /json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json
 ```
 
+```http
+GET /json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json&key=your-access-key
+```
+
 ### 4. 通过 ID 获取详情
 
 ```http
 GET /json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2
+```
+
+```http
+GET /json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2&key=your-access-key
 ```
 
 ### 5. 通过索引序号获取详情
@@ -188,10 +214,20 @@ GET /json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2
 GET /json/item?index=0
 ```
 
+```http
+GET /json/item?index=0&key=your-access-key
+```
+
 ### 6. 健康检查
 
 ```http
 GET /health
+```
+
+### 7. 页面自动登录
+
+```text
+http://127.0.0.1:8000/?key=your-access-key
 ```
 
 ## curl 调用示例
@@ -202,10 +238,18 @@ GET /health
 curl -X POST http://127.0.0.1:8000/auth/login -H "Content-Type: application/json" -d "{\"password\":\"your-access-key\"}"
 ```
 
+```powershell
+curl "http://127.0.0.1:8000/auth/login?key=your-access-key" -X POST
+```
+
 ### 获取索引
 
 ```powershell
 curl http://127.0.0.1:8000/json -H "X-Access-Key: your-access-key"
+```
+
+```powershell
+curl "http://127.0.0.1:8000/json?key=your-access-key"
 ```
 
 ### 通过 index 获取详情
@@ -214,16 +258,28 @@ curl http://127.0.0.1:8000/json -H "X-Access-Key: your-access-key"
 curl "http://127.0.0.1:8000/json/item?index=0" -H "X-Access-Key: your-access-key"
 ```
 
+```powershell
+curl "http://127.0.0.1:8000/json/item?index=0&key=your-access-key"
+```
+
 ### 通过 id 获取详情
 
 ```powershell
 curl "http://127.0.0.1:8000/json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2" -H "X-Access-Key: your-access-key"
 ```
 
+```powershell
+curl "http://127.0.0.1:8000/json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2&key=your-access-key"
+```
+
 ### 通过 name 获取详情
 
 ```powershell
 curl "http://127.0.0.1:8000/json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json" -H "X-Access-Key: your-access-key"
+```
+
+```powershell
+curl "http://127.0.0.1:8000/json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json&key=your-access-key"
 ```
 
 ## 常见问题
