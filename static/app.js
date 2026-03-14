@@ -52,8 +52,6 @@ const elements = {
   claimResults: document.getElementById("claim-results"),
 };
 
-
-
 function showLoggedIn(loggedIn) {
   if (loggedIn) {
     elements.loginScreen.classList.add("hidden");
@@ -84,12 +82,12 @@ function switchTab(name) {
   const headerTitle = document.getElementById("header-title");
   if (headerTitle) {
     const map = {
-      data: "Dashboard",
-      keys: "API Key Management",
-      claim: "Claim Accounts",
-      docs: "API Docs",
+      data: "数据面板",
+      keys: "API Key 管理",
+      claim: "领取账号",
+      docs: "API 使用指南",
     };
-    headerTitle.textContent = map[name] || "Dashboard";
+    headerTitle.textContent = map[name] || "数据面板";
   }
 }
 
@@ -102,7 +100,6 @@ function setLoginMessage(message = "", tone = "error") {
     elements.loginMessage.classList.add("hidden");
   }
 }
-
 
 async function loadClaims() {
   const payload = await fetchJson("/me/claims");
@@ -119,7 +116,7 @@ async function fetchJson(url, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(payload.detail || `Request failed: ${response.status}`);
+    const error = new Error(payload.detail || `请求失败: ${response.status}`);
     error.status = response.status;
     throw error;
   }
@@ -132,7 +129,7 @@ function renderUser() {
     elements.userUsername.textContent = "-";
     elements.userId.textContent = "-";
     elements.userTrust.textContent = "-";
-    elements.authSummary.textContent = "Signed Out";
+    elements.authSummary.textContent = "未登录";
     return;
   }
   elements.userName.textContent = state.user.name || state.user.username;
@@ -179,10 +176,10 @@ function renderMyClaims() {
 
 function formatKeyStatus(status) {
   if (status === "active") {
-    return "Active";
+    return "可用";
   }
   if (status === "revoked") {
-    return "Revoked";
+    return "已删除";
   }
   return status || "-";
 }
@@ -199,11 +196,11 @@ async function copyText(text) {
 function renderApiKeys(limit) {
   elements.apiKeyList.innerHTML = "";
   const keys = (state.apiKeys || []).filter((key) => key.status === "active");
-  elements.apiKeyLimit.textContent = `Active API Keys: ${keys.length} / ${limit}`;
+  elements.apiKeyLimit.textContent = `可用 API Key：${keys.length} / ${limit}`;
   if (!keys.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No API keys yet";
+    empty.textContent = "暂无 API Key";
     elements.apiKeyList.appendChild(empty);
     return;
   }
@@ -212,16 +209,16 @@ function renderApiKeys(limit) {
     const item = document.createElement("div");
     item.className = "key-item";
     const statusLabel = formatKeyStatus(key.status);
-    const keyDisplay = key.token ? `Full Key: ${key.token}` : `Key Prefix: ${key.prefix}`;
+    const keyDisplay = key.token ? `完整 Key：${key.token}` : `Key 前缀：${key.prefix}`;
     item.innerHTML = `
       <div class="key-main">
         <div class="key-title">${key.name || "API Key"}</div>
         <div class="key-meta">${keyDisplay}</div>
-        <div class="key-meta">${statusLabel} ? ${key.created_at}</div>
+        <div class="key-meta">${statusLabel} · ${key.created_at}</div>
       </div>
       <div class="key-actions">
-        <button class="btn btn-outline btn-inline" data-key-copy="${key.id}">Copy Key</button>
-        <button class="btn btn-outline btn-inline" data-key-id="${key.id}" class="btn btn-outline btn-inline btn-danger">Revoke</button>
+        <button class="btn btn-outline btn-inline" data-key-copy="${key.id}">复制 Key</button>
+        <button class="btn btn-outline btn-inline btn-danger" data-key-id="${key.id}">删除</button>
       </div>
     `;
     const revokeBtn = item.querySelector("button[data-key-id]");
@@ -234,17 +231,15 @@ function renderApiKeys(limit) {
       }
       const ok = await copyText(key.token);
       if (ok) {
-        copyBtn.textContent = "Copied";
+        copyBtn.textContent = "已复制";
         setTimeout(() => {
-          copyBtn.textContent = "Copy Key";
+          copyBtn.textContent = "复制 Key";
         }, 1200);
       }
     });
     elements.apiKeyList.appendChild(item);
   });
 }
-
-
 
 async function removeSelectedClaims() {
   if (!state.claimResults.length || !state.claimSelected.size) {
@@ -261,10 +256,6 @@ async function removeSelectedClaims() {
   renderClaimResults();
 }
 
-
-
-
-
 function toggleClaimSelection(claimId, checked) {
   if (checked) {
     state.claimSelected.add(claimId);
@@ -279,7 +270,7 @@ function renderClaimResults() {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No claim results";
+    empty.textContent = "暂无领取记录";
     elements.claimResults.appendChild(empty);
     return;
   }
@@ -293,17 +284,16 @@ function renderClaimResults() {
     card.innerHTML = `
       <div class="claim-card-header">
         <div>
-          <div class="claim-file">#${index + 1} ? ${item.file_name}</div>
-          <div class="claim-meta">${item.file_path} ? ${item.encoding}</div>
+          <div class="claim-file">#${index + 1} · ${item.file_name}</div>
+          <div class="claim-meta">${item.file_path} · ${item.encoding}</div>
         </div>
         <div class="claim-actions">
-          <label class="claim-select">
+          <label class="claim-select" title="选择">
             <input type="checkbox" data-claim-select="${claimId}" ${checked} />
-            Select
           </label>
-          <button class="btn btn-outline btn-inline" data-claim-copy="${claimId}">Copy JSON</button>
-          <a class="btn btn-outline btn-inline" href="${item.download_url}" target="_blank" rel="noopener noreferrer">Download</a>
-          <button class="btn btn-ghost btn-inline btn-danger" data-claim-remove="${claimId}">Delete (Hidden)</button>
+          <button class="btn btn-outline btn-inline" data-claim-copy="${claimId}">复制 JSON</button>
+          <a class="btn btn-outline btn-inline" href="${item.download_url}" target="_blank" rel="noopener noreferrer">下载</a>
+          <button class="btn btn-ghost btn-inline btn-danger" data-claim-remove="${claimId}">删除（标记隐藏）</button>
         </div>
       </div>
       <pre class="token-json">${content}</pre>
@@ -314,9 +304,9 @@ function renderClaimResults() {
     copyBtn.addEventListener("click", async () => {
       const ok = await copyText(content);
       if (ok) {
-        copyBtn.textContent = "Copied";
+        copyBtn.textContent = "已复制";
         setTimeout(() => {
-          copyBtn.textContent = "Copy JSON";
+          copyBtn.textContent = "复制 JSON";
         }, 1200);
       }
     });
@@ -369,7 +359,7 @@ async function createApiKey() {
   elements.apiKeyName.value = "";
 
   const displayKey = created.token || "-";
-  elements.apiKeyCreated.textContent = `Key created: ${displayKey}`;
+  elements.apiKeyCreated.textContent = `已创建 Key：${displayKey}`;
   elements.apiKeyCreated.classList.remove("hidden");
   await loadDashboard();
 }
@@ -386,7 +376,7 @@ async function claimTokens() {
 
   const count = Number.parseInt(elements.claimCount.value, 10);
   if (!Number.isFinite(count) || count < 1) {
-    elements.claimError.textContent = "Enter a valid count.";
+    elements.claimError.textContent = "请输入有效数量。";
     elements.claimError.classList.remove("hidden");
     return;
   }
@@ -398,7 +388,7 @@ async function claimTokens() {
       body: JSON.stringify({ count }),
     });
     await loadClaims();
-    elements.claimSummary.textContent = `Claimed ${result.granted} / Requested ${result.requested}, Remaining this hour ${result.quota.remaining}`;
+    elements.claimSummary.textContent = `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
     elements.claimSummary.classList.remove("hidden");
     renderClaimResults();
     await loadDashboard();
@@ -411,7 +401,6 @@ async function claimTokens() {
 function downloadAllClaims() {
   window.open("/me/claims/archive", "_blank");
 }
-
 
 async function clearClaimResults() {
   if (!state.claimResults.length) {
@@ -430,13 +419,11 @@ async function clearClaimResults() {
   renderClaimResults();
 }
 
-
-
 async function logout() {
   try {
     await fetch("/auth/logout", { method: "POST" });
   } catch (error) {
-    console.error("Sign out failed", error);
+    console.error("退出登录失败", error);
   }
   showLoggedIn(false);
 }
@@ -481,7 +468,7 @@ function bindEvents() {
 
 async function init() {
   bindEvents();
-  elements.summaryOrigin.textContent = `Origin: ${window.location.origin}`;
+  elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
 
   try {
     const status = await fetchJson("/auth/status");
@@ -504,7 +491,7 @@ async function init() {
   const url = new URL(window.location.href);
   const authError = url.searchParams.get("auth_error");
   if (authError) {
-    setLoginMessage(`Login failed: ${authError}`, "error");
+    setLoginMessage(`登录失败：${authError}`, "error");
     url.searchParams.delete("auth_error");
     window.history.replaceState({}, document.title, `${url.pathname}${url.search}`);
   }
