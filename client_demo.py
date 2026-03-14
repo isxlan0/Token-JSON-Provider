@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -9,8 +10,10 @@ from urllib import error, parse, request
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
-ACCESS_KEY_ENV = "TOKEN_INDEX_ACCESS_KEY"
+API_KEY_ENV = "TOKEN_PROVIDER_API_KEY"
 BASE_URL_ENV = "TOKEN_PROVIDER_BASE_URL"
+SESSION_COOKIE_ENV = "TOKEN_ATLAS_SESSION"
+SESSION_COOKIE_NAME = "token_atlas_session"
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
 
@@ -63,8 +66,29 @@ def get_base_url() -> str:
     return os.getenv(BASE_URL_ENV, DEFAULT_BASE_URL).rstrip("/")
 
 
-def get_access_key() -> str:
-    return os.getenv(ACCESS_KEY_ENV, "")
+def get_api_key() -> str:
+    return os.getenv(API_KEY_ENV, "")
+
+
+def get_session_cookie() -> str:
+    return os.getenv(SESSION_COOKIE_ENV, "")
+
+
+def build_session_headers(session_cookie: str) -> dict[str, str]:
+    if not session_cookie:
+        return {}
+    return {"Cookie": f"{SESSION_COOKIE_NAME}={session_cookie}"}
+
+def build_json_headers(api_key: str, session_cookie: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    if session_cookie:
+        headers.update(build_session_headers(session_cookie))
+    return headers
+
+def build_json_params() -> dict[str, Any]:
+    return {}
 
 
 def request_json(
@@ -72,27 +96,25 @@ def request_json(
     path: str,
     *,
     base_url: str,
-    access_key: str,
+    headers: dict[str, str] | None = None,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
-    use_access_key: bool = True,
 ) -> tuple[int, Any]:
     url = f"{base_url}{path}"
     if params:
         query = parse.urlencode({k: v for k, v in params.items() if v is not None})
         url = f"{url}?{query}"
 
-    headers = {}
     payload = None
-
-    if use_access_key and access_key:
-        headers["X-Access-Key"] = access_key
+    final_headers: dict[str, str] = {"User-Agent": "Token-Atlas-Client"}
+    if headers:
+        final_headers.update(headers)
 
     if body is not None:
-        headers["Content-Type"] = "application/json"
+        final_headers["Content-Type"] = "application/json"
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
-    req = request.Request(url, data=payload, headers=headers, method=method)
+    req = request.Request(url, data=payload, headers=final_headers, method=method)
 
     try:
         with request.urlopen(req, timeout=20) as resp:
@@ -114,6 +136,29 @@ def request_json(
         return status, text
 
 
+def request_bytes(
+    method: str,
+    path: str,
+    *,
+    base_url: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes, dict[str, str]]:
+    url = f"{base_url}{path}"
+    final_headers: dict[str, str] = {"User-Agent": "Token-Atlas-Client"}
+    if headers:
+        final_headers.update(headers)
+
+    req = request.Request(url, headers=final_headers, method=method)
+
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers)
+    except error.URLError as exc:
+        return 0, str(exc.reason).encode("utf-8"), {}
+
+
 def print_result(title: str, status: int, payload: Any) -> None:
     print(f"\n[{title}] status={status}")
     if payload is None:
@@ -128,37 +173,29 @@ def print_result(title: str, status: int, payload: Any) -> None:
 
 
 def parse_actions(raw: str) -> list[int]:
-    normalized = raw.replace("，", " ").replace(",", " ").strip()
+    normalized = raw.replace(",", " ").strip()
     actions: list[int] = []
 
     for token in normalized.split():
         if token.isdigit():
-            actions.extend(int(char) for char in token)
+            actions.append(int(token))
 
     return actions
 
 
-def action_login(base_url: str, access_key: str) -> None:
-    status, payload = request_json(
-        "POST",
-        "/auth/login",
-        base_url=base_url,
-        access_key=access_key,
-        body={"password": access_key},
-        use_access_key=False,
-    )
-    print_result("登录校验", status, payload)
+def action_index(base_url: str, api_key: str, session_cookie: str) -> None:
+    headers = build_json_headers(api_key, session_cookie)
+    params = build_json_params()
+    status, payload = request_json("GET", "/json", base_url=base_url, headers=headers, params=params)
+    print_result("Index", status, payload)
 
 
-def action_index(base_url: str, access_key: str) -> None:
-    status, payload = request_json("GET", "/json", base_url=base_url, access_key=access_key)
-    print_result("全部索引", status, payload)
-
-
-def action_index_with_content(base_url: str, access_key: str) -> None:
-    status, payload = request_json("GET", "/json", base_url=base_url, access_key=access_key)
+def action_index_with_content(base_url: str, api_key: str, session_cookie: str) -> None:
+    headers = build_json_headers(api_key, session_cookie)
+    params = build_json_params()
+    status, payload = request_json("GET", "/json", base_url=base_url, headers=headers, params=params)
     if status != 200 or not isinstance(payload, dict):
-        print_result("全部索引+内容", status, payload)
+        print_result("Index + Content", status, payload)
         return
 
     items = payload.get("items", [])
@@ -168,8 +205,8 @@ def action_index_with_content(base_url: str, access_key: str) -> None:
             "GET",
             "/json/item",
             base_url=base_url,
-            access_key=access_key,
-            params={"name": item.get("name")},
+            headers=headers,
+            params={"name": item.get("name"), **params},
         )
         merged.append(
             {
@@ -179,92 +216,170 @@ def action_index_with_content(base_url: str, access_key: str) -> None:
             }
         )
 
-    print_result("全部索引+内容", 200, merged)
+    print_result("Index + Content", 200, merged)
 
 
-def action_by_id(base_url: str, access_key: str) -> None:
-    item_id = input("请输入 id: ").strip()
+def action_by_id(base_url: str, api_key: str, session_cookie: str) -> None:
+    item_id = input("Enter id: ").strip()
+    headers = build_json_headers(api_key, session_cookie)
+    params = build_json_params()
     status, payload = request_json(
         "GET",
         "/json/item",
         base_url=base_url,
-        access_key=access_key,
-        params={"id": item_id},
+        headers=headers,
+        params={"id": item_id, **params},
     )
-    print_result("按 id 获取内容", status, payload)
+    print_result("Fetch by id", status, payload)
 
 
-def action_by_index(base_url: str, access_key: str) -> None:
-    index = input("请输入 index: ").strip()
+def action_by_index(base_url: str, api_key: str, session_cookie: str) -> None:
+    index = input("Enter index: ").strip()
+    headers = build_json_headers(api_key, session_cookie)
+    params = build_json_params()
     status, payload = request_json(
         "GET",
         "/json/item",
         base_url=base_url,
-        access_key=access_key,
-        params={"index": index},
+        headers=headers,
+        params={"index": index, **params},
     )
-    print_result("按 index 获取内容", status, payload)
+    print_result("Fetch by index", status, payload)
 
 
-def action_health(base_url: str) -> None:
-    status, payload = request_json(
-        "GET",
-        "/health",
-        base_url=base_url,
-        access_key="",
-        use_access_key=False,
-    )
-    print_result("健康检测", status, payload)
-
-
-def action_by_name(base_url: str, access_key: str) -> None:
-    name = input("请输入文件名: ").strip()
+def action_by_name(base_url: str, api_key: str, session_cookie: str) -> None:
+    name = input("Enter filename: ").strip()
+    headers = build_json_headers(api_key, session_cookie)
+    params = build_json_params()
     status, payload = request_json(
         "GET",
         "/json/item",
         base_url=base_url,
-        access_key=access_key,
-        params={"name": name},
+        headers=headers,
+        params={"name": name, **params},
     )
-    print_result("按文件名获取内容", status, payload)
+    print_result("Fetch by name", status, payload)
+
+
+def action_claim(base_url: str, api_key: str) -> None:
+    count = input("How many to claim: ").strip()
+    count_value = int(count) if count.isdigit() else 1
+    headers = {"X-API-Key": api_key} if api_key else {}
+    status, payload = request_json(
+        "POST",
+        "/api/claim",
+        base_url=base_url,
+        headers=headers,
+        body={"count": count_value},
+    )
+    print_result("API Claim", status, payload)
+
+
+def action_download(base_url: str, api_key: str) -> None:
+    token_id = input("Enter token_id to download: ").strip()
+    headers = {"X-API-Key": api_key} if api_key else {}
+    status, payload = request_json(
+        "GET",
+        f"/api/download/{token_id}",
+        base_url=base_url,
+        headers=headers,
+    )
+    print_result("Download JSON", status, payload)
+
+
+def action_me(base_url: str, session_cookie: str) -> None:
+    headers = build_session_headers(session_cookie)
+    status, payload = request_json("GET", "/me", base_url=base_url, headers=headers)
+    print_result("Me", status, payload)
+
+
+def action_dashboard_stats(base_url: str, session_cookie: str) -> None:
+    headers = build_session_headers(session_cookie)
+    status, payload = request_json("GET", "/dashboard/stats", base_url=base_url, headers=headers)
+    print_result("Dashboard Stats", status, payload)
+
+
+def action_claim_session(base_url: str, session_cookie: str) -> None:
+    count = input("How many to claim (session): ").strip()
+    count_value = int(count) if count.isdigit() else 1
+    headers = build_session_headers(session_cookie)
+    status, payload = request_json(
+        "POST",
+        "/me/claim",
+        base_url=base_url,
+        headers=headers,
+        body={"count": count_value},
+    )
+    print_result("Session Claim", status, payload)
+
+
+def action_list_claims(base_url: str, session_cookie: str) -> None:
+    headers = build_session_headers(session_cookie)
+    status, payload = request_json("GET", "/me/claims", base_url=base_url, headers=headers)
+    print_result("Session Claims", status, payload)
+
+
+def action_claims_archive(base_url: str, session_cookie: str) -> None:
+    headers = build_session_headers(session_cookie)
+    status, raw, _ = request_bytes("GET", "/me/claims/archive", base_url=base_url, headers=headers)
+    if status != 200:
+        print_result("Claims Archive", status, raw.decode("utf-8", errors="replace"))
+        return
+    filename = f"claimed-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    file_path = BASE_DIR / filename
+    file_path.write_bytes(raw)
+    print(f"\n[Claims Archive] status={status}")
+    print(f"Saved to {file_path}")
 
 
 def action_set_base_url() -> str:
-    value = input(f"请输入服务地址，回车保持当前值 [{get_base_url()}]: ").strip()
+    value = input(f"Base URL [{get_base_url()}]: ").strip()
     return value.rstrip("/") if value else get_base_url()
 
 
-def action_set_access_key() -> str:
-    value = input("请输入访问密码，回车保持当前值: ").strip()
-    return value if value else get_access_key()
+def action_set_api_key() -> str:
+    value = input("API key (X-API-Key): ").strip()
+    return value if value else get_api_key()
 
 
-def print_menu(base_url: str, access_key: str) -> None:
+def action_set_session_cookie() -> str:
+    value = input("Session cookie (token_atlas_session): ").strip()
+    return value if value else get_session_cookie()
+
+
+def print_menu(base_url: str, api_key: str, session_cookie: str) -> None:
     print("\n================ Token Atlas Client Demo ================")
-    print(f"服务地址: {base_url}")
-    print(f"访问密码: {'已设置' if access_key else '未设置'}")
-    print("1. 登录校验")
-    print("2. 获取全部索引")
-    print("3. 获取全部索引 + 内容")
-    print("4. 获取指定 ID 内容")
-    print("5. 获取指定 Index 内容")
-    print("6. 健康检测")
-    print("7. 按文件名获取内容")
-    print("8. 修改服务地址")
-    print("9. 修改访问密码")
-    print("0. 退出")
-    print("可一次输入多个编号，例如: 1 2 34")
+    print(f"Base URL: {base_url}")
+    print(f"API Key: {'set' if api_key else 'empty'}")
+    print(f"Session Cookie: {'set' if session_cookie else 'empty'}")
+    print("1. List index (/json)")
+    print("2. List index + content")
+    print("3. Fetch by id")
+    print("4. Fetch by index")
+    print("5. Fetch by filename")
+    print("6. Claim accounts (/api/claim)")
+    print("7. Download claimed JSON (/api/download/{token_id})")
+    print("8. Set base URL")
+    print("9. Set API key")
+    print("10. Get /me (session)")
+    print("11. Get /dashboard/stats (session)")
+    print("12. Claim accounts (/me/claim)")
+    print("13. List /me/claims")
+    print("14. Download /me/claims/archive")
+    print("15. Set session cookie")
+    print("0. Exit")
 
 
 def main() -> None:
     base_url = get_base_url()
-    access_key = get_access_key()
+    api_key = get_api_key()
+    session_cookie = get_session_cookie()
 
     while True:
-        print_menu(base_url, access_key)
-        actions = parse_actions(input("请输入操作编号: "))
+        print_menu(base_url, api_key, session_cookie)
+        actions = parse_actions(input("Select actions: "))
         if not actions:
-            print("未识别到有效操作。")
+            print("No valid actions.")
             continue
 
         should_exit = False
@@ -273,30 +388,40 @@ def main() -> None:
                 should_exit = True
                 break
             if action == 1:
-                action_login(base_url, access_key)
+                action_index(base_url, api_key, session_cookie)
             elif action == 2:
-                action_index(base_url, access_key)
+                action_index_with_content(base_url, api_key, session_cookie)
             elif action == 3:
-                action_index_with_content(base_url, access_key)
+                action_by_id(base_url, api_key, session_cookie)
             elif action == 4:
-                action_by_id(base_url, access_key)
+                action_by_index(base_url, api_key, session_cookie)
             elif action == 5:
-                action_by_index(base_url, access_key)
+                action_by_name(base_url, api_key, session_cookie)
             elif action == 6:
-                action_health(base_url)
+                action_claim(base_url, api_key)
             elif action == 7:
-                action_by_name(base_url, access_key)
+                action_download(base_url, api_key)
             elif action == 8:
                 base_url = action_set_base_url()
-                print(f"已切换服务地址: {base_url}")
             elif action == 9:
-                access_key = action_set_access_key()
-                print(f"访问密码状态: {'已设置' if access_key else '未设置'}")
+                api_key = action_set_api_key()
+            elif action == 10:
+                action_me(base_url, session_cookie)
+            elif action == 11:
+                action_dashboard_stats(base_url, session_cookie)
+            elif action == 12:
+                action_claim_session(base_url, session_cookie)
+            elif action == 13:
+                action_list_claims(base_url, session_cookie)
+            elif action == 14:
+                action_claims_archive(base_url, session_cookie)
+            elif action == 15:
+                session_cookie = action_set_session_cookie()
             else:
-                print(f"不支持的操作: {action}")
+                print(f"Unsupported action: {action}")
 
         if should_exit:
-            print("已退出。")
+            print("Bye.")
             return
 
 

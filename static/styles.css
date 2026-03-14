@@ -764,3 +764,141 @@ body {
   .toolbar-actions { width: 100%; }
   .toolbar-actions .btn { flex: 1; }
 }
+
+/* ??????? */
+.stat-meta {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.panel-title {
+  font-weight: 700;
+  color: var(--text-main);
+  font-size: 0.95rem;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.panel-body {
+  padding: 1.25rem 1.5rem 1.5rem;
+  background-color: var(--bg-main);
+}
+
+.hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+
+.key-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.key-item {
+  background-color: white;
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-md);
+  padding: 0.75rem 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.key-title {
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.key-meta {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.empty-state {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  padding: 0.5rem 0;
+}
+
+.callout {
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-md);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  background-color: white;
+  color: var(--text-main);
+}
+
+.callout.info {
+  border-color: #bae6fd;
+  background-color: #eff6ff;
+}
+
+.callout.danger {
+  border-color: #fecaca;
+  background-color: #fef2f2;
+  color: var(--danger);
+}
+
+.claim-controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.claim-results {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.claim-card {
+  background-color: white;
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.claim-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.claim-file {
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.claim-meta {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.token-json {
+  background-color: #0f172a;
+  color: #e2e8f0;
+  padding: 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  overflow-x: auto;
+  max-height: 260px;
+}
+
+
+.claim-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
