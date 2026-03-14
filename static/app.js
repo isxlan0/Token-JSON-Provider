@@ -6,7 +6,6 @@ const state = {
   filteredItems: [],
   selectedName: null,
   lastUpdated: null,
-  downloading: false,
 };
 
 const elements = {
@@ -34,28 +33,22 @@ const elements = {
   template: document.getElementById("index-item-template"),
 };
 
-function getHeaders(includeJson = false) {
-  const headers = {
+function getHeaders() {
+  return {
     [ACCESS_KEY_HEADER]: state.accessKey,
   };
-
-  if (includeJson) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  return headers;
 }
 
 function setLoginMessage(message) {
   elements.loginMessage.textContent = message;
 }
 
-function updateDownloadButton() {
-  const count = state.items.length;
-  elements.downloadZipBtn.disabled = state.downloading || !state.accessKey || count === 0;
-  elements.downloadZipBtn.textContent = state.downloading
-    ? "正在打包..."
-    : "打包全部Json账号并下载ZIP文件";
+function setAuthPlaceholders(key) {
+  const placeholders = document.querySelectorAll(".auth-placeholder");
+  const displayKey = key || "你的密码";
+  placeholders.forEach((el) => {
+    el.textContent = displayKey;
+  });
 }
 
 function clearData() {
@@ -63,7 +56,6 @@ function clearData() {
   state.filteredItems = [];
   state.selectedName = null;
   state.lastUpdated = null;
-  state.downloading = false;
   elements.indexList.innerHTML = "";
   elements.summaryCount.textContent = "0 个文件";
   elements.summaryUpdated.textContent = "最近同步: -";
@@ -71,13 +63,14 @@ function clearData() {
   elements.detailRoute.textContent = "/json/item";
   elements.detailMeta.textContent = "未选择文件";
   elements.detailContent.textContent = "登录后选择文件查看完整 JSON。";
-  updateDownloadButton();
+  setAuthPlaceholders("");
 }
 
 function showLoggedIn(loggedIn) {
   if (loggedIn) {
     elements.loginScreen.classList.add("hidden");
     elements.appScreen.classList.remove("hidden");
+    setAuthPlaceholders(state.accessKey);
     return;
   }
 
@@ -139,16 +132,9 @@ function applyFilters() {
 
 function renderIndex() {
   elements.indexList.innerHTML = "";
-
-  if (state.filteredItems.length === state.items.length) {
-    elements.summaryCount.textContent = `${state.items.length} 个文件`;
-  } else {
-    elements.summaryCount.textContent = `筛选结果 ${state.filteredItems.length} / ${state.items.length}`;
-  }
-
+  elements.summaryCount.textContent = `${state.items.length} 个文件`;
   elements.summaryUpdated.textContent = `最近同步: ${formatTime(state.lastUpdated)}`;
   elements.summaryOrigin.textContent = `地址: ${window.location.origin}`;
-  updateDownloadButton();
 
   if (state.filteredItems.length === 0) {
     elements.indexList.textContent = "没有可显示的数据。";
@@ -205,65 +191,6 @@ async function fetchJson(url) {
   return payload;
 }
 
-function triggerBrowserDownload(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function getDownloadFilename(response) {
-  const disposition = response.headers.get("Content-Disposition") || "";
-  const match = disposition.match(/filename="?([^";]+)"?/i);
-  return match?.[1] || `token-atlas-${Date.now()}.zip`;
-}
-
-async function downloadArchive() {
-  if (!state.accessKey || state.items.length === 0 || state.downloading) {
-    return;
-  }
-
-  state.downloading = true;
-  updateDownloadButton();
-
-  try {
-    const response = await fetch("/json/archive", {
-      method: "POST",
-      headers: getHeaders(true),
-      body: JSON.stringify({}),
-    });
-
-    if (response.status === 401) {
-      const error = new Error("访问密码无效或缺失");
-      error.code = 401;
-      throw error;
-    }
-
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.detail || `打包失败: ${response.status}`);
-    }
-
-    const blob = await response.blob();
-    triggerBrowserDownload(blob, getDownloadFilename(response));
-    elements.detailMeta.textContent = `已打包下载全部 ${state.items.length} 个文件`;
-  } catch (error) {
-    if (error.code === 401) {
-      logout("访问密码无效或缺失，未返回任何数据");
-      return;
-    }
-
-    renderError(error.message || "打包下载失败");
-  } finally {
-    state.downloading = false;
-    updateDownloadButton();
-  }
-}
-
 function logout(message = "已退出登录") {
   state.accessKey = "";
   elements.passwordInput.value = "";
@@ -309,18 +236,15 @@ async function loadIndex() {
 
   try {
     const data = await fetchJson("/json");
-    const previousSelection = state.selectedName;
     state.items = data.items || [];
     state.lastUpdated = data.updated_at || null;
     applyFilters();
 
-    if (state.items.length === 0) {
+    if (state.items.length > 0) {
+      await selectItem(state.items[0]);
+    } else {
       renderError("当前没有可用的 JSON 文件。");
-      return;
     }
-
-    const selectedItem = state.items.find((item) => item.name === previousSelection) || state.items[0];
-    await selectItem(selectedItem);
   } catch (error) {
     if (error.code === 401) {
       logout("访问密码无效或缺失，未返回任何数据");
@@ -348,11 +272,53 @@ async function selectItem(item) {
   }
 }
 
+async function downloadZip() {
+  const btn = elements.downloadZipBtn;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "下载中...";
+  try {
+    const response = await fetch("/zip", { headers: getHeaders() });
+    if (response.status === 401) {
+      logout("访问密码无效，请重新登录");
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`下载失败: ${response.status}`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tokens_${new Date().toISOString().slice(0, 10)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(`下载失败: ${error.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
 function bindEvents() {
   elements.loginBtn.addEventListener("click", login);
   elements.logoutBtn.addEventListener("click", () => logout());
-  elements.refreshBtn.addEventListener("click", loadIndex);
-  elements.downloadZipBtn.addEventListener("click", downloadArchive);
+  elements.refreshBtn.addEventListener("click", async () => {
+    const btn = elements.refreshBtn;
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = "正在同步...";
+    try {
+      await loadIndex();
+    } finally {
+      btn.innerHTML = originalHtml;
+      btn.disabled = false;
+    }
+  });
+  elements.downloadZipBtn.addEventListener("click", downloadZip);
   elements.tabData.addEventListener("click", () => switchTab("data"));
   elements.tabDocs.addEventListener("click", () => switchTab("docs"));
   elements.searchInput.addEventListener("input", applyFilters);
@@ -364,8 +330,43 @@ function bindEvents() {
   });
 }
 
+function setupCopyButtons() {
+  document.querySelectorAll(".code-block").forEach((block) => {
+    block.style.position = "relative";
+    block.style.paddingRight = "3rem";
+
+    const btn = document.createElement("button");
+    btn.className = "copy-btn";
+    btn.title = "复制到剪贴板";
+    btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+
+    btn.addEventListener("click", async () => {
+      const clone = block.cloneNode(true);
+      const cloneBtn = clone.querySelector(".copy-btn");
+      if (cloneBtn) {
+        clone.removeChild(cloneBtn);
+      }
+      const textToCopy = clone.textContent.trim();
+
+      try {
+        await navigator.clipboard.writeText(textToCopy);
+        const originalHtml = btn.innerHTML;
+        btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--success)"><polyline points="20 6 9 17 4 12"/></svg>`;
+        setTimeout(() => {
+          btn.innerHTML = originalHtml;
+        }, 2000);
+      } catch (e) {
+        console.error("Copy failed", e);
+      }
+    });
+
+    block.appendChild(btn);
+  });
+}
+
 function init() {
   bindEvents();
+  setupCopyButtons();
   clearData();
   showLoggedIn(false);
   switchTab("data");
