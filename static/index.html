@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Token Atlas</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <section id="login-screen" class="screen login-screen">
+    <div class="login-card">
+      <h1>Token Atlas</h1>
+      <p>输入访问密码后进入系统。</p>
+      <label class="field">
+        <span>访问密码</span>
+        <input id="password-input" type="password" placeholder="请输入 TOKEN_INDEX_ACCESS_KEY">
+      </label>
+      <button id="login-btn" class="btn btn-primary" type="button">登录</button>
+      <p id="login-message" class="message">未登录</p>
+    </div>
+  </section>
+
+  <section id="app-screen" class="screen app-screen hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1>Token Atlas</h1>
+        <div class="tabs">
+          <button id="tab-data" class="tab active" type="button">数据</button>
+          <button id="tab-docs" class="tab" type="button">文档</button>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <span id="summary-origin" class="topbar-text">地址: -</span>
+        <button id="logout-btn" class="btn" type="button">退出</button>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <section id="view-data" class="tab-view active">
+        <div class="toolbar panel">
+          <label class="field grow">
+            <span>搜索</span>
+            <input id="search-input" type="search" placeholder="按 name / id / path 搜索">
+          </label>
+          <label class="field sort-field">
+            <span>排序</span>
+            <select id="sort-select">
+              <option value="name-asc">名称升序</option>
+              <option value="name-desc">名称降序</option>
+              <option value="mtime-desc">最新修改</option>
+              <option value="mtime-asc">最早修改</option>
+            </select>
+          </label>
+          <div class="toolbar-actions">
+            <button id="refresh-btn" class="btn" type="button">刷新</button>
+          </div>
+        </div>
+
+        <div class="summary panel">
+          <span id="summary-count">0 个文件</span>
+          <span id="summary-updated">最近同步: -</span>
+        </div>
+
+        <div class="data-layout">
+          <section class="panel list-panel">
+            <h2>索引列表</h2>
+            <div id="index-list" class="index-list"></div>
+          </section>
+
+          <section class="panel detail-panel">
+            <h2>详情</h2>
+            <p id="detail-route" class="detail-route">/json/item</p>
+            <div id="detail-meta" class="detail-meta">未选择文件</div>
+            <pre id="detail-content" class="detail-content">登录后选择文件查看完整 JSON。</pre>
+          </section>
+        </div>
+      </section>
+
+      <section id="view-docs" class="tab-view">
+        <div class="panel docs-panel">
+          <h2>接口文档</h2>
+          <p>受保护接口都需要请求头：</p>
+          <pre>X-Access-Key: 你的访问密码</pre>
+
+          <h3>1. 登录校验</h3>
+          <pre>POST /auth/login
+Content-Type: application/json
+
+{"password":"你的访问密码"}</pre>
+
+          <h3>2. 获取全部索引</h3>
+          <pre>GET /json</pre>
+
+          <h3>3. 通过文件名获取详情</h3>
+          <pre>GET /json/item?name=文件名.json</pre>
+
+          <h3>4. 通过 ID 获取详情</h3>
+          <pre>GET /json/item?id=文件名去掉 .json 后的值</pre>
+
+          <h3>5. 通过索引序号获取详情</h3>
+          <pre>GET /json/item?index=0</pre>
+
+          <h3>6. 健康检查</h3>
+          <pre>GET /health</pre>
+
+          <h3>调用示例</h3>
+          <pre>curl -X POST http://127.0.0.1:8000/auth/login -H "Content-Type: application/json" -d "{\"password\":\"your-access-key\"}"</pre>
+          <pre>curl http://127.0.0.1:8000/json -H "X-Access-Key: your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json/item?index=0" -H "X-Access-Key: your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json/item?id=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2" -H "X-Access-Key: your-access-key"</pre>
+          <pre>curl "http://127.0.0.1:8000/json/item?name=02b3d9f6-93a0-4ad6-ba2c-044c87feb3a2.json" -H "X-Access-Key: your-access-key"</pre>
+        </div>
+      </section>
+    </main>
+  </section>
+
+  <footer class="site-footer">
+    <span>© 2026 Token Atlas</span>
+    <a href="https://github.com/isxlan0/Token-JSON-Provider" target="_blank" rel="noreferrer">GitHub 仓库</a>
+  </footer>
+
+  <template id="index-item-template">
+    <button class="index-item" type="button">
+      <div class="index-name"></div>
+      <div class="index-meta"></div>
+    </button>
+  </template>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

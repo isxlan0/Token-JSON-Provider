@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+
+token/
+
+__pycache__/
+*.py[cod]
