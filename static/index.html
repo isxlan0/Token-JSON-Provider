@@ -1,22 +1,29 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>账号领取中心</title>
+  <title>Token Atlas</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap"
+    rel="stylesheet">
 
-  <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260315">
 </head>
+
 <body class="light-theme">
 
   <section id="login-screen" class="screen login-screen">
     <div class="card login-card">
       <div class="brand-logo">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+        </svg>
       </div>
       <h1>Token Atlas</h1>
       <p>使用 LinuxDo OAuth2 登录后领取可下载的 JSON 账号。</p>
@@ -30,7 +37,11 @@
       <div>&copy; 2026 Token Atlas. 保留所有权利。</div>
       <div>
         <a href="https://github.com/isxlan0/Token-JSON-Provider" target="_blank" rel="noopener noreferrer">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path
+              d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+          </svg>
           GitHub 项目
         </a>
       </div>
@@ -40,24 +51,54 @@
   <section id="app-screen" class="screen app-screen hidden">
     <aside class="sidebar">
       <div class="sidebar-brand">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);">
+          <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+        </svg>
         <h1>Token Atlas</h1>
       </div>
       <nav class="nav-menu">
         <button id="tab-data" class="nav-item active" type="button">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+          </svg>
           数据面板
         </button>
         <button id="tab-keys" class="nav-item" type="button">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 3h-8"/><path d="M8 3v4"/><path d="M16 3v4"/><circle cx="8" cy="14" r="1"/><circle cx="12" cy="14" r="1"/><circle cx="16" cy="14" r="1"/></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="7" width="20" height="14" rx="2" ry="2" />
+            <path d="M16 3h-8" />
+            <path d="M8 3v4" />
+            <path d="M16 3v4" />
+            <circle cx="8" cy="14" r="1" />
+            <circle cx="12" cy="14" r="1" />
+            <circle cx="16" cy="14" r="1" />
+          </svg>
           API Key 管理
         </button>
         <button id="tab-claim" class="nav-item" type="button">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 5v14" />
+            <path d="M5 12h14" />
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+          </svg>
           领取账号
         </button>
         <button id="tab-docs" class="nav-item" type="button">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+            <line x1="16" y1="13" x2="8" y2="13" />
+            <line x1="16" y1="17" x2="8" y2="17" />
+            <polyline points="10 9 9 9 8 9" />
+          </svg>
           API 使用指南
         </button>
       </nav>
@@ -77,7 +118,12 @@
           </div>
           <button id="logout-btn" class="btn btn-ghost" type="button" title="退出登录">
             退出登录
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-left:0.5rem;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round" style="margin-left:0.5rem;">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+              <polyline points="16 17 21 12 16 7" />
+              <line x1="21" y1="12" x2="9" y2="12" />
+            </svg>
           </button>
         </div>
       </header>
@@ -105,7 +151,8 @@
               <div class="stat-label">领取统计</div>
               <div class="stat-value"><span id="claims-others-total">0</span></div>
               <div class="stat-meta">他人已领取（去重）：<span id="claims-others-unique">0</span></div>
-              <div class="stat-meta">总领取：<span id="claims-total">0</span> · 总领取（去重）：<span id="claims-unique">0</span></div>
+              <div class="stat-meta">总领取：<span id="claims-total">0</span> · 总领取（去重）：<span id="claims-unique">0</span>
+              </div>
               <div class="stat-meta">我的总领取：<span id="my-claims-total">0</span></div>
             </div>
           </div>
@@ -136,7 +183,8 @@
                 <input id="claim-count" class="form-input" type="number" min="1" value="1" />
                 <button id="claim-btn" class="btn btn-primary btn-inline" type="button">领取账号</button>
                 <button id="claim-download-all" class="btn btn-outline btn-inline" type="button">下载全部（ZIP）</button>
-                <button id="claim-remove-selected" class="btn btn-outline btn-inline btn-danger" type="button">删除选中（标记隐藏）</button>
+                <button id="claim-remove-selected" class="btn btn-outline btn-inline btn-danger"
+                  type="button">删除选中（标记隐藏）</button>
                 <button id="claim-clear" class="btn btn-ghost btn-inline btn-danger" type="button">删除全部（标记隐藏）</button>
               </div>
             </div>
@@ -151,7 +199,8 @@
         <section id="view-docs" class="tab-view">
           <div class="docs-container">
             <h2 class="docs-title">API 使用指南</h2>
-            <p class="docs-intro">会话类接口需要 LinuxDo 登录且带 <code>token_atlas_session</code> Cookie。API Key 接口使用 <code>X-API-Key</code>。</p>
+            <p class="docs-intro">会话类接口需要 LinuxDo 登录且带 <code>token_atlas_session</code> Cookie。API Key 接口使用
+              <code>X-API-Key</code>。</p>
 
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge">GET</span> /me</div>
@@ -200,7 +249,8 @@
 
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge">GET</span> /json/item</div>
-              <p>可用 <code>name</code>、<code>id</code> 或 <code>index</code> 获取详情，例如 <code>/json/item?name=demo.json</code>。</p>
+              <p>可用 <code>name</code>、<code>id</code> 或 <code>index</code> 获取详情，例如
+                <code>/json/item?name=demo.json</code>。</p>
             </div>
 
             <div class="endpoint-block">
@@ -219,7 +269,11 @@
           <div>&copy; 2026 Token Atlas. 保留所有权利。</div>
           <div>
             <a href="https://github.com/isxlan0/Token-JSON-Provider" target="_blank" rel="noopener noreferrer">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path
+                  d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+              </svg>
               GitHub 项目
             </a>
           </div>
@@ -228,6 +282,7 @@
     </main>
   </section>
 
-  <script src="/assets/app.js" defer></script>
+  <script src="/assets/app.js?v=20260315" defer></script>
 </body>
+
 </html>

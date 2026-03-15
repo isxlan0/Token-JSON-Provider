@@ -27,6 +27,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+import claim_queue
+
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = BASE_DIR / "token"
 STATIC_DIR = BASE_DIR / "static"
@@ -281,10 +283,23 @@ class TokenDb:
                     FOREIGN KEY(api_key_id) REFERENCES api_keys(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS claim_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    api_key_id INTEGER,
+                    requested INTEGER NOT NULL,
+                    remaining INTEGER NOT NULL,
+                    enqueued_at_ts INTEGER NOT NULL,
+                    request_id TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_token_claims_user_time
                     ON token_claims(user_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
                     ON token_claims(api_key_id, claimed_at_ts);
+                CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
+                    ON claim_queue(status, enqueued_at_ts, id);
                 """
             )
             claims_columns = {
@@ -630,6 +645,10 @@ class TokenDb:
         api_key_id: int | None,
         count: int,
     ) -> dict[str, Any]:
+        try:
+            try_fulfill_queue(self)
+        except Exception:
+            pass
         requested = max(1, count)
         batch_limit = get_claim_batch_limit()
         requested = min(requested, batch_limit)
@@ -651,7 +670,7 @@ class TokenDb:
             limit = get_claim_hourly_limit()
             remaining = max(0, limit - used)
             if remaining <= 0:
-                raise RateLimitError("Hourly quota exceeded.")
+                raise RateLimitError("您当前小时内的兑换额度已用完")
 
             if api_key_id is not None:
                 per_minute = get_apikey_rate_per_minute()
@@ -673,7 +692,45 @@ class TokenDb:
 
             target = min(requested, remaining)
             if target <= 0:
-                raise RateLimitError("Hourly quota exceeded.")
+                raise RateLimitError("您当前小时内的兑换额度已用完")
+
+            if claim_queue.has_pending_queue(self, conn=conn):
+                queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                _QUEUE_STATUS_CACHE.pop(user_id, None)
+                return {
+                    "request_id": queued["request_id"],
+                    "items": [],
+                    "requested": target,
+                    "granted": 0,
+                    "queued": True,
+                    "queue_id": queued["queue_id"],
+                    "queue_position": queued["position"],
+                    "queue_remaining": queued["remaining"],
+                    "quota": {"used": used, "limit": limit, "remaining": remaining},
+                }
+
+            available_row = conn.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM tokens
+                WHERE is_available = 1 AND claim_count < max_claims
+                """
+            ).fetchone()
+            available = int(available_row["cnt"]) if available_row else 0
+            if available < target:
+                queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                _QUEUE_STATUS_CACHE.pop(user_id, None)
+                return {
+                    "request_id": queued["request_id"],
+                    "items": [],
+                    "requested": target,
+                    "granted": 0,
+                    "queued": True,
+                    "queue_id": queued["queue_id"],
+                    "queue_position": queued["position"],
+                    "queue_remaining": queued["remaining"],
+                    "quota": {"used": used, "limit": limit, "remaining": remaining},
+                }
 
             rows = conn.execute(
                 """
@@ -687,11 +744,17 @@ class TokenDb:
             ).fetchall()
 
             if not rows:
+                queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                _QUEUE_STATUS_CACHE.pop(user_id, None)
                 return {
-                    "request_id": request_id,
+                    "request_id": queued["request_id"],
                     "items": [],
                     "requested": target,
                     "granted": 0,
+                    "queued": True,
+                    "queue_id": queued["queue_id"],
+                    "queue_position": queued["position"],
+                    "queue_remaining": queued["remaining"],
                     "quota": {"used": used, "limit": limit, "remaining": remaining},
                 }
 
@@ -739,6 +802,7 @@ class TokenDb:
             "items": items,
             "requested": target,
             "granted": len(items),
+            "queued": False,
             "quota": {"used": new_used, "limit": limit, "remaining": new_remaining},
         }
 
@@ -798,6 +862,59 @@ class TokenDb:
                 }
             )
         return items
+
+    def get_queue_status(self, user_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, requested, remaining, enqueued_at_ts, request_id
+                FROM claim_queue
+                WHERE user_id = ? AND status = 'queued' AND remaining > 0
+                ORDER BY enqueued_at_ts ASC, id ASC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if not row:
+                return None
+            queue_id = int(row["id"])
+            ahead_row = conn.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM claim_queue
+                WHERE status = 'queued'
+                  AND (enqueued_at_ts < ? OR (enqueued_at_ts = ? AND id < ?))
+                """,
+                (int(row["enqueued_at_ts"]), int(row["enqueued_at_ts"]), queue_id),
+            ).fetchone()
+            ahead = int(ahead_row["cnt"]) if ahead_row else 0
+            total_row = conn.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM claim_queue
+                WHERE status = 'queued' AND remaining > 0
+                """
+            ).fetchone()
+            total_queued = int(total_row["cnt"]) if total_row else 0
+            available_row = conn.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM tokens
+                WHERE is_available = 1 AND claim_count < max_claims
+                """
+            ).fetchone()
+            available = int(available_row["cnt"]) if available_row else 0
+        return {
+            "queue_id": queue_id,
+            "position": ahead + 1,
+            "ahead": ahead,
+            "total_queued": total_queued,
+            "available_tokens": available,
+            "requested": int(row["requested"]),
+            "remaining": int(row["remaining"]),
+            "enqueued_at": isoformat_from_ts(int(row["enqueued_at_ts"])),
+            "request_id": row["request_id"],
+        }
 
     def hide_claims(self, user_id: int, claim_ids: list[int]) -> int:
         if not claim_ids:
@@ -974,18 +1091,36 @@ class TokenIndexStore:
 
 
 class TokenDirectoryEventHandler(FileSystemEventHandler):
+    _DEBOUNCE_SECONDS = 2.0
+
     def __init__(self, store: TokenIndexStore, db: TokenDb) -> None:
         self.store = store
         self.db = db
+        self._timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+
+    def _do_sync(self) -> None:
+        self.store.refresh_all()
+        self.db.sync_tokens(TOKEN_DIR)
+        try:
+            try_fulfill_queue(self.db)
+        except Exception:
+            pass
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
 
         paths = [getattr(event, "src_path", ""), getattr(event, "dest_path", "")]
-        if any(path.lower().endswith(".json") for path in paths if path):
-            self.store.refresh_all()
-            self.db.sync_tokens(TOKEN_DIR)
+        if not any(path.lower().endswith(".json") for path in paths if path):
+            return
+
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._DEBOUNCE_SECONDS, self._do_sync)
+            self._timer.daemon = True
+            self._timer.start()
 
 
 def get_session_secret() -> str:
@@ -1030,6 +1165,7 @@ def get_provider_base_url() -> str | None:
         return None
     return raw.rstrip("/")
 
+
 def build_download_url(request: Request, token_id: int) -> str:
     url = str(request.url_for("download_claimed_token", token_id=token_id))
     base_url = get_provider_base_url()
@@ -1038,7 +1174,6 @@ def build_download_url(request: Request, token_id: int) -> str:
     parsed = urllib.parse.urlparse(url)
     query = f"?{parsed.query}" if parsed.query else ""
     return f"{base_url}{parsed.path}{query}"
-
 
 
 def get_claim_hourly_limit() -> int:
@@ -1177,6 +1312,11 @@ def clear_auth_session(request: Request) -> None:
     request.session.pop(SESSION_OAUTH_STATE_KEY, None)
 
 
+def clear_auth_cookie(request: Request, response: Response) -> None:
+    clear_auth_session(request)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+
+
 def get_session_auth(request: Request) -> dict[str, Any] | None:
     session_auth = request.session.get(SESSION_AUTH_KEY)
     if isinstance(session_auth, dict):
@@ -1265,6 +1405,43 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
 db = TokenDb(get_db_path())
 store = TokenIndexStore(TOKEN_DIR)
 observer: Observer | None = None
+_QUEUE_FULFILL_LOCK = threading.Lock()
+_QUEUE_LAST_FULFILL_TS = 0.0
+_QUEUE_FULFILL_THROTTLE_SEC = 5.0
+_STATS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
+_QUEUE_STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
+_CACHE_TTL_SEC = 5.0
+_QUEUE_PUMP_THREAD: threading.Thread | None = None
+_QUEUE_PUMP_STOP = threading.Event()
+_QUEUE_PUMP_INTERVAL_SEC = 20.0
+
+
+def try_fulfill_queue(db_handle: TokenDb) -> None:
+    global _QUEUE_LAST_FULFILL_TS
+    now = time.time()
+    with _QUEUE_FULFILL_LOCK:
+        if now - _QUEUE_LAST_FULFILL_TS < _QUEUE_FULFILL_THROTTLE_SEC:
+            return
+        _QUEUE_LAST_FULFILL_TS = now
+    claim_queue.fulfill_queue(
+        db_handle,
+        hourly_limit=get_claim_hourly_limit(),
+        apikey_rate_limit=get_apikey_rate_per_minute(),
+    )
+
+
+def _cache_fresh(ts: float) -> bool:
+    return time.time() - ts < _CACHE_TTL_SEC
+
+
+def _queue_pump_loop() -> None:
+    while not _QUEUE_PUMP_STOP.is_set():
+        try:
+            if claim_queue.has_pending_queue(db):
+                try_fulfill_queue(db)
+        except Exception:
+            pass
+        _QUEUE_PUMP_STOP.wait(timeout=_QUEUE_PUMP_INTERVAL_SEC)
 
 
 @asynccontextmanager
@@ -1281,13 +1458,29 @@ async def lifespan(_: FastAPI):
     observer.schedule(event_handler, str(TOKEN_DIR), recursive=False)
     observer.start()
 
+    _QUEUE_PUMP_STOP.clear()
+    global _QUEUE_PUMP_THREAD
+    _QUEUE_PUMP_THREAD = threading.Thread(
+        target=_queue_pump_loop,
+        daemon=True,
+        name="claim-queue-pump",
+    )
+    _QUEUE_PUMP_THREAD.start()
+
     try:
         yield
     finally:
-        if observer is not None:
-            observer.stop()
-            observer.join(timeout=5)
-            observer = None
+
+        if observer is None:
+            return
+
+        observer.stop()
+        observer.join(timeout=5)
+        observer = None
+        _QUEUE_PUMP_STOP.set()
+        if _QUEUE_PUMP_THREAD is not None:
+            _QUEUE_PUMP_THREAD.join(timeout=5)
+            _QUEUE_PUMP_THREAD = None
 
 
 app = FastAPI(title="Token Atlas", version="1.1.0", lifespan=lifespan)
@@ -1334,8 +1527,9 @@ def login(_: Request) -> Response:
 
 @app.post("/auth/logout")
 def logout(request: Request) -> Response:
-    clear_auth_session(request)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    clear_auth_cookie(request, response)
+    return response
 
 
 @app.get("/auth/status")
@@ -1383,7 +1577,13 @@ def get_me(request: Request) -> dict[str, Any]:
 def get_dashboard_stats(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
+    cached = _STATS_CACHE.get("value")
+    ts = float(_STATS_CACHE.get("ts") or 0.0)
+    if cached is not None and _cache_fresh(ts):
+        return cached
     stats = db.get_dashboard_stats(user_id)
+    _STATS_CACHE["value"] = stats
+    _STATS_CACHE["ts"] = time.time()
     return stats
 
 
@@ -1422,6 +1622,22 @@ def list_claims(request: Request) -> dict[str, Any]:
     return {"items": items}
 
 
+@app.get("/me/queue-status")
+def get_queue_status(request: Request) -> dict[str, Any]:
+    session = require_session_user(request)
+    user_id = session["user_id"]
+    cached = _QUEUE_STATUS_CACHE.get(user_id)
+    if cached and _cache_fresh(cached[0]):
+        return cached[1]
+    status = db.get_queue_status(user_id)
+    if not status:
+        payload = {"queued": False}
+        _QUEUE_STATUS_CACHE[user_id] = (time.time(), payload)
+        return payload
+    payload = {"queued": True, **status}
+    _QUEUE_STATUS_CACHE[user_id] = (time.time(), payload)
+    return payload
+
 
 @app.post("/me/claims/hide")
 def hide_claims(request: Request, payload: ClaimHidePayload) -> dict[str, Any]:
@@ -1458,7 +1674,6 @@ def claim_tokens_session(request: Request, payload: ClaimPayload) -> dict[str, A
     for item in result["items"]:
         item["download_url"] = build_download_url(request, item["token_id"])
     return result
-
 
 
 @app.post("/api/claim")
@@ -1532,18 +1747,28 @@ def linuxdo_callback(
     request.session.pop(SESSION_OAUTH_STATE_KEY, None)
 
     if error:
-        clear_auth_session(request)
-        return RedirectResponse(
+        response = RedirectResponse(
             url=f"/?auth_error={urllib.parse.quote(error)}",
             status_code=status.HTTP_302_FOUND,
         )
+        clear_auth_cookie(request, response)
+        return response
 
     if not is_linuxdo_enabled():
-        return RedirectResponse(url="/?auth_error=linuxdo_not_configured", status_code=status.HTTP_302_FOUND)
+        response = RedirectResponse(
+            url="/?auth_error=linuxdo_not_configured",
+            status_code=status.HTTP_302_FOUND,
+        )
+        clear_auth_cookie(request, response)
+        return response
 
     if not code or not state or state != expected_state:
-        clear_auth_session(request)
-        return RedirectResponse(url="/?auth_error=invalid_oauth_state", status_code=status.HTTP_302_FOUND)
+        response = RedirectResponse(
+            url="/?auth_error=invalid_oauth_state",
+            status_code=status.HTTP_302_FOUND,
+        )
+        clear_auth_cookie(request, response)
+        return response
 
     try:
         access_token = exchange_linuxdo_code(request, code)
@@ -1552,8 +1777,12 @@ def linuxdo_callback(
         db_user = db.upsert_user(user)
         set_linuxdo_session(request, user, db_user["id"])
     except (PermissionError, ValueError, urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
-        clear_auth_session(request)
-        return RedirectResponse(url="/?auth_error=linuxdo_login_failed", status_code=status.HTTP_302_FOUND)
+        response = RedirectResponse(
+            url="/?auth_error=linuxdo_login_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+        clear_auth_cookie(request, response)
+        return response
 
     base_url = get_provider_base_url()
     if base_url:

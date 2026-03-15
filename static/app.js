@@ -5,6 +5,13 @@ const state = {
   apiKeys: [],
   claimResults: [],
   claimSelected: new Set(),
+  refreshTimer: null,
+  refreshing: false,
+  queueStatus: null,
+  queueSticky: false,
+  lastClaimTotal: null,
+  claimsInitialized: false,
+  skipNextClaimModal: false,
 };
 
 const elements = {
@@ -89,6 +96,10 @@ function switchTab(name) {
     };
     headerTitle.textContent = map[name] || "数据面板";
   }
+
+  if (name === "claim") {
+    refreshAll();
+  }
 }
 
 function setLoginMessage(message = "", tone = "error") {
@@ -103,9 +114,48 @@ function setLoginMessage(message = "", tone = "error") {
 
 async function loadClaims() {
   const payload = await fetchJson("/me/claims");
-  state.claimResults = payload.items || [];
+  const items = payload.items || [];
+  const total = items.length;
+  if (state.claimsInitialized) {
+    const lastTotal = state.lastClaimTotal ?? total;
+    const delta = total - lastTotal;
+    if (delta > 0 && !state.skipNextClaimModal) {
+      showModal("领取成功", `共 ${delta} 个账号`);
+    }
+  }
+  state.skipNextClaimModal = false;
+  state.lastClaimTotal = total;
+  state.claimsInitialized = true;
+  state.claimResults = items;
   state.claimSelected.clear();
   renderClaimResults();
+}
+
+async function loadQueueStatus() {
+  const payload = await fetchJson("/me/queue-status");
+  state.queueStatus = payload;
+  renderQueueStatus();
+}
+
+function renderQueueStatus() {
+  const status = state.queueStatus;
+  if (!status || !status.queued) {
+    if (state.queueSticky) {
+      elements.claimSummary.classList.add("hidden");
+      state.queueSticky = false;
+    }
+    return;
+  }
+  const position = status.position ?? "-";
+  const total = status.total_queued ?? "-";
+  const available = status.available_tokens ?? "-";
+  const remaining = status.remaining ?? status.requested ?? "-";
+  elements.claimSummary.textContent =
+    `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。` +
+    `当前可用库存 ${available}，库存会优先发给前面排队用户。` +
+    "系统每隔 15 秒自动刷新。";
+  elements.claimSummary.classList.remove("hidden");
+  state.queueSticky = true;
 }
 
 async function fetchJson(url, options = {}) {
@@ -191,6 +241,35 @@ async function copyText(text) {
   } catch (error) {
     return false;
   }
+}
+
+function showModal(title, message) {
+  let overlay = document.getElementById("modal-overlay");
+  if (overlay) {
+    overlay.remove();
+  }
+  overlay = document.createElement("div");
+  overlay.id = "modal-overlay";
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="modal-title"></div>
+      <div class="modal-body"></div>
+      <div class="modal-actions">
+        <button class="btn btn-primary modal-confirm" type="button">确认</button>
+      </div>
+    </div>
+  `;
+  overlay.querySelector(".modal-title").textContent = title;
+  overlay.querySelector(".modal-body").textContent = message;
+  const confirmBtn = overlay.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", () => {
+    overlay.remove();
+  });
+  document.body.appendChild(overlay);
+  requestAnimationFrame(() => {
+    overlay.classList.add("show");
+  });
 }
 
 function renderApiKeys(limit) {
@@ -387,11 +466,30 @@ async function claimTokens() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ count }),
     });
+    if (result.granted && result.granted > 0) {
+      state.skipNextClaimModal = true;
+    }
     await loadClaims();
-    elements.claimSummary.textContent = `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
-    elements.claimSummary.classList.remove("hidden");
+    if (result.queued) {
+      state.queueStatus = {
+        queued: true,
+        position: result.queue_position,
+        remaining: result.queue_remaining,
+        requested: result.requested,
+      };
+      renderQueueStatus();
+    } else {
+      state.queueStatus = { queued: false };
+      state.queueSticky = false;
+      elements.claimSummary.textContent = `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
+      elements.claimSummary.classList.remove("hidden");
+      if (result.granted && result.granted > 0) {
+        showModal("领取成功", `共 ${result.granted} 个账号`);
+      }
+    }
     renderClaimResults();
     await loadDashboard();
+    await loadQueueStatus();
   } catch (error) {
     elements.claimError.textContent = error.message;
     elements.claimError.classList.remove("hidden");
@@ -425,7 +523,34 @@ async function logout() {
   } catch (error) {
     console.error("退出登录失败", error);
   }
+  if (state.refreshTimer) {
+    clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
   showLoggedIn(false);
+}
+
+async function refreshAll() {
+  if (state.refreshing) {
+    return;
+  }
+  state.refreshing = true;
+  try {
+    await loadDashboard();
+    await loadClaims();
+    await loadQueueStatus();
+  } catch (error) {
+    // ignore refresh errors
+  } finally {
+    state.refreshing = false;
+  }
+}
+
+function startAutoRefresh() {
+  if (state.refreshTimer) {
+    clearInterval(state.refreshTimer);
+  }
+  state.refreshTimer = setInterval(refreshAll, 15000);
 }
 
 function bindEvents() {
@@ -473,6 +598,10 @@ async function init() {
   try {
     const status = await fetchJson("/auth/status");
     if (!status.authenticated) {
+      if (state.refreshTimer) {
+        clearInterval(state.refreshTimer);
+        state.refreshTimer = null;
+      }
       showLoggedIn(false);
       return;
     }
@@ -480,8 +609,14 @@ async function init() {
     switchTab("data");
     await loadDashboard();
     await loadClaims();
+    await loadQueueStatus();
+    startAutoRefresh();
   } catch (error) {
     if (error.status === 401) {
+      if (state.refreshTimer) {
+        clearInterval(state.refreshTimer);
+        state.refreshTimer = null;
+      }
       showLoggedIn(false);
       return;
     }

@@ -902,3 +902,57 @@ body {
   flex-wrap: wrap;
   align-items: center;
 }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.modal-overlay.show {
+  opacity: 1;
+}
+
+.modal {
+  background: white;
+  color: var(--text-main);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem 2rem;
+  box-shadow: var(--shadow-lg);
+  min-width: 280px;
+  max-width: 90vw;
+  text-align: center;
+  transform: translateY(6px);
+  transition: transform 0.2s ease;
+}
+
+.modal-overlay.show .modal {
+  transform: translateY(0);
+}
+
+.modal-title {
+  font-size: 1rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.modal-body {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.modal-actions {
+  margin-top: 1rem;
+  display: flex;
+  justify-content: center;
+}
+
+.modal-actions .btn {
+  min-width: 120px;
+}
