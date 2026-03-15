@@ -137,6 +137,15 @@ async function loadQueueStatus() {
   renderQueueStatus();
 }
 
+
+function applyDocsBaseUrl() {
+  const baseUrl = window.location.origin;
+  const nodes = document.querySelectorAll('.endpoint-block pre');
+  nodes.forEach((node) => {
+    node.textContent = node.textContent.replace(/\$\{TOKEN_PROVIDER_BASE_URL\}/g, baseUrl);
+  });
+}
+
 function renderQueueStatus() {
   const status = state.queueStatus;
   if (!status || !status.queued) {
@@ -596,6 +605,7 @@ async function init() {
   elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
 
   try {
+    applyDocsBaseUrl();
     const status = await fetchJson("/auth/status");
     if (!status.authenticated) {
       if (state.refreshTimer) {

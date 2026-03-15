@@ -210,7 +210,8 @@
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge post">POST</span> /me/claim</div>
               <p>使用会话 Cookie 领取账号，例如 <code>{"count": 2}</code>。</p>
-              <pre class="token-json">curl -X POST http://127.0.0.1:8000/me/claim \
+              <pre class="token-json">curl -X POST ${TOKEN_PROVIDER_BASE_URL}/me/claim \
+\
   -H "Content-Type: application/json" \
   --cookie "token_atlas_session=YOUR_SESSION" \
   -d "{\"count\": 2}"</pre>
@@ -229,7 +230,8 @@
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge post">POST</span> /api/claim</div>
               <p>使用 <code>X-API-Key</code> 领取账号，例如 <code>{"count": 2}</code>。</p>
-              <pre class="token-json">curl -X POST http://127.0.0.1:8000/api/claim \
+              <pre class="token-json">curl -X POST ${TOKEN_PROVIDER_BASE_URL}/api/claim \
+\
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-api-key" \
   -d "{\"count\": 2}"</pre>
@@ -238,7 +240,7 @@
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge">GET</span> /api/download/{token_id}</div>
               <p>通过领取结果里的 <code>token_id</code> 下载 JSON。</p>
-              <pre class="token-json">curl -L http://127.0.0.1:8000/api/download/123 \
+              <pre class="token-json">curl -L ${TOKEN_PROVIDER_BASE_URL}/api/download/123 \
   -H "X-API-Key: your-api-key"</pre>
             </div>
 
