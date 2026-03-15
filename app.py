@@ -1030,6 +1030,16 @@ def get_provider_base_url() -> str | None:
         return None
     return raw.rstrip("/")
 
+def build_download_url(request: Request, token_id: int) -> str:
+    url = str(request.url_for("download_claimed_token", token_id=token_id))
+    base_url = get_provider_base_url()
+    if not base_url:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{base_url}{parsed.path}{query}"
+
+
 
 def get_claim_hourly_limit() -> int:
     return max(1, env_int(CLAIM_HOURLY_LIMIT_ENV, 50))
@@ -1274,12 +1284,10 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
-        if observer is None:
-            return
-
-        observer.stop()
-        observer.join(timeout=5)
-        observer = None
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=5)
+            observer = None
 
 
 app = FastAPI(title="Token Atlas", version="1.1.0", lifespan=lifespan)
@@ -1410,10 +1418,9 @@ def list_claims(request: Request) -> dict[str, Any]:
     user_id = session["user_id"]
     items = db.list_claims(user_id)
     for item in items:
-        item["download_url"] = str(
-            request.url_for("download_claimed_token", token_id=item["token_id"])
-        )
+        item["download_url"] = build_download_url(request, item["token_id"])
     return {"items": items}
+
 
 
 @app.post("/me/claims/hide")
@@ -1449,10 +1456,9 @@ def claim_tokens_session(request: Request, payload: ClaimPayload) -> dict[str, A
     user_id = session["user_id"]
     result = db.claim_tokens(user_id, None, payload.count)
     for item in result["items"]:
-        item["download_url"] = str(
-            request.url_for("download_claimed_token", token_id=item["token_id"])
-        )
+        item["download_url"] = build_download_url(request, item["token_id"])
     return result
+
 
 
 @app.post("/api/claim")
@@ -1463,9 +1469,7 @@ def claim_tokens_api(
 ) -> dict[str, Any]:
     result = db.claim_tokens(api_record["user_id"], api_record["api_key_id"], payload.count)
     for item in result["items"]:
-        item["download_url"] = str(
-            request.url_for("download_claimed_token", token_id=item["token_id"])
-        )
+        item["download_url"] = build_download_url(request, item["token_id"])
     return result
 
 
