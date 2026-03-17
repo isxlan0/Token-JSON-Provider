@@ -12,7 +12,7 @@
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap"
     rel="stylesheet">
 
-  <link rel="stylesheet" href="/assets/styles.css?v=20260315">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260317">
 </head>
 
 <body class="light-theme">
@@ -164,7 +164,7 @@
               <div class="panel-title">API Key 管理</div>
               <div class="panel-actions">
                 <input id="api-key-name" class="form-input" type="text" placeholder="备注名（可选）" />
-                <button id="api-key-create-btn" class="btn btn-outline" type="button">创建 Key</button>
+                <button id="api-key-create-btn" class="btn btn-outline" type="button">创建Key</button>
               </div>
             </div>
             <div class="panel-body">
@@ -179,15 +179,25 @@
           <div class="data-panel">
             <div class="panel-toolbar">
               <div class="panel-title">领取账号</div>
-              <div class="panel-actions">
-                <input id="claim-count" class="form-input" type="number" min="1" value="1" />
-                <button id="claim-btn" class="btn btn-primary btn-inline" type="button">领取账号</button>
-                <button id="claim-download-all" class="btn btn-outline btn-inline" type="button">下载全部（ZIP）</button>
-                <button id="claim-remove-selected" class="btn btn-outline btn-inline btn-danger"
-                  type="button">删除选中（标记隐藏）</button>
-                <button id="claim-clear" class="btn btn-ghost btn-inline btn-danger" type="button">删除全部（标记隐藏）</button>
+              <div class="panel-actions claim-toolbar-actions">
+                <input id="claim-count" class="form-input claim-count-input" type="number" min="1" value="1" />
+
+                <button id="claim-btn" class="claim-toolbar-action claim-toolbar-action-primary"
+                  type="button">申请账号</button>
+
+                <button id="claim-multi-mode" class="claim-toolbar-action" type="button"
+                  title="Enable direct card selection for multi-select" aria-pressed="false">多选模式</button>
+
+                <button id="claim-select-all" class="claim-toolbar-action hidden" type="button">全选账号</button>
+
+                <button id="claim-download-all" class="claim-toolbar-action" type="button">下载全部账号(ZIP格式)</button>
+
+                <button id="claim-remove-selected" class="claim-toolbar-action is-danger" type="button">删除选中账号</button>
+
+                <button id="claim-clear" class="claim-toolbar-action is-danger" type="button">删除全部账号</button>
               </div>
             </div>
+
             <div class="panel-body">
               <div id="claim-summary" class="callout info hidden"></div>
               <div id="claim-error" class="callout danger hidden"></div>
@@ -200,7 +210,8 @@
           <div class="docs-container">
             <h2 class="docs-title">API 使用指南</h2>
             <p class="docs-intro">会话类接口需要 LinuxDo 登录且带 <code>token_atlas_session</code> Cookie。API Key 接口使用
-              <code>X-API-Key</code>。</p>
+              <code>X-API-Key</code>。
+            </p>
 
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge">GET</span> /me</div>
@@ -252,7 +263,8 @@
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge">GET</span> /json/item</div>
               <p>可用 <code>name</code>、<code>id</code> 或 <code>index</code> 获取详情，例如
-                <code>/json/item?name=demo.json</code>。</p>
+                <code>/json/item?name=demo.json</code>。
+              </p>
             </div>
 
             <div class="endpoint-block">
@@ -284,7 +296,7 @@
     </main>
   </section>
 
-  <script src="/assets/app.js?v=20260315" defer></script>
+  <script src="/assets/app.js?v=20260317" defer></script>
 </body>
 
 </html>

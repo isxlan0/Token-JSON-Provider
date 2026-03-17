@@ -5,6 +5,7 @@ const state = {
   apiKeys: [],
   claimResults: [],
   claimSelected: new Set(),
+  claimMultiMode: false,
   refreshTimer: null,
   refreshing: false,
   queueStatus: null,
@@ -51,6 +52,8 @@ const elements = {
   apiKeyList: document.getElementById("api-key-list"),
   claimCount: document.getElementById("claim-count"),
   claimBtn: document.getElementById("claim-btn"),
+  claimMultiMode: document.getElementById("claim-multi-mode"),
+  claimSelectAll: document.getElementById("claim-select-all"),
   claimDownloadAll: document.getElementById("claim-download-all"),
   claimRemoveSelected: document.getElementById("claim-remove-selected"),
   claimClear: document.getElementById("claim-clear"),
@@ -352,54 +355,72 @@ function toggleClaimSelection(claimId, checked) {
   }
 }
 
+function isClaimActionTarget(target) {
+  return Boolean(target.closest("button, a, input, label"));
+}
+
+function syncClaimMultiModeButton() {
+  if (elements.claimMultiMode) {
+    elements.claimMultiMode.classList.toggle("active", state.claimMultiMode);
+    elements.claimMultiMode.setAttribute("aria-pressed", state.claimMultiMode ? "true" : "false");
+  }
+  if (elements.claimSelectAll) {
+    elements.claimSelectAll.classList.toggle("hidden", !state.claimMultiMode);
+  }
+}
+
 function renderClaimResults() {
+  syncClaimMultiModeButton();
   elements.claimResults.innerHTML = "";
   const items = state.claimResults || [];
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "暂无领取记录";
+    empty.textContent = "No claimed accounts yet.";
     elements.claimResults.appendChild(empty);
     return;
   }
 
   items.forEach((item, index) => {
     const card = document.createElement("div");
-    card.className = "claim-card";
     const content = JSON.stringify(item.content, null, 2);
     const claimId = item.claim_id ?? index;
-    const checked = state.claimSelected.has(claimId) ? "checked" : "";
+    const selected = state.claimSelected.has(claimId);
+    card.className = "claim-card";
+    card.classList.toggle("selectable", state.claimMultiMode);
+    card.classList.toggle("selected", selected);
     card.innerHTML = `
-      <div class="claim-card-header">
-        <div>
-          <div class="claim-file">#${index + 1} · ${item.file_name}</div>
-          <div class="claim-meta">${item.file_path} · ${item.encoding}</div>
-        </div>
-        <div class="claim-actions">
-          <label class="claim-select" title="选择">
-            <input type="checkbox" data-claim-select="${claimId}" ${checked} />
-          </label>
-          <button class="btn btn-outline btn-inline" data-claim-copy="${claimId}">复制 JSON</button>
-          <a class="btn btn-outline btn-inline" href="${item.download_url}" target="_blank" rel="noopener noreferrer">下载</a>
-          <button class="btn btn-ghost btn-inline btn-danger" data-claim-remove="${claimId}">删除（标记隐藏）</button>
-        </div>
-      </div>
-      <pre class="token-json">${content}</pre>
-    `;
+  <div class="claim-card-header">
+    <div>
+      <div class="claim-file">#${index + 1} | ${item.file_name}</div>
+      <div class="claim-meta">Path: ${item.file_path} | Encoding: ${item.encoding}</div>
+    </div>
+    <div class="claim-actions">
+      <span class="claim-selection-state ${selected ? "is-visible" : ""}">Selected</span>
+      <button class="btn btn-outline btn-inline" data-claim-copy="${claimId}">复制账号 JSON</button>
+      <a class="btn btn-outline btn-inline" href="${item.download_url}" target="_blank" rel="noopener noreferrer">下载 JSON</a>
+      <button class="btn btn-ghost btn-inline btn-danger" data-claim-remove="${claimId}">删除账号</button>
+    </div>
+  </div>
+  <pre class="token-json">${content}</pre>
+`;
     const copyBtn = card.querySelector(`button[data-claim-copy="${claimId}"]`);
-    const selectInput = card.querySelector(`input[data-claim-select="${claimId}"]`);
     const removeBtn = card.querySelector(`button[data-claim-remove="${claimId}"]`);
     copyBtn.addEventListener("click", async () => {
       const ok = await copyText(content);
       if (ok) {
-        copyBtn.textContent = "已复制";
+        copyBtn.textContent = "Copied";
         setTimeout(() => {
-          copyBtn.textContent = "复制 JSON";
+          copyBtn.textContent = "Copy JSON";
         }, 1200);
       }
     });
-    selectInput.addEventListener("change", (event) => {
-      toggleClaimSelection(claimId, event.target.checked);
+    card.addEventListener("click", (event) => {
+      if (!state.claimMultiMode || isClaimActionTarget(event.target)) {
+        return;
+      }
+      toggleClaimSelection(claimId, !state.claimSelected.has(claimId));
+      renderClaimResults();
     });
     removeBtn.addEventListener("click", async () => {
       if (item.claim_id != null) {
@@ -588,6 +609,23 @@ function bindEvents() {
   }
   if (elements.claimBtn) {
     elements.claimBtn.addEventListener("click", claimTokens);
+  }
+  if (elements.claimMultiMode) {
+    elements.claimMultiMode.addEventListener("click", () => {
+      state.claimMultiMode = !state.claimMultiMode;
+      if (!state.claimMultiMode) {
+        state.claimSelected.clear();
+      }
+      renderClaimResults();
+    });
+  }
+  if (elements.claimSelectAll) {
+    elements.claimSelectAll.addEventListener("click", () => {
+      state.claimSelected = new Set(
+        (state.claimResults || []).map((item, index) => item.claim_id ?? index)
+      );
+      renderClaimResults();
+    });
   }
   if (elements.claimDownloadAll) {
     elements.claimDownloadAll.addEventListener("click", downloadAllClaims);
