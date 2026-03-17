@@ -231,10 +231,11 @@ class TokenDb:
         self._lock = threading.RLock()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def init_db(self) -> None:
@@ -1134,6 +1135,17 @@ class TokenDirectoryEventHandler(FileSystemEventHandler):
             self._timer.start()
 
 
+def sync_tokens_with_retry(db_handle: TokenDb, token_dir: Path, retries: int = 5, delay_sec: float = 1.0) -> None:
+    for attempt in range(1, retries + 1):
+        try:
+            db_handle.sync_tokens(token_dir)
+            return
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= retries:
+                raise
+            time.sleep(delay_sec)
+
+
 def get_session_secret() -> str:
     return os.getenv(SESSION_SECRET_ENV, "change-me-session-secret")
 
@@ -1461,7 +1473,7 @@ async def lifespan(_: FastAPI):
 
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db()
-    db.sync_tokens(TOKEN_DIR)
+    sync_tokens_with_retry(db, TOKEN_DIR)
     store.refresh_all()
 
     event_handler = TokenDirectoryEventHandler(store, db)
