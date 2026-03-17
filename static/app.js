@@ -454,22 +454,23 @@ function renderTrends() {
   elements.trendSummary.textContent = `最近 ${days || 1} 天：累计 ${total} 次认领，峰值为每小时 ${peak} 次。`;
 }
 
-async function loadDashboardExtras() {
+async function loadDashboardSummary() {
   try {
-    const [leaderboard, recent, trends, system] = await Promise.all([
-      fetchJson("/dashboard/leaderboard?window=24h&limit=50"),
-      fetchJson("/dashboard/recent-claims?limit=50"),
-      fetchJson("/dashboard/trends?window=7d&bucket=1h"),
-      fetchJson("/dashboard/system-status"),
-    ]);
-    state.leaderboard = leaderboard.items || [];
-    state.recentClaims = recent.items || [];
-    state.trends = trends.series || [];
-    state.trendsMeta = { window: trends.window, bucket: trends.bucket };
-    state.systemStatus = system;
+    const summary = await fetchJson(
+      "/dashboard/summary?window=7d&bucket=1h&leaderboard_window=24h&leaderboard_limit=50&recent_limit=50"
+    );
+    state.stats = summary.stats || null;
+    state.leaderboard = summary.leaderboard?.items || [];
+    state.recentClaims = summary.recent?.items || [];
+    state.trends = summary.trends?.series || [];
+    state.trendsMeta = summary.trends
+      ? { window: summary.trends.window, bucket: summary.trends.bucket }
+      : null;
+    state.systemStatus = summary.system || null;
   } catch (error) {
     return;
   }
+  renderStats();
   renderLeaderboard();
   renderRecentClaims();
   renderSystemStatus();
@@ -687,10 +688,6 @@ async function loadDashboard() {
   renderQuota();
   renderMyClaims();
 
-  const stats = await fetchJson("/dashboard/stats");
-  state.stats = stats;
-  renderStats();
-
   const keys = await fetchJson("/me/api-keys");
   state.apiKeys = keys.items || [];
   renderApiKeys(keys.limit || 0);
@@ -711,6 +708,7 @@ async function createApiKey() {
   elements.apiKeyCreated.textContent = `已创建 Key：${displayKey}`;
   elements.apiKeyCreated.classList.remove("hidden");
   await loadDashboard();
+  await loadDashboardSummary();
 }
 
 async function revokeApiKey(keyId) {
@@ -759,6 +757,7 @@ async function claimTokens() {
     }
     renderClaimResults();
     await loadDashboard();
+    await loadDashboardSummary();
     await loadQueueStatus();
   } catch (error) {
     elements.claimError.textContent = error.message;
@@ -807,7 +806,7 @@ async function refreshAll() {
   state.refreshing = true;
   try {
     await loadDashboard();
-    await loadDashboardExtras();
+    await loadDashboardSummary();
     await loadClaims();
     await loadQueueStatus();
   } catch (error) {
@@ -897,7 +896,7 @@ async function init() {
     showLoggedIn(true);
     switchTab("data");
     await loadDashboard();
-    await loadDashboardExtras();
+    await loadDashboardSummary();
     await loadClaims();
     await loadQueueStatus();
     startAutoRefresh();

@@ -1870,10 +1870,11 @@ def get_me(request: Request) -> dict[str, Any]:
 def get_dashboard_leaderboard(
     request: Request,
     window: str | None = Query(default="24h"),
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=50),
 ) -> dict[str, Any]:
     require_session_user(request)
     window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
+    limit = min(limit, 50)
     cache_key = f"{window_sec}:{limit}"
     cached = _LEADERBOARD_CACHE.get("value")
     if cached and _LEADERBOARD_CACHE.get("key") == cache_key and _cache_fresh(float(_LEADERBOARD_CACHE.get("ts") or 0.0)):
@@ -1884,6 +1885,110 @@ def get_dashboard_leaderboard(
     _LEADERBOARD_CACHE["ts"] = time.time()
     _LEADERBOARD_CACHE["key"] = cache_key
     return payload
+
+
+@app.get("/dashboard/summary")
+def get_dashboard_summary(
+    request: Request,
+    window: str | None = Query(default="7d"),
+    bucket: str | None = Query(default="1h"),
+    leaderboard_window: str | None = Query(default="24h"),
+    leaderboard_limit: int = Query(default=50, ge=1, le=50),
+    recent_limit: int = Query(default=50, ge=1, le=50),
+) -> dict[str, Any]:
+    session = require_session_user(request)
+    user_id = session["user_id"]
+
+    stats_cached = _STATS_CACHE.get("value")
+    stats_ts = float(_STATS_CACHE.get("ts") or 0.0)
+    if stats_cached is not None and _cache_fresh(stats_ts):
+        stats = stats_cached
+    else:
+        stats = db.get_dashboard_stats(user_id)
+        _STATS_CACHE["value"] = stats
+        _STATS_CACHE["ts"] = time.time()
+
+    leaderboard_window_sec = parse_window_to_seconds(
+        leaderboard_window, 24 * 3600, max_seconds=7 * 24 * 3600
+    )
+    leaderboard_limit = min(leaderboard_limit, 50)
+    leaderboard_key = f"{leaderboard_window_sec}:{leaderboard_limit}"
+    leaderboard_cached = _LEADERBOARD_CACHE.get("value")
+    if (
+        leaderboard_cached
+        and _LEADERBOARD_CACHE.get("key") == leaderboard_key
+        and _cache_fresh(float(_LEADERBOARD_CACHE.get("ts") or 0.0))
+    ):
+        leaderboard = leaderboard_cached
+    else:
+        leaderboard_items = db.get_leaderboard(leaderboard_window_sec, leaderboard_limit)
+        leaderboard = {"window": leaderboard_window_sec, "items": leaderboard_items}
+        _LEADERBOARD_CACHE["value"] = leaderboard
+        _LEADERBOARD_CACHE["ts"] = time.time()
+        _LEADERBOARD_CACHE["key"] = leaderboard_key
+
+    recent_limit = min(recent_limit, 50)
+    recent_key = str(recent_limit)
+    recent_cached = _RECENT_CLAIMS_CACHE.get("value")
+    if (
+        recent_cached
+        and _RECENT_CLAIMS_CACHE.get("key") == recent_key
+        and _cache_fresh(float(_RECENT_CLAIMS_CACHE.get("ts") or 0.0))
+    ):
+        recent = recent_cached
+    else:
+        recent_items = db.list_recent_claims(recent_limit)
+        recent = {"items": recent_items}
+        _RECENT_CLAIMS_CACHE["value"] = recent
+        _RECENT_CLAIMS_CACHE["ts"] = time.time()
+        _RECENT_CLAIMS_CACHE["key"] = recent_key
+
+    window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
+    bucket_sec = parse_bucket_seconds(bucket, 3600)
+    trends_key = f"{window_sec}:{bucket_sec}"
+    trends_cached = _TRENDS_CACHE.get("value")
+    if (
+        trends_cached
+        and _TRENDS_CACHE.get("key") == trends_key
+        and _cache_fresh(float(_TRENDS_CACHE.get("ts") or 0.0))
+    ):
+        trends = trends_cached
+    else:
+        series = db.get_claim_trends(window_sec, bucket_sec)
+        trends = {"window": window_sec, "bucket": bucket_sec, "series": series}
+        _TRENDS_CACHE["value"] = trends
+        _TRENDS_CACHE["ts"] = time.time()
+        _TRENDS_CACHE["key"] = trends_key
+
+    system_cached = _SYSTEM_STATUS_CACHE.get("value")
+    if system_cached and _cache_fresh(float(_SYSTEM_STATUS_CACHE.get("ts") or 0.0)):
+        system = system_cached
+    else:
+        policy = db.ensure_inventory_policy()
+        snapshot = db.get_inventory_snapshot()
+        queue = db.get_queue_overview()
+        index_snapshot = store.list_index()
+        system = {
+            "inventory": snapshot,
+            "queue": queue,
+            "health": {
+                "status": policy["status"],
+                "hourly_limit": policy["hourly_limit"],
+                "max_claims": policy["max_claims"],
+                "thresholds": policy["thresholds"],
+            },
+            "index": {"updated_at": index_snapshot["updated_at"]},
+        }
+        _SYSTEM_STATUS_CACHE["value"] = system
+        _SYSTEM_STATUS_CACHE["ts"] = time.time()
+
+    return {
+        "stats": stats,
+        "leaderboard": leaderboard,
+        "recent": recent,
+        "trends": trends,
+        "system": system,
+    }
 
 
 @app.get("/dashboard/recent-claims")
