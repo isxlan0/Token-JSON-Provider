@@ -156,7 +156,10 @@ def load_dotenv_file(path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
-load_dotenv_file(ENV_FILE)
+try:
+    load_dotenv_file(ENV_FILE)
+except FileNotFoundError as exc:
+    raise SystemExit(f"{exc}\nRefusing to start without the required config file.") from None
 
 
 @dataclass
