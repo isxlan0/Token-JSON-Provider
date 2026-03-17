@@ -155,6 +155,47 @@
               </div>
               <div class="stat-meta">我的总领取：<span id="my-claims-total">0</span></div>
             </div>
+            <div class="stat-card">
+              <div class="stat-label">库存健康统计</div>
+              <div class="stat-value" id="inventory-health-value">-</div>
+              <div class="stat-meta">未用库存: <span id="inventory-health-unclaimed">0</span></div>
+              <div class="stat-meta">每小时可领取: <span id="inventory-health-hourly">0</span></div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">系统状态</div>
+              <div class="stat-value" id="system-status-value">-</div>
+              <div class="stat-meta">队列: <span id="system-status-queue">0</span></div>
+              <div class="stat-meta">更新日期: <span id="system-status-index">-</span></div>
+            </div>
+          </div>
+          <div class="dashboard-grid layout-dashboard">
+            <div class="data-panel panel-span-2 panel-trends">
+              <div class="panel-toolbar">
+                <div class="panel-title">领取趋势（7天/小时）</div>
+              </div>
+              <div class="panel-body">
+                <div id="trend-summary" class="trend-summary">-</div>
+                <div id="trend-chart" class="trend-chart"></div>
+              </div>
+            </div>
+
+            <div class="data-panel panel-leaderboard">
+              <div class="panel-toolbar">
+                <div class="panel-title">用户领取排行榜（24小时）</div>
+              </div>
+              <div class="panel-body">
+                <div id="leaderboard-list" class="leaderboard-list"></div>
+              </div>
+            </div>
+
+            <div class="data-panel panel-recent">
+              <div class="panel-toolbar">
+                <div class="panel-title">最近领取用户</div>
+              </div>
+              <div class="panel-body">
+                <div id="recent-claims-list" class="recent-list"></div>
+              </div>
+            </div>
           </div>
         </section>
 

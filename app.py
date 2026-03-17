@@ -44,9 +44,15 @@ LINUXDO_SCOPE_ENV = "TOKEN_INDEX_LINUXDO_SCOPE"
 LINUXDO_MIN_TRUST_LEVEL_ENV = "TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL"
 LINUXDO_ALLOWED_IDS_ENV = "TOKEN_INDEX_LINUXDO_ALLOWED_IDS"
 DB_PATH_ENV = "TOKEN_DB_PATH"
-CLAIM_HOURLY_LIMIT_ENV = "TOKEN_CLAIM_HOURLY_LIMIT"
-CLAIM_BATCH_LIMIT_ENV = "TOKEN_CLAIM_BATCH_LIMIT"
-TOKEN_MAX_CLAIMS_ENV = "TOKEN_MAX_CLAIMS_PER_TOKEN"
+TOKEN_HEALTHY_THRESHOLD_ENV = "TOKEN_HEALTHY_THRESHOLD"
+TOKEN_WARNING_THRESHOLD_ENV = "TOKEN_WARNING_THRESHOLD"
+TOKEN_CRITICAL_THRESHOLD_ENV = "TOKEN_CRITICAL_THRESHOLD"
+TOKEN_HOURLY_LIMIT_HEALTHY_ENV = "TOKEN_HOURLY_LIMIT_HEALTHY"
+TOKEN_HOURLY_LIMIT_WARNING_ENV = "TOKEN_HOURLY_LIMIT_WARNING"
+TOKEN_HOURLY_LIMIT_CRITICAL_ENV = "TOKEN_HOURLY_LIMIT_CRITICAL"
+TOKEN_MAX_CLAIMS_HEALTHY_ENV = "TOKEN_MAX_CLAIMS_HEALTHY"
+TOKEN_MAX_CLAIMS_WARNING_ENV = "TOKEN_MAX_CLAIMS_WARNING"
+TOKEN_MAX_CLAIMS_CRITICAL_ENV = "TOKEN_MAX_CLAIMS_CRITICAL"
 APIKEY_MAX_PER_USER_ENV = "TOKEN_APIKEY_MAX_PER_USER"
 APIKEY_RATE_PER_MIN_ENV = "TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE"
 PROVIDER_BASE_URL_ENV = "TOKEN_PROVIDER_BASE_URL"
@@ -274,6 +280,7 @@ class TokenDb:
                     file_hash TEXT NOT NULL,
                     encoding TEXT NOT NULL,
                     content_json TEXT NOT NULL,
+                    is_active INTEGER NOT NULL,
                     is_available INTEGER NOT NULL,
                     claim_count INTEGER NOT NULL,
                     max_claims INTEGER NOT NULL,
@@ -326,6 +333,12 @@ class TokenDb:
             }
             if "key_value" not in columns:
                 conn.execute("ALTER TABLE api_keys ADD COLUMN key_value TEXT")
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tokens)").fetchall()
+            }
+            if "is_active" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
 
     def _load_token_file(self, path: Path) -> tuple[str, str, str]:
         raw = path.read_bytes()
@@ -340,9 +353,10 @@ class TokenDb:
         files = sorted(token_dir.glob("*.json"), key=lambda path: path.name.lower())
         seen_names: set[str] = set()
         now = now_ts()
-        max_claims = get_max_claims_per_token()
 
         with self._lock, self.connect() as conn:
+            policy = self.ensure_inventory_policy(conn=conn)
+            max_claims = policy["max_claims"]
             for path in files:
                 try:
                     encoding, content_json, file_hash = self._load_token_file(path)
@@ -368,6 +382,7 @@ class TokenDb:
                             encoding = ?,
                             content_json = ?,
                             max_claims = ?,
+                            is_active = 1,
                             is_available = ?,
                             updated_at_ts = ?,
                             last_seen_at_ts = ?
@@ -394,13 +409,14 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
+                            is_active,
                             is_available,
                             claim_count,
                             max_claims,
                             created_at_ts,
                             updated_at_ts,
                             last_seen_at_ts
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             file_name,
@@ -408,6 +424,7 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
+                            1,
                             1,
                             0,
                             max_claims,
@@ -422,7 +439,8 @@ class TokenDb:
                 conn.execute(
                     f"""
                     UPDATE tokens
-                    SET is_available = 0,
+                    SET is_active = 0,
+                        is_available = 0,
                         last_seen_at_ts = ?
                     WHERE file_name NOT IN ({placeholders})
                     """,
@@ -430,7 +448,7 @@ class TokenDb:
                 )
             else:
                 conn.execute(
-                    "UPDATE tokens SET is_available = 0, last_seen_at_ts = ?",
+                    "UPDATE tokens SET is_active = 0, is_available = 0, last_seen_at_ts = ?",
                     (now,),
                 )
 
@@ -600,11 +618,12 @@ class TokenDb:
                 SELECT COUNT(*) as cnt
                 FROM token_claims
                 WHERE user_id = ? AND claimed_at_ts >= ?
-                """,
+                """
+                ,
                 (user_id, cutoff),
             ).fetchone()
-        used = int(row["cnt"]) if row else 0
-        limit = get_claim_hourly_limit()
+            used = int(row["cnt"]) if row else 0
+            limit = get_claim_hourly_limit(self, conn=conn)
         remaining = max(0, limit - used)
         return {"used": used, "limit": limit, "remaining": remaining}
 
@@ -625,13 +644,13 @@ class TokenDb:
 
     def get_dashboard_stats(self, user_id: int) -> dict[str, int]:
         with self.connect() as conn:
-            total_tokens = conn.execute("SELECT COUNT(*) as cnt FROM tokens").fetchone()
+            total_tokens = conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1").fetchone()
             available_tokens = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_available = 1 AND claim_count < max_claims"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims"
             ).fetchone()
             claimed_total = conn.execute("SELECT COUNT(*) as cnt FROM token_claims").fetchone()
             claimed_unique = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE claim_count > 0"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND claim_count > 0"
             ).fetchone()
             others_claimed_total = conn.execute(
                 "SELECT COUNT(*) as cnt FROM token_claims WHERE user_id != ?",
@@ -651,6 +670,160 @@ class TokenDb:
             "others_claimed_unique": int(others_claimed_unique["cnt"]) if others_claimed_unique else 0,
         }
 
+    def get_inventory_snapshot(self, *, conn=None) -> dict[str, int]:
+        def _fetch(target_conn):
+            total_row = target_conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1").fetchone()
+            available_row = target_conn.execute(
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims"
+            ).fetchone()
+            unclaimed_row = target_conn.execute(
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND claim_count = 0"
+            ).fetchone()
+            return {
+                "total": int(total_row["cnt"]) if total_row else 0,
+                "available": int(available_row["cnt"]) if available_row else 0,
+                "unclaimed": int(unclaimed_row["cnt"]) if unclaimed_row else 0,
+            }
+
+        if conn is None:
+            with self.connect() as target_conn:
+                return _fetch(target_conn)
+        return _fetch(conn)
+
+    def ensure_inventory_policy(self, *, conn=None) -> dict[str, Any]:
+        def _ensure(target_conn):
+            policy = get_inventory_policy(self, conn=target_conn, force=True)
+            status = policy["status"]
+            max_claims = int(policy["max_claims"])
+            if _POLICY_STATE.get("status") != status or _POLICY_STATE.get("max_claims") != max_claims:
+                now = now_ts()
+                target_conn.execute(
+                    """
+                    UPDATE tokens
+                    SET max_claims = ?,
+                        is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
+                        updated_at_ts = ?
+                    WHERE is_active = 1
+                    """
+                    ,
+                    (max_claims, max_claims, now),
+                )
+                _POLICY_STATE["status"] = status
+                _POLICY_STATE["max_claims"] = max_claims
+            return policy
+
+        if conn is None:
+            with self._lock, self.connect() as target_conn:
+                target_conn.execute("BEGIN IMMEDIATE")
+                return _ensure(target_conn)
+        return _ensure(conn)
+
+    def get_leaderboard(self, window_sec: int, limit: int) -> list[dict[str, Any]]:
+        cutoff = now_ts() - max(0, int(window_sec))
+        limit = max(1, int(limit))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT users.linuxdo_user_id as user_id,
+                       users.linuxdo_username as username,
+                       users.linuxdo_name as name,
+                       COUNT(*) as cnt
+                FROM token_claims
+                JOIN users ON users.id = token_claims.user_id
+                WHERE token_claims.claimed_at_ts >= ?
+                GROUP BY users.id
+                ORDER BY cnt DESC, users.id ASC
+                LIMIT ?
+                """
+                ,
+                (cutoff, limit),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            name = row["name"] or row["username"]
+            items.append(
+                {
+                    "user_id": row["user_id"],
+                    "username": row["username"],
+                    "name": name,
+                    "count": int(row["cnt"]),
+                }
+            )
+        return items
+
+    def list_recent_claims(self, limit: int) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT token_claims.request_id as request_id,
+                       MAX(token_claims.claimed_at_ts) as claimed_at_ts,
+                       users.linuxdo_username as username,
+                       users.linuxdo_name as name,
+                       COUNT(*) as cnt
+                FROM token_claims
+                JOIN users ON users.id = token_claims.user_id
+                GROUP BY token_claims.request_id, users.id
+                ORDER BY claimed_at_ts DESC
+                LIMIT ?
+                """
+                ,
+                (limit,),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            name = row["name"] or row["username"]
+            items.append(
+                {
+                    "name": name,
+                    "username": row["username"],
+                    "count": int(row["cnt"]),
+                    "claimed_at": isoformat_from_ts(int(row["claimed_at_ts"])),
+                }
+            )
+        return items
+
+    def get_claim_trends(self, window_sec: int, bucket_sec: int) -> list[dict[str, Any]]:
+        window_sec = max(1, int(window_sec))
+        bucket_sec = max(60, int(bucket_sec))
+        now = now_ts()
+        start_ts = now - window_sec
+        start_bucket = (start_ts // bucket_sec) * bucket_sec
+        end_bucket = (now // bucket_sec) * bucket_sec
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT CAST(claimed_at_ts / ? AS INTEGER) * ? as bucket_ts,
+                       COUNT(*) as cnt
+                FROM token_claims
+                WHERE claimed_at_ts >= ?
+                GROUP BY bucket_ts
+                ORDER BY bucket_ts ASC
+                """
+                ,
+                (bucket_sec, bucket_sec, start_ts),
+            ).fetchall()
+        counts = {int(row["bucket_ts"]): int(row["cnt"]) for row in rows}
+        series: list[dict[str, Any]] = []
+        cursor = start_bucket
+        while cursor <= end_bucket:
+            series.append(
+                {
+                    "ts": isoformat_from_ts(int(cursor)),
+                    "count": counts.get(int(cursor), 0),
+                }
+            )
+            cursor += bucket_sec
+        return series
+
+    def get_queue_overview(self) -> dict[str, int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM claim_queue WHERE status = 'queued' AND remaining > 0"
+            ).fetchone()
+        total = int(row["cnt"]) if row else 0
+        return {"total": total}
+
     def claim_tokens(
         self,
         user_id: int,
@@ -662,14 +835,15 @@ class TokenDb:
         except Exception:
             pass
         requested = max(1, count)
-        batch_limit = get_claim_batch_limit()
-        requested = min(requested, batch_limit)
         now = now_ts()
         cutoff = now - 3600
         request_id = secrets.token_hex(8)
 
         with self._lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self.ensure_inventory_policy(conn=conn)
+            batch_limit = get_claim_batch_limit(self, conn=conn)
+            requested = min(requested, batch_limit)
             used_row = conn.execute(
                 """
                 SELECT COUNT(*) as cnt
@@ -679,7 +853,7 @@ class TokenDb:
                 (user_id, cutoff),
             ).fetchone()
             used = int(used_row["cnt"]) if used_row else 0
-            limit = get_claim_hourly_limit()
+            limit = get_claim_hourly_limit(self, conn=conn)
             remaining = max(0, limit - used)
             if remaining <= 0:
                 raise RateLimitError("您当前小时内的兑换额度已用完")
@@ -725,7 +899,7 @@ class TokenDb:
                 """
                 SELECT COUNT(*) as cnt
                 FROM tokens
-                WHERE is_available = 1 AND claim_count < max_claims
+                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
                 """
             ).fetchone()
             available = int(available_row["cnt"]) if available_row else 0
@@ -748,7 +922,7 @@ class TokenDb:
                 """
                 SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
                 FROM tokens
-                WHERE is_available = 1 AND claim_count < max_claims
+                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
                 ORDER BY created_at_ts ASC, id ASC
                 LIMIT ?
                 """,
@@ -912,7 +1086,7 @@ class TokenDb:
                 """
                 SELECT COUNT(*) as cnt
                 FROM tokens
-                WHERE is_available = 1 AND claim_count < max_claims
+                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
                 """
             ).fetchone()
             available = int(available_row["cnt"]) if available_row else 0
@@ -1182,7 +1356,39 @@ def get_db_path() -> Path:
     return BASE_DIR / "token_atlas.db"
 
 
+
+def parse_window_to_seconds(raw: str | None, default_sec: int, *, max_seconds: int | None = None) -> int:
+    if not raw:
+        value = default_sec
+    else:
+        cleaned = raw.strip().lower()
+        value = default_sec
+        if cleaned.endswith("h") and cleaned[:-1].isdigit():
+            value = int(cleaned[:-1]) * 3600
+        elif cleaned.endswith("d") and cleaned[:-1].isdigit():
+            value = int(cleaned[:-1]) * 86400
+        elif cleaned.isdigit():
+            value = int(cleaned)
+    if max_seconds is not None:
+        value = min(value, max_seconds)
+    return max(1, value)
+
+
+def parse_bucket_seconds(raw: str | None, default_sec: int) -> int:
+    if not raw:
+        return max(60, default_sec)
+    cleaned = raw.strip().lower()
+    if cleaned.endswith("h") and cleaned[:-1].isdigit():
+        return max(60, int(cleaned[:-1]) * 3600)
+    if cleaned.endswith("m") and cleaned[:-1].isdigit():
+        return max(60, int(cleaned[:-1]) * 60)
+    if cleaned.isdigit():
+        return max(60, int(cleaned))
+    return max(60, default_sec)
+
+
 def get_provider_base_url() -> str | None:
+
     raw = os.getenv(PROVIDER_BASE_URL_ENV, "").strip()
     if not raw:
         return None
@@ -1199,16 +1405,74 @@ def build_download_url(request: Request, token_id: int) -> str:
     return f"{base_url}{parsed.path}{query}"
 
 
-def get_claim_hourly_limit() -> int:
-    return max(1, env_int(CLAIM_HOURLY_LIMIT_ENV, 50))
+def get_inventory_thresholds() -> dict[str, int]:
+    return {
+        "healthy": max(1, env_int(TOKEN_HEALTHY_THRESHOLD_ENV, 1000)),
+        "warning": max(1, env_int(TOKEN_WARNING_THRESHOLD_ENV, 500)),
+        "critical": max(1, env_int(TOKEN_CRITICAL_THRESHOLD_ENV, 100)),
+    }
 
 
-def get_claim_batch_limit() -> int:
-    return max(1, env_int(CLAIM_BATCH_LIMIT_ENV, 50))
+def get_inventory_limits() -> dict[str, dict[str, int]]:
+    return {
+        "healthy": {
+            "hourly": max(1, env_int(TOKEN_HOURLY_LIMIT_HEALTHY_ENV, 30)),
+            "max_claims": max(1, env_int(TOKEN_MAX_CLAIMS_HEALTHY_ENV, 1)),
+        },
+        "warning": {
+            "hourly": max(1, env_int(TOKEN_HOURLY_LIMIT_WARNING_ENV, 20)),
+            "max_claims": max(1, env_int(TOKEN_MAX_CLAIMS_WARNING_ENV, 2)),
+        },
+        "critical": {
+            "hourly": max(1, env_int(TOKEN_HOURLY_LIMIT_CRITICAL_ENV, 15)),
+            "max_claims": max(1, env_int(TOKEN_MAX_CLAIMS_CRITICAL_ENV, 3)),
+        },
+    }
 
 
-def get_max_claims_per_token() -> int:
-    return max(1, env_int(TOKEN_MAX_CLAIMS_ENV, 1))
+def resolve_inventory_status(unclaimed: int, thresholds: dict[str, int]) -> str:
+    if unclaimed < thresholds["critical"]:
+        return "critical"
+    if unclaimed < thresholds["warning"]:
+        return "warning"
+    return "healthy"
+
+
+def get_inventory_policy(db_handle: "TokenDb", *, conn=None, force: bool = False) -> dict[str, Any]:
+    cached = _POLICY_CACHE.get("value")
+    ts = float(_POLICY_CACHE.get("ts") or 0.0)
+    if cached and not force and _cache_fresh(ts):
+        return cached
+    snapshot = db_handle.get_inventory_snapshot(conn=conn)
+    unclaimed = snapshot["unclaimed"]
+    thresholds = get_inventory_thresholds()
+    limits = get_inventory_limits()
+    status = resolve_inventory_status(unclaimed, thresholds)
+    chosen = limits.get(status, limits["healthy"])
+    policy = {
+        "status": status,
+        "unclaimed": unclaimed,
+        "thresholds": thresholds,
+        "hourly_limit": chosen["hourly"],
+        "max_claims": chosen["max_claims"],
+    }
+    _POLICY_CACHE["value"] = policy
+    _POLICY_CACHE["ts"] = time.time()
+    return policy
+
+
+def get_claim_hourly_limit(db_handle: "TokenDb" | None = None, *, conn=None) -> int:
+    policy = get_inventory_policy(db_handle or db, conn=conn)
+    return policy["hourly_limit"]
+
+
+def get_claim_batch_limit(db_handle: "TokenDb" | None = None, *, conn=None) -> int:
+    return get_claim_hourly_limit(db_handle, conn=conn)
+
+
+def get_max_claims_per_token(db_handle: "TokenDb" | None = None, *, conn=None) -> int:
+    policy = get_inventory_policy(db_handle or db, conn=conn)
+    return policy["max_claims"]
 
 
 def get_apikey_max_per_user() -> int:
@@ -1432,6 +1696,12 @@ _QUEUE_FULFILL_LOCK = threading.Lock()
 _QUEUE_LAST_FULFILL_TS = 0.0
 _QUEUE_FULFILL_THROTTLE_SEC = 5.0
 _STATS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
+_POLICY_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
+_POLICY_STATE: dict[str, Any] = {"status": None, "max_claims": None}
+_LEADERBOARD_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "key": None}
+_RECENT_CLAIMS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "key": None}
+_TRENDS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "key": None}
+_SYSTEM_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _QUEUE_STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
 _CACHE_TTL_SEC = 5.0
 _QUEUE_PUMP_THREAD: threading.Thread | None = None
@@ -1448,7 +1718,7 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
         _QUEUE_LAST_FULFILL_TS = now
     claim_queue.fulfill_queue(
         db_handle,
-        hourly_limit=get_claim_hourly_limit(),
+        hourly_limit=get_claim_hourly_limit(db_handle),
         apikey_rate_limit=get_apikey_rate_per_minute(),
     )
 
@@ -1594,6 +1864,91 @@ def get_me(request: Request) -> dict[str, Any]:
             "active": len([key for key in api_keys if key["status"] == "active"]),
         },
     }
+
+
+@app.get("/dashboard/leaderboard")
+def get_dashboard_leaderboard(
+    request: Request,
+    window: str | None = Query(default="24h"),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, Any]:
+    require_session_user(request)
+    window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
+    cache_key = f"{window_sec}:{limit}"
+    cached = _LEADERBOARD_CACHE.get("value")
+    if cached and _LEADERBOARD_CACHE.get("key") == cache_key and _cache_fresh(float(_LEADERBOARD_CACHE.get("ts") or 0.0)):
+        return cached
+    items = db.get_leaderboard(window_sec, limit)
+    payload = {"window": window_sec, "items": items}
+    _LEADERBOARD_CACHE["value"] = payload
+    _LEADERBOARD_CACHE["ts"] = time.time()
+    _LEADERBOARD_CACHE["key"] = cache_key
+    return payload
+
+
+@app.get("/dashboard/recent-claims")
+def get_dashboard_recent_claims(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=50),
+) -> dict[str, Any]:
+    require_session_user(request)
+    cache_key = str(limit)
+    cached = _RECENT_CLAIMS_CACHE.get("value")
+    if cached and _RECENT_CLAIMS_CACHE.get("key") == cache_key and _cache_fresh(float(_RECENT_CLAIMS_CACHE.get("ts") or 0.0)):
+        return cached
+    items = db.list_recent_claims(limit)
+    payload = {"items": items}
+    _RECENT_CLAIMS_CACHE["value"] = payload
+    _RECENT_CLAIMS_CACHE["ts"] = time.time()
+    _RECENT_CLAIMS_CACHE["key"] = cache_key
+    return payload
+
+
+@app.get("/dashboard/trends")
+def get_dashboard_trends(
+    request: Request,
+    window: str | None = Query(default="7d"),
+    bucket: str | None = Query(default="1h"),
+) -> dict[str, Any]:
+    require_session_user(request)
+    window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
+    bucket_sec = parse_bucket_seconds(bucket, 3600)
+    cache_key = f"{window_sec}:{bucket_sec}"
+    cached = _TRENDS_CACHE.get("value")
+    if cached and _TRENDS_CACHE.get("key") == cache_key and _cache_fresh(float(_TRENDS_CACHE.get("ts") or 0.0)):
+        return cached
+    series = db.get_claim_trends(window_sec, bucket_sec)
+    payload = {"window": window_sec, "bucket": bucket_sec, "series": series}
+    _TRENDS_CACHE["value"] = payload
+    _TRENDS_CACHE["ts"] = time.time()
+    _TRENDS_CACHE["key"] = cache_key
+    return payload
+
+
+@app.get("/dashboard/system-status")
+def get_dashboard_system_status(request: Request) -> dict[str, Any]:
+    require_session_user(request)
+    cached = _SYSTEM_STATUS_CACHE.get("value")
+    if cached and _cache_fresh(float(_SYSTEM_STATUS_CACHE.get("ts") or 0.0)):
+        return cached
+    policy = db.ensure_inventory_policy()
+    snapshot = db.get_inventory_snapshot()
+    queue = db.get_queue_overview()
+    index_snapshot = store.list_index()
+    payload = {
+        "inventory": snapshot,
+        "queue": queue,
+        "health": {
+            "status": policy["status"],
+            "hourly_limit": policy["hourly_limit"],
+            "max_claims": policy["max_claims"],
+            "thresholds": policy["thresholds"],
+        },
+        "index": {"updated_at": index_snapshot["updated_at"]},
+    }
+    _SYSTEM_STATUS_CACHE["value"] = payload
+    _SYSTEM_STATUS_CACHE["ts"] = time.time()
+    return payload
 
 
 @app.get("/dashboard/stats")

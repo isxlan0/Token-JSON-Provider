@@ -146,6 +146,10 @@ def fulfill_queue(
 
     with db._lock, db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        try:
+            db.ensure_inventory_policy(conn=conn)
+        except Exception:
+            pass
 
         queue_rows = conn.execute(
             """
@@ -190,7 +194,7 @@ def fulfill_queue(
                 """
                 SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
                 FROM tokens
-                WHERE is_available = 1 AND claim_count < max_claims
+                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
                 ORDER BY created_at_ts ASC, id ASC
                 LIMIT ?
                 """,

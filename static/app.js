@@ -10,6 +10,11 @@ const state = {
   refreshing: false,
   queueStatus: null,
   queueSticky: false,
+  leaderboard: [],
+  recentClaims: [],
+  trends: [],
+  trendsMeta: null,
+  systemStatus: null,
   lastClaimTotal: null,
   claimsInitialized: false,
   skipNextClaimModal: false,
@@ -45,6 +50,26 @@ const elements = {
   claimsTotal: document.getElementById("claims-total"),
   claimsUnique: document.getElementById("claims-unique"),
   myClaimsTotal: document.getElementById("my-claims-total"),
+  inventoryHealthValue: document.getElementById("inventory-health-value"),
+  inventoryHealthUnclaimed: document.getElementById("inventory-health-unclaimed"),
+  inventoryHealthHourly: document.getElementById("inventory-health-hourly"),
+  systemStatusValue: document.getElementById("system-status-value"),
+  systemStatusQueue: document.getElementById("system-status-queue"),
+  systemStatusIndex: document.getElementById("system-status-index"),
+  leaderboardList: document.getElementById("leaderboard-list"),
+  recentClaimsList: document.getElementById("recent-claims-list"),
+  inventoryStatus: document.getElementById("inventory-status"),
+  inventoryUnclaimed: document.getElementById("inventory-unclaimed"),
+  inventoryAvailableDetail: document.getElementById("inventory-available-detail"),
+  inventoryTotalDetail: document.getElementById("inventory-total-detail"),
+  inventoryProgress: document.getElementById("inventory-progress"),
+  inventoryPolicy: document.getElementById("inventory-policy"),
+  queueTotal: document.getElementById("queue-total"),
+  indexUpdated: document.getElementById("index-updated"),
+  hourlyLimit: document.getElementById("hourly-limit"),
+  maxClaims: document.getElementById("max-claims"),
+  trendChart: document.getElementById("trend-chart"),
+  trendSummary: document.getElementById("trend-summary"),
   apiKeyName: document.getElementById("api-key-name"),
   apiKeyCreateBtn: document.getElementById("api-key-create-btn"),
   apiKeyCreated: document.getElementById("api-key-created"),
@@ -234,6 +259,221 @@ function renderStats() {
 function renderMyClaims() {
   const total = state.claims?.total ?? 0;
   elements.myClaimsTotal.textContent = total;
+}
+
+function formatDateTime(value) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString();
+}
+
+function renderLeaderboard() {
+  const list = elements.leaderboardList;
+  if (!list) {
+    return;
+  }
+  list.innerHTML = "";
+  const items = state.leaderboard || [];
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "No leaderboard data.";
+    list.appendChild(empty);
+    return;
+  }
+  items.forEach((item, index) => {
+    const row = document.createElement("div");
+    row.className = "leaderboard-row";
+    row.innerHTML = `
+      <div class="leaderboard-rank">#${index + 1}</div>
+      <div class="leaderboard-name">${item.name || item.username || "-"} (@${item.username || "-"})</div>
+      <div class="leaderboard-count mono">个数: ${item.count ?? 0}</div>
+    `;
+    list.appendChild(row);
+  });
+}
+
+function renderRecentClaims() {
+  const list = elements.recentClaimsList;
+  if (!list) {
+    return;
+  }
+  list.innerHTML = "";
+  const items = state.recentClaims || [];
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "No recent claims.";
+    list.appendChild(empty);
+    return;
+  }
+  items.forEach((item, index) => {
+    const row = document.createElement("div");
+    row.className = "leaderboard-row";
+    row.innerHTML = `
+      <div class=\"leaderboard-rank\">#${index + 1}</div>
+      <div class=\"leaderboard-name\">${item.name || item.username || "-"} (@${item.username || "-"})</div>
+      <div class=\"leaderboard-count mono\">个数: ${item.count ?? 0} 时间: ${formatDateTime(item.claimed_at)}</div>
+    `;
+    list.appendChild(row);
+  });
+}
+
+function renderSystemStatus() {
+  const status = state.systemStatus;
+  if (!status) {
+    if (elements.inventoryStatus) {
+      elements.inventoryStatus.textContent = "-";
+      elements.inventoryStatus.className = "status-pill";
+    }
+    return;
+  }
+  const inventory = status.inventory || {};
+  const health = status.health || {};
+  const total = inventory.total ?? 0;
+  const available = inventory.available ?? 0;
+  const unclaimed = inventory.unclaimed ?? 0;
+  const statusMap = { healthy: "健康", warning: "警告", critical: "严重" };
+  const statusKey = health.status || "healthy";
+  if (elements.inventoryHealthValue) {
+    elements.inventoryHealthValue.textContent = statusMap[statusKey] || statusKey;
+  }
+  if (elements.inventoryHealthUnclaimed) {
+    elements.inventoryHealthUnclaimed.textContent = unclaimed;
+  }
+  if (elements.inventoryHealthHourly) {
+    elements.inventoryHealthHourly.textContent = health.hourly_limit ?? 0;
+  }
+  if (elements.systemStatusValue) {
+    elements.systemStatusValue.textContent = "在线";
+  }
+  if (elements.systemStatusQueue) {
+    elements.systemStatusQueue.textContent = status.queue?.total ?? 0;
+  }
+  if (elements.systemStatusIndex) {
+    elements.systemStatusIndex.textContent = formatDateTime(status.index?.updated_at);
+  }
+}
+
+function renderTrendChart(series) {
+  const container = elements.trendChart;
+  if (!container) {
+    return;
+  }
+  container.innerHTML = "";
+  if (!series || !series.length) {
+    const empty = document.createElement("div");
+    empty.className = "trend-empty";
+    empty.textContent = "No trend data.";
+    container.appendChild(empty);
+    return;
+  }
+  const padding = 24;
+  const rect = container.getBoundingClientRect();
+  const width = Math.max(300, rect.width || 800);
+  const height = Math.max(180, rect.height || 220);
+  const maxValue = Math.max(...series.map((item) => item.count || 0), 1);
+  const points = series.map((item, index) => {
+    const x = padding + (index / Math.max(1, series.length - 1)) * (width - padding * 2);
+    const y = height - padding - ((item.count || 0) / maxValue) * (height - padding * 2);
+    return { x, y };
+  });
+  const line = points.map((pt) => `${pt.x},${pt.y}`).join(" ");
+  let areaPath = `M ${points[0].x} ${points[0].y}`;
+  points.slice(1).forEach((pt) => {
+    areaPath += ` L ${pt.x} ${pt.y}`;
+  });
+  areaPath += ` L ${width - padding} ${height - padding} L ${padding} ${height - padding} Z`;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const tooltip = document.createElement("div");
+  tooltip.className = "trend-tooltip";
+  container.appendChild(tooltip);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="trendGradient" x1="0" x2="0" y1="0" y2="1">
+        <stop offset="0%" stop-color="var(--primary)" stop-opacity="0.35" />
+        <stop offset="100%" stop-color="var(--primary)" stop-opacity="0" />
+      </linearGradient>
+    </defs>
+    <path d="${areaPath}" fill="url(#trendGradient)" stroke="none" />
+    <polyline points="${line}" fill="none" stroke="var(--primary)" stroke-width="2" />
+  `;
+  const hoverDot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  hoverDot.setAttribute("r", "4");
+  hoverDot.setAttribute("fill", "var(--primary)");
+  hoverDot.setAttribute("stroke", "white");
+  hoverDot.setAttribute("stroke-width", "2");
+  hoverDot.style.opacity = "0";
+  svg.appendChild(hoverDot);
+  svg.addEventListener("mousemove", (event) => {
+    const box = svg.getBoundingClientRect();
+    const x = Math.max(padding, Math.min(box.width - padding, event.clientX - box.left));
+    const ratio = (x - padding) / Math.max(1, (box.width - padding * 2));
+    const index = Math.round(ratio * (points.length - 1));
+    const clamped = Math.max(0, Math.min(points.length - 1, index));
+    const point = points[clamped];
+    const item = series[clamped];
+    const scaleX = box.width / width;
+    const scaleY = box.height / height;
+    hoverDot.setAttribute("cx", point.x);
+    hoverDot.setAttribute("cy", point.y);
+    hoverDot.style.opacity = "1";
+    tooltip.textContent = `${formatDateTime(item.ts)} ? ${item.count || 0}`;
+    tooltip.style.left = `${(point.x * scaleX) / box.width * 100}%`;
+    tooltip.style.top = `${(point.y * scaleY) / box.height * 100}%`;
+    tooltip.classList.add("show");
+  });
+  svg.addEventListener("mouseleave", () => {
+    hoverDot.style.opacity = "0";
+    tooltip.classList.remove("show");
+  });
+  container.appendChild(svg);
+}
+
+function renderTrends() {
+  const series = state.trends || [];
+  renderTrendChart(series);
+  if (!elements.trendSummary) {
+    return;
+  }
+  if (!series.length) {
+    elements.trendSummary.textContent = "No trend data.";
+    return;
+  }
+  const total = series.reduce((sum, item) => sum + (item.count || 0), 0);
+  const peak = Math.max(...series.map((item) => item.count || 0), 0);
+  const windowSec = state.trendsMeta?.window || series.length * 3600;
+  const days = Math.round(windowSec / 86400);
+  elements.trendSummary.textContent = `最近 ${days || 1} 天：累计 ${total} 次认领，峰值为每小时 ${peak} 次。`;
+}
+
+async function loadDashboardExtras() {
+  try {
+    const [leaderboard, recent, trends, system] = await Promise.all([
+      fetchJson("/dashboard/leaderboard?window=24h&limit=50"),
+      fetchJson("/dashboard/recent-claims?limit=50"),
+      fetchJson("/dashboard/trends?window=7d&bucket=1h"),
+      fetchJson("/dashboard/system-status"),
+    ]);
+    state.leaderboard = leaderboard.items || [];
+    state.recentClaims = recent.items || [];
+    state.trends = trends.series || [];
+    state.trendsMeta = { window: trends.window, bucket: trends.bucket };
+    state.systemStatus = system;
+  } catch (error) {
+    return;
+  }
+  renderLeaderboard();
+  renderRecentClaims();
+  renderSystemStatus();
+  renderTrends();
 }
 
 function formatKeyStatus(status) {
@@ -567,6 +807,7 @@ async function refreshAll() {
   state.refreshing = true;
   try {
     await loadDashboard();
+    await loadDashboardExtras();
     await loadClaims();
     await loadQueueStatus();
   } catch (error) {
@@ -656,6 +897,7 @@ async function init() {
     showLoggedIn(true);
     switchTab("data");
     await loadDashboard();
+    await loadDashboardExtras();
     await loadClaims();
     await loadQueueStatus();
     startAutoRefresh();
