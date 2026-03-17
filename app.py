@@ -78,8 +78,16 @@ def isoformat_from_ts(value: int) -> str:
     return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def env_value(name: str, default: str = "") -> str:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    cleaned = raw.split("#", 1)[0].strip()
+    return cleaned or default
+
+
 def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
+    raw = env_value(name)
     if not raw:
         return default
     try:
@@ -126,7 +134,7 @@ def detect_encoding(raw: bytes) -> str:
 
 def load_dotenv_file(path: Path) -> None:
     if not path.exists():
-        return
+        raise FileNotFoundError(f"Missing required config file: {path}")
 
     raw = path.read_bytes()
     encoding = detect_encoding(raw)
@@ -1898,6 +1906,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
+        port=env_int("PORT", 8000),
         reload=False,
     )
