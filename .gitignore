@@ -1,11 +1,13 @@
 .env
 .env.*
 !.env.example
-
 token/
-
+token_staging/
 __pycache__/
 *.py[cod]
 .playwright-mcp/
 .claude/
 *.db
+GptCodexApi/
+start.*
+.vscode/
