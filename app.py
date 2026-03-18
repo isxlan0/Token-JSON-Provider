@@ -24,9 +24,6 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
-from watchdog.events import FileSystemEvent, FileSystemEventHandler
-from watchdog.observers import Observer
-
 import claim_queue
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -291,7 +288,7 @@ class DashboardMemoryCache:
         self._trends_cache: dict[str, dict[str, Any]] = {}
         self._stats_cache: dict[int, dict[str, int]] = {}
 
-    def refresh_from_db(self, db_handle: "TokenDb", index_updated_at: str) -> None:
+    def refresh_from_db(self, db_handle: "TokenDb", index_updated_at: str | None = None) -> None:
         cutoff = now_ts() - _CLAIM_EVENT_WINDOW_SEC
         with db_handle.connect() as conn:
             inventory = db_handle.get_inventory_snapshot(conn=conn)
@@ -363,7 +360,7 @@ class DashboardMemoryCache:
             self._inventory = inventory
             self._queue = {"total": int(queue_row["cnt"]) if queue_row else 0}
             self._policy = policy
-            self._index_updated_at = index_updated_at
+            self._index_updated_at = index_updated_at or isoformat_now()
             self._claim_events = claim_events
             self._total_claims = int(total_row["cnt"]) if total_row else 0
             self._user_total_claims = user_total_claims
@@ -509,12 +506,12 @@ class TokenDb:
         self.path = path
         self._lock = threading.RLock()
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+    def connect(self, timeout: float = 30.0) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout * 1000))}")
         return conn
 
     def init_db(self) -> None:
@@ -554,11 +551,13 @@ class TokenDb:
                     encoding TEXT NOT NULL,
                     content_json TEXT NOT NULL,
                     is_active INTEGER NOT NULL,
+                    is_cleaned INTEGER NOT NULL DEFAULT 0,
                     is_enabled INTEGER NOT NULL DEFAULT 1,
                     is_available INTEGER NOT NULL,
                     claim_count INTEGER NOT NULL,
                     max_claims INTEGER NOT NULL,
                     created_at_ts INTEGER NOT NULL,
+                    cleaned_at_ts INTEGER,
                     updated_at_ts INTEGER NOT NULL,
                     last_seen_at_ts INTEGER NOT NULL
                 );
@@ -636,8 +635,12 @@ class TokenDb:
             }
             if "is_active" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+            if "is_cleaned" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN is_cleaned INTEGER NOT NULL DEFAULT 0")
             if "is_enabled" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
+            if "cleaned_at_ts" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN cleaned_at_ts INTEGER")
 
     def _get_runtime_policy_state(self, conn: sqlite3.Connection) -> dict[str, Any] | None:
         row = conn.execute(
@@ -785,6 +788,85 @@ class TokenDb:
                 )
             self.ensure_inventory_policy(conn=conn)
         _refresh_dashboard_memory()
+
+    def sync_new_tokens(self, token_dir: Path) -> dict[str, int]:
+        now = now_ts()
+        healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
+        imported = 0
+        skipped = 0
+        errors = 0
+        files: list[Path] = []
+
+        try:
+            with os.scandir(token_dir) as entries:
+                for entry in entries:
+                    if not entry.is_file() or not entry.name.lower().endswith(".json"):
+                        continue
+                    files.append(Path(entry.path))
+        except OSError:
+            return {"imported": 0, "skipped": 0, "errors": 1}
+
+        with self._lock, self.connect(timeout=3.0) as conn:
+            existing_names = {
+                str(row["file_name"])
+                for row in conn.execute("SELECT file_name FROM tokens").fetchall()
+            }
+            for path in files:
+                file_name = path.name
+                if file_name in existing_names:
+                    skipped += 1
+                    continue
+                try:
+                    encoding, content_json, file_hash = self._load_token_file(path)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    errors += 1
+                    continue
+                file_path = path.relative_to(BASE_DIR).as_posix()
+                conn.execute(
+                    """
+                    INSERT INTO tokens (
+                        file_name,
+                        file_path,
+                        file_hash,
+                        encoding,
+                        content_json,
+                        is_active,
+                        is_cleaned,
+                        is_enabled,
+                        is_available,
+                        claim_count,
+                        max_claims,
+                        created_at_ts,
+                        cleaned_at_ts,
+                        updated_at_ts,
+                        last_seen_at_ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        file_name,
+                        file_path,
+                        file_hash,
+                        encoding,
+                        content_json,
+                        1,
+                        0,
+                        1,
+                        1,
+                        0,
+                        healthy_max_claims,
+                        now,
+                        None,
+                        now,
+                        now,
+                    ),
+                )
+                existing_names.add(file_name)
+                imported += 1
+            self.ensure_inventory_policy(conn=conn)
+
+        if imported:
+            _refresh_dashboard_memory()
+        return {"imported": imported, "skipped": skipped, "errors": errors}
 
     def upsert_user(self, user: LinuxDOUser) -> dict[str, Any]:
         now = now_ts()
@@ -969,9 +1051,10 @@ class TokenDb:
         reason: str,
         banned_by_user_id: int,
         expires_at_ts: int | None,
+        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         now = now_ts()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connect(timeout=timeout_s) as conn:
             conn.execute(
                 """
                 UPDATE user_bans
@@ -1008,9 +1091,9 @@ class TokenDb:
             ).fetchone()
         return self._format_ban_row(row) if row else {}
 
-    def unban_user(self, linuxdo_user_id: str, *, unbanned_by_user_id: int) -> bool:
+    def unban_user(self, linuxdo_user_id: str, *, unbanned_by_user_id: int, timeout_s: float = 30.0) -> bool:
         now = now_ts()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connect(timeout=timeout_s) as conn:
             result = conn.execute(
                 """
                 UPDATE user_bans
@@ -1240,7 +1323,7 @@ class TokenDb:
             rows = conn.execute(
                 f"""
                 SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
-                       claim_count, max_claims, created_at_ts, updated_at_ts, last_seen_at_ts
+                       is_cleaned, claim_count, max_claims, cleaned_at_ts, created_at_ts, updated_at_ts, last_seen_at_ts
                 FROM tokens
                 WHERE {' AND '.join(where_parts)}
                 ORDER BY is_active DESC, is_enabled DESC, updated_at_ts DESC, id DESC
@@ -1256,10 +1339,12 @@ class TokenDb:
                 "file_path": row["file_path"],
                 "encoding": row["encoding"],
                 "is_active": bool(row["is_active"]),
+                "is_cleaned": bool(row["is_cleaned"]),
                 "is_enabled": bool(row["is_enabled"]),
                 "is_available": bool(row["is_available"]),
                 "claim_count": int(row["claim_count"]),
                 "max_claims": int(row["max_claims"]),
+                "cleaned_at": isoformat_from_ts(int(row["cleaned_at_ts"])) if row["cleaned_at_ts"] else None,
                 "created_at": isoformat_from_ts(int(row["created_at_ts"])),
                 "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
                 "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
@@ -1271,9 +1356,9 @@ class TokenDb:
             "offset": offset,
         }
 
-    def set_token_enabled(self, token_id: int, enabled: bool) -> dict[str, Any] | None:
+    def set_token_enabled(self, token_id: int, enabled: bool, *, timeout_s: float = 30.0) -> dict[str, Any] | None:
         now = now_ts()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connect(timeout=timeout_s) as conn:
             conn.execute(
                 """
                 UPDATE tokens
@@ -1290,7 +1375,7 @@ class TokenDb:
             row = conn.execute(
                 """
                 SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
-                       claim_count, max_claims, created_at_ts, updated_at_ts, last_seen_at_ts
+                       is_cleaned, claim_count, max_claims, cleaned_at_ts, created_at_ts, updated_at_ts, last_seen_at_ts
                 FROM tokens
                 WHERE id = ?
                 """,
@@ -1306,13 +1391,77 @@ class TokenDb:
             "file_path": row["file_path"],
             "encoding": row["encoding"],
             "is_active": bool(row["is_active"]),
+            "is_cleaned": bool(row["is_cleaned"]),
             "is_enabled": bool(row["is_enabled"]),
             "is_available": bool(row["is_available"]),
             "claim_count": int(row["claim_count"]),
             "max_claims": int(row["max_claims"]),
+            "cleaned_at": isoformat_from_ts(int(row["cleaned_at_ts"])) if row["cleaned_at_ts"] else None,
             "created_at": isoformat_from_ts(int(row["created_at_ts"])),
             "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
             "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
+        }
+
+    def cleanup_exhausted_tokens(self, token_dir: Path) -> dict[str, Any]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, file_name, file_path
+                FROM tokens
+                WHERE is_active = 1 AND is_cleaned = 0 AND claim_count >= max_claims
+                ORDER BY updated_at_ts ASC, id ASC
+                """
+            ).fetchall()
+
+        if not rows:
+            return {"matched": 0, "cleaned": 0, "deleted_files": 0, "missing_files": 0, "failed": []}
+
+        cleaned_ids: list[int] = []
+        failed: list[dict[str, str]] = []
+        deleted_files = 0
+        missing_files = 0
+        for row in rows:
+            token_id = int(row["id"])
+            file_name = str(row["file_name"])
+            relative_path = str(row["file_path"] or "")
+            target_path = BASE_DIR / relative_path if relative_path else (token_dir / file_name)
+            try:
+                if target_path.exists():
+                    target_path.unlink()
+                    deleted_files += 1
+                else:
+                    missing_files += 1
+                cleaned_ids.append(token_id)
+            except OSError as exc:
+                failed.append({"file_name": file_name, "detail": str(exc)})
+
+        if cleaned_ids:
+            now = now_ts()
+            placeholders = ",".join("?" for _ in cleaned_ids)
+            with self._lock, self.connect(timeout=3.0) as conn:
+                conn.execute(
+                    f"""
+                    UPDATE tokens
+                    SET is_active = 0,
+                        is_cleaned = 1,
+                        is_enabled = 0,
+                        is_available = 0,
+                        cleaned_at_ts = ?,
+                        updated_at_ts = ?,
+                        last_seen_at_ts = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, now, now, *cleaned_ids),
+                )
+                self.ensure_inventory_policy(conn=conn)
+            _refresh_dashboard_memory()
+
+        return {
+            "matched": len(rows),
+            "cleaned": len(cleaned_ids),
+            "deleted_files": deleted_files,
+            "missing_files": missing_files,
+            "failed": failed,
         }
 
     def _format_ban_row(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -2100,138 +2249,6 @@ class TokenDb:
             )
         return items
 
-class TokenIndexStore:
-    def __init__(self, token_dir: Path) -> None:
-        self.token_dir = token_dir
-        self._lock = threading.RLock()
-        self._items: list[TokenDocument] = []
-        self._updated_at = isoformat_now()
-
-    def refresh_all(self) -> None:
-        files = sorted(self.token_dir.glob("*.json"), key=lambda path: path.name.lower())
-        documents: list[TokenDocument] = []
-
-        for path in files:
-            document = self._load_document(path, len(documents))
-            if document is not None:
-                documents.append(document)
-
-        with self._lock:
-            self._items = documents
-            self._updated_at = isoformat_now()
-
-    def list_index(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "count": len(self._items),
-                "updated_at": self._updated_at,
-                "items": [item.to_index_payload() for item in self._items],
-            }
-
-    def resolve(
-        self,
-        *,
-        name: str | None = None,
-        item_id: str | None = None,
-        index: int | None = None,
-    ) -> TokenDocument | None:
-        with self._lock:
-            if name:
-                for item in self._items:
-                    if item.name == name:
-                        return item
-                return None
-
-            if item_id:
-                for item in self._items:
-                    if item.id == item_id:
-                        return item
-                return None
-
-            if index is None:
-                return None
-
-            if 0 <= index < len(self._items):
-                return self._items[index]
-
-            return None
-
-    def list_documents(self, names: list[str] | None = None) -> list[TokenDocument]:
-        with self._lock:
-            if not names:
-                return list(self._items)
-
-            wanted = set(names)
-            return [item for item in self._items if item.name in wanted]
-
-    def _load_document(self, path: Path, index: int) -> TokenDocument | None:
-        try:
-            raw = path.read_bytes()
-            stat = path.stat()
-        except OSError:
-            return None
-
-        encoding = detect_encoding(raw)
-        relative_path = path.relative_to(BASE_DIR).as_posix()
-        item_id = path.stem
-
-        try:
-            decoded = raw.decode(encoding)
-            content = json.loads(decoded)
-            keys = sorted(content.keys()) if isinstance(content, dict) else []
-            error = None
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            content = None
-            keys = []
-            error = str(exc)
-
-        return TokenDocument(
-            index=index,
-            id=item_id,
-            name=path.name,
-            path=relative_path,
-            size=stat.st_size,
-            mtime=isoformat_timestamp(stat.st_mtime),
-            encoding=encoding,
-            keys=keys,
-            error=error,
-            content=content,
-        )
-
-
-class TokenDirectoryEventHandler(FileSystemEventHandler):
-    _DEBOUNCE_SECONDS = 2.0
-
-    def __init__(self, store: TokenIndexStore, db: TokenDb) -> None:
-        self.store = store
-        self.db = db
-        self._timer: threading.Timer | None = None
-        self._lock = threading.Lock()
-
-    def _do_sync(self) -> None:
-        self.store.refresh_all()
-        self.db.sync_tokens(TOKEN_DIR)
-        try:
-            try_fulfill_queue(self.db)
-        except Exception:
-            pass
-
-    def on_any_event(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-
-        paths = [getattr(event, "src_path", ""), getattr(event, "dest_path", "")]
-        if not any(path.lower().endswith(".json") for path in paths if path):
-            return
-
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(self._DEBOUNCE_SECONDS, self._do_sync)
-            self._timer.daemon = True
-            self._timer.start()
-
-
 def sync_tokens_with_retry(db_handle: TokenDb, token_dir: Path, retries: int = 5, delay_sec: float = 1.0) -> None:
     for attempt in range(1, retries + 1):
         try:
@@ -2243,6 +2260,22 @@ def sync_tokens_with_retry(db_handle: TokenDb, token_dir: Path, retries: int = 5
             time.sleep(delay_sec)
 
 
+def sync_new_tokens_with_retry(
+    db_handle: TokenDb,
+    token_dir: Path,
+    retries: int = 3,
+    delay_sec: float = 0.5,
+) -> dict[str, int]:
+    for attempt in range(1, retries + 1):
+        try:
+            return db_handle.sync_new_tokens(token_dir)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= retries:
+                raise
+            time.sleep(delay_sec)
+    return {"imported": 0, "skipped": 0, "errors": 0}
+
+
 def run_db_write_with_retry(func, retries: int = 4, delay_sec: float = 0.35):
     for attempt in range(1, retries + 1):
         try:
@@ -2251,6 +2284,19 @@ def run_db_write_with_retry(func, retries: int = 4, delay_sec: float = 0.35):
             if "database is locked" not in str(exc).lower() or attempt >= retries:
                 raise
             time.sleep(delay_sec)
+
+
+def make_db_busy_response() -> Response:
+    error_json = json.dumps(
+        {"detail": "数据库正忙，请稍后重试。"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return Response(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=error_json,
+        media_type="application/json",
+        headers={"Retry-After": "3"},
+    )
 
 
 def get_session_secret() -> str:
@@ -2723,8 +2769,6 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
 
 db = TokenDb(get_db_path())
 db.init_db()
-store = TokenIndexStore(TOKEN_DIR)
-observer: Observer | None = None
 _QUEUE_FULFILL_LOCK = threading.Lock()
 _QUEUE_LAST_FULFILL_TS = 0.0
 _QUEUE_FULFILL_THROTTLE_SEC = 5.0
@@ -2741,13 +2785,16 @@ _CACHE_TTL_SEC = 5.0
 _QUEUE_PUMP_THREAD: threading.Thread | None = None
 _QUEUE_PUMP_STOP = threading.Event()
 _QUEUE_PUMP_INTERVAL_SEC = 20.0
+_TOKEN_IMPORT_THREAD: threading.Thread | None = None
+_TOKEN_IMPORT_STOP = threading.Event()
+_TOKEN_IMPORT_INTERVAL_SEC = 60.0
 _API_KEY_CACHE_LOCK = threading.RLock()
 _API_KEY_CACHE_BY_HASH: dict[str, dict[str, Any]] = {}
 _DASHBOARD_CACHE = DashboardMemoryCache()
 
 
 def _refresh_dashboard_memory() -> None:
-    _DASHBOARD_CACHE.refresh_from_db(db, store.list_index()["updated_at"])
+    _DASHBOARD_CACHE.refresh_from_db(db)
     _QUEUE_STATUS_CACHE.clear()
 
 
@@ -2781,44 +2828,50 @@ def _queue_pump_loop() -> None:
         _QUEUE_PUMP_STOP.wait(timeout=_QUEUE_PUMP_INTERVAL_SEC)
 
 
+def _token_import_loop() -> None:
+    while not _TOKEN_IMPORT_STOP.wait(timeout=_TOKEN_IMPORT_INTERVAL_SEC):
+        try:
+            result = sync_new_tokens_with_retry(db, TOKEN_DIR)
+            if result.get("imported"):
+                try_fulfill_queue(db)
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global observer
-
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db()
-    sync_tokens_with_retry(db, TOKEN_DIR)
-    store.refresh_all()
     _refresh_dashboard_memory()
 
-    event_handler = TokenDirectoryEventHandler(store, db)
-    observer = Observer()
-    observer.schedule(event_handler, str(TOKEN_DIR), recursive=False)
-    observer.start()
-
     _QUEUE_PUMP_STOP.clear()
+    _TOKEN_IMPORT_STOP.clear()
     global _QUEUE_PUMP_THREAD
+    global _TOKEN_IMPORT_THREAD
     _QUEUE_PUMP_THREAD = threading.Thread(
         target=_queue_pump_loop,
         daemon=True,
         name="claim-queue-pump",
     )
     _QUEUE_PUMP_THREAD.start()
+    _TOKEN_IMPORT_THREAD = threading.Thread(
+        target=_token_import_loop,
+        daemon=True,
+        name="token-import-pump",
+    )
+    _TOKEN_IMPORT_THREAD.start()
 
     try:
         yield
     finally:
-
-        if observer is None:
-            return
-
-        observer.stop()
-        observer.join(timeout=5)
-        observer = None
         _QUEUE_PUMP_STOP.set()
+        _TOKEN_IMPORT_STOP.set()
         if _QUEUE_PUMP_THREAD is not None:
             _QUEUE_PUMP_THREAD.join(timeout=5)
             _QUEUE_PUMP_THREAD = None
+        if _TOKEN_IMPORT_THREAD is not None:
+            _TOKEN_IMPORT_THREAD.join(timeout=5)
+            _TOKEN_IMPORT_THREAD = None
 
 
 app = FastAPI(title="Token Atlas", version="1.1.0", lifespan=lifespan)
@@ -2979,24 +3032,43 @@ def admin_ban_user(request: Request, linuxdo_user_id: str, payload: AdminBanPayl
             ensure_ascii=False,
         ).encode("utf-8")
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
-    ban = run_db_write_with_retry(
-        lambda: db.ban_user(
-            linuxdo_user_id=target["linuxdo_user_id"],
-            username_snapshot=target["linuxdo_username"],
-            reason=payload.reason,
-            banned_by_user_id=context["user_id"],
-            expires_at_ts=expires_at_ts,
+    try:
+        ban = run_db_write_with_retry(
+            lambda: db.ban_user(
+                linuxdo_user_id=target["linuxdo_user_id"],
+                username_snapshot=target["linuxdo_username"],
+                reason=payload.reason,
+                banned_by_user_id=context["user_id"],
+                expires_at_ts=expires_at_ts,
+                timeout_s=3.0,
+            ),
+            retries=2,
+            delay_sec=0.2,
         )
-    )
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            return make_db_busy_response()
+        raise
     return {"ok": True, "ban": ban}
 
 
 @app.post("/admin/users/{linuxdo_user_id}/unban")
 def admin_unban_user(request: Request, linuxdo_user_id: str) -> dict[str, Any]:
     context = require_admin_user(request)
-    changed = run_db_write_with_retry(
-        lambda: db.unban_user(linuxdo_user_id, unbanned_by_user_id=context["user_id"])
-    )
+    try:
+        changed = run_db_write_with_retry(
+            lambda: db.unban_user(
+                linuxdo_user_id,
+                unbanned_by_user_id=context["user_id"],
+                timeout_s=3.0,
+            ),
+            retries=2,
+            delay_sec=0.2,
+        )
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            return make_db_busy_response()
+        raise
     return {"ok": changed}
 
 
@@ -3027,7 +3099,16 @@ def admin_list_tokens(
 @app.post("/admin/tokens/{token_id}/activate")
 def admin_activate_token(request: Request, token_id: int) -> dict[str, Any]:
     require_admin_user(request)
-    token = run_db_write_with_retry(lambda: db.set_token_enabled(token_id, True))
+    try:
+        token = run_db_write_with_retry(
+            lambda: db.set_token_enabled(token_id, True, timeout_s=3.0),
+            retries=2,
+            delay_sec=0.2,
+        )
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            return make_db_busy_response()
+        raise
     if not token:
         error_json = json.dumps({"detail": "Token not found."}, ensure_ascii=False).encode("utf-8")
         return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
@@ -3037,11 +3118,36 @@ def admin_activate_token(request: Request, token_id: int) -> dict[str, Any]:
 @app.post("/admin/tokens/{token_id}/deactivate")
 def admin_deactivate_token(request: Request, token_id: int) -> dict[str, Any]:
     require_admin_user(request)
-    token = run_db_write_with_retry(lambda: db.set_token_enabled(token_id, False))
+    try:
+        token = run_db_write_with_retry(
+            lambda: db.set_token_enabled(token_id, False, timeout_s=3.0),
+            retries=2,
+            delay_sec=0.2,
+        )
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            return make_db_busy_response()
+        raise
     if not token:
         error_json = json.dumps({"detail": "Token not found."}, ensure_ascii=False).encode("utf-8")
         return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
     return {"ok": True, "item": token}
+
+
+@app.post("/admin/tokens/cleanup-exhausted")
+def admin_cleanup_exhausted_tokens(request: Request) -> dict[str, Any]:
+    require_admin_user(request)
+    try:
+        result = run_db_write_with_retry(
+            lambda: db.cleanup_exhausted_tokens(TOKEN_DIR),
+            retries=2,
+            delay_sec=0.2,
+        )
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            return make_db_busy_response()
+        raise
+    return {"ok": True, **result}
 
 
 @app.get("/admin/policy")
@@ -3455,11 +3561,11 @@ def get_item(
 
 @app.get("/health")
 def get_health() -> dict[str, Any]:
-    snapshot = store.list_index()
+    system = _DASHBOARD_CACHE.get_system_status()
     return {
         "status": "ok",
-        "token_count": snapshot["count"],
-        "updated_at": snapshot["updated_at"],
+        "token_count": int(system["inventory"]["total"]),
+        "updated_at": system["index"]["updated_at"],
     }
 
 

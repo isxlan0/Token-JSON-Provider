@@ -111,7 +111,7 @@
 .admin-toolbar {
   padding: 1rem;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) repeat(3, auto);
+  grid-template-columns: minmax(220px, 1fr) repeat(4, auto);
   gap: 0.75rem;
   align-items: center;
 }
@@ -282,6 +282,11 @@
 .admin-badge.inactive {
   background: #f8fafc;
   color: var(--text-muted);
+}
+
+.admin-badge.cleaned {
+  background: #fff7ed;
+  color: #c2410c;
 }
 
 .admin-list-plain {

@@ -86,7 +86,9 @@
           <div class="admin-subtitle" id="admin-auth-summary">-</div>
         </div>
         <div class="header-actions admin-header-actions">
-          <div class="status-badge"><div class="dot"></div><span id="admin-policy-summary" class="mono">策略 -</span></div>
+          <div class="status-badge">
+            <div class="dot"></div><span id="admin-policy-summary" class="mono">策略 -</span>
+          </div>
           <button id="admin-logout-btn" class="btn btn-ghost" type="button">退出登录</button>
         </div>
       </header>
@@ -95,7 +97,8 @@
       <div class="admin-content">
         <section id="admin-view-users" class="admin-view active">
           <div class="admin-toolbar card">
-            <input id="admin-user-search" class="form-input admin-search-input" type="text" placeholder="搜索 LinuxDo ID / 用户名 / 昵称">
+            <input id="admin-user-search" class="form-input admin-search-input" type="text"
+              placeholder="搜索 LinuxDo ID / 用户名 / 昵称">
             <select id="admin-user-filter" class="form-input admin-select">
               <option value="all">全部用户</option>
               <option value="banned">仅封禁</option>
@@ -150,6 +153,7 @@
               <option value="50" selected>每页 50</option>
               <option value="100">每页 100</option>
             </select>
+            <button id="admin-token-cleanup" class="btn btn-outline" type="button">删除历史已领取账号</button>
             <button id="admin-token-refresh" class="btn btn-outline" type="button">刷新</button>
           </div>
           <div id="admin-token-list" class="admin-list token-list"></div>

@@ -49,6 +49,7 @@ const elements = {
   tokenFilter: document.getElementById("admin-token-filter"),
   tokenLimit: document.getElementById("admin-token-limit"),
   tokenRefresh: document.getElementById("admin-token-refresh"),
+  tokenCleanup: document.getElementById("admin-token-cleanup"),
   tokenList: document.getElementById("admin-token-list"),
   tokenPager: document.getElementById("admin-token-pager"),
   policyPanel: document.getElementById("admin-policy-panel"),
@@ -347,8 +348,8 @@ function renderTokens() {
     elements.tokenList.innerHTML = '<div class="card admin-card empty-state">没有匹配的 Token</div>';
   } else {
     state.tokens.forEach((item) => {
-      const statusClass = !item.is_active ? "inactive" : item.is_enabled ? "enabled" : "disabled";
-      const statusText = !item.is_active ? "文件缺失" : item.is_enabled ? "已启用" : "已停用";
+      const statusClass = item.is_cleaned ? "cleaned" : !item.is_active ? "inactive" : item.is_enabled ? "enabled" : "disabled";
+      const statusText = item.is_cleaned ? "已清理" : !item.is_active ? "文件缺失" : item.is_enabled ? "已启用" : "已停用";
       const actionText = item.is_enabled ? "停用" : "启用";
       const actionPath = item.is_enabled ? "deactivate" : "activate";
       const card = document.createElement("div");
@@ -364,7 +365,7 @@ function renderTokens() {
         <div class="admin-card-meta">编码：${item.encoding} · 领取 ${item.claim_count} / 上限 ${item.max_claims}</div>
         <div class="admin-card-meta">最后同步：${formatDateTime(item.last_seen_at)}</div>
         <div class="admin-card-actions">
-          <button class="btn btn-outline btn-inline" data-token-action="${item.id}" ${!item.is_active ? "disabled" : ""}>${actionText}</button>
+          <button class="btn btn-outline btn-inline" data-token-action="${item.id}" ${!item.is_active || item.is_cleaned ? "disabled" : ""}>${actionText}</button>
         </div>
       `;
       const actionBtn = card.querySelector("[data-token-action]");
@@ -485,6 +486,23 @@ async function loadPolicy() {
   renderPolicy();
 }
 
+async function cleanupExhaustedTokens() {
+  if (!window.confirm("这会删除 token 目录中所有已领完账号的文件，并在数据库里标记为已清理。是否继续？")) {
+    return;
+  }
+  const restoreButton = setButtonPending(elements.tokenCleanup, "清理中...");
+  showNotice("正在清理已领完账号...");
+  try {
+    const result = await fetchJson("/admin/tokens/cleanup-exhausted", { method: "POST" });
+    showNotice(`清理完成：处理 ${result.cleaned || 0} 个账号，删除文件 ${result.deleted_files || 0} 个`);
+    await Promise.all([loadTokens(), loadPolicy()]);
+  } catch (error) {
+    showNotice(error.message, "error");
+  } finally {
+    restoreButton?.();
+  }
+}
+
 async function banSelectedUser() {
   if (!state.selectedUserId) {
     return;
@@ -563,6 +581,7 @@ function bindEvents() {
   elements.userRefresh?.addEventListener("click", () => loadUsers(true));
   elements.banRefresh?.addEventListener("click", () => loadBans(true));
   elements.tokenRefresh?.addEventListener("click", () => loadTokens(true));
+  elements.tokenCleanup?.addEventListener("click", cleanupExhaustedTokens);
   elements.userSearch?.addEventListener("keydown", (event) => event.key === "Enter" && loadUsers(true));
   elements.banSearch?.addEventListener("keydown", (event) => event.key === "Enter" && loadBans(true));
   elements.tokenSearch?.addEventListener("keydown", (event) => event.key === "Enter" && loadTokens(true));
