@@ -11,3 +11,4 @@ __pycache__/
 GptCodexApi/
 start.*
 .vscode/
+*.txt

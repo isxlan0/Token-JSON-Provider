@@ -231,6 +231,242 @@ class RateLimitError(Exception):
     pass
 
 
+class DashboardMemoryCache:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._inventory = {"total": 0, "available": 0, "unclaimed": 0}
+        self._queue = {"total": 0}
+        self._policy = {
+            "status": "healthy",
+            "unclaimed": 0,
+            "thresholds": get_inventory_thresholds(),
+            "hourly_limit": get_inventory_limits()["healthy"]["hourly"],
+            "max_claims": get_inventory_limits()["healthy"]["max_claims"],
+        }
+        self._index_updated_at = isoformat_now()
+        self._claim_events: list[dict[str, Any]] = []
+        self._total_claims = 0
+        self._token_claimers: dict[int, set[int]] = {}
+        self._user_total_claims: dict[int, int] = {}
+        self._user_unique_tokens: dict[int, set[int]] = {}
+        self._leaderboard_cache: dict[str, dict[str, Any]] = {}
+        self._recent_cache: dict[str, dict[str, Any]] = {}
+        self._trends_cache: dict[str, dict[str, Any]] = {}
+        self._stats_cache: dict[int, dict[str, int]] = {}
+
+    def refresh_from_db(self, db_handle: "TokenDb", index_updated_at: str) -> None:
+        cutoff = now_ts() - _CLAIM_EVENT_WINDOW_SEC
+        with db_handle.connect() as conn:
+            inventory = db_handle.get_inventory_snapshot(conn=conn)
+            queue_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM claim_queue WHERE status = 'queued' AND remaining > 0"
+            ).fetchone()
+            events_rows = conn.execute(
+                """
+                SELECT MIN(token_claims.id) as first_claim_id,
+                       token_claims.request_id as request_id,
+                       token_claims.user_id as user_id,
+                       token_claims.claimed_at_ts as claimed_at_ts,
+                       users.linuxdo_user_id as public_user_id,
+                       users.linuxdo_username as username,
+                       users.linuxdo_name as name,
+                       COUNT(*) as cnt
+                FROM token_claims
+                JOIN users ON users.id = token_claims.user_id
+                WHERE token_claims.claimed_at_ts >= ?
+                GROUP BY token_claims.request_id,
+                         token_claims.user_id,
+                         token_claims.claimed_at_ts,
+                         users.linuxdo_user_id,
+                         users.linuxdo_username,
+                         users.linuxdo_name
+                ORDER BY token_claims.claimed_at_ts ASC, first_claim_id ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            total_row = conn.execute("SELECT COUNT(*) as cnt FROM token_claims").fetchone()
+            user_total_rows = conn.execute(
+                """
+                SELECT user_id, COUNT(*) as cnt
+                FROM token_claims
+                GROUP BY user_id
+                """
+            ).fetchall()
+            unique_rows = conn.execute(
+                """
+                SELECT user_id, token_id
+                FROM token_claims
+                GROUP BY user_id, token_id
+                """
+            ).fetchall()
+
+        policy = build_inventory_policy_from_snapshot(inventory)
+        claim_events = [
+            {
+                "request_id": row["request_id"],
+                "user_id": int(row["user_id"]),
+                "public_user_id": row["public_user_id"],
+                "username": row["username"],
+                "name": row["name"] or row["username"],
+                "claimed_at_ts": int(row["claimed_at_ts"]),
+                "count": int(row["cnt"]),
+            }
+            for row in events_rows
+        ]
+        user_total_claims = {int(row["user_id"]): int(row["cnt"]) for row in user_total_rows}
+        user_unique_tokens: dict[int, set[int]] = {}
+        token_claimers: dict[int, set[int]] = {}
+        for row in unique_rows:
+            user_id = int(row["user_id"])
+            token_id = int(row["token_id"])
+            user_unique_tokens.setdefault(user_id, set()).add(token_id)
+            token_claimers.setdefault(token_id, set()).add(user_id)
+
+        with self._lock:
+            self._inventory = inventory
+            self._queue = {"total": int(queue_row["cnt"]) if queue_row else 0}
+            self._policy = policy
+            self._index_updated_at = index_updated_at
+            self._claim_events = claim_events
+            self._total_claims = int(total_row["cnt"]) if total_row else 0
+            self._user_total_claims = user_total_claims
+            self._user_unique_tokens = user_unique_tokens
+            self._token_claimers = token_claimers
+            self._invalidate_derived_locked()
+
+        _POLICY_CACHE["value"] = policy
+        _POLICY_CACHE["ts"] = time.time()
+        _POLICY_STATE["status"] = policy["status"]
+        _POLICY_STATE["max_claims"] = policy["max_claims"]
+
+    def get_system_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "inventory": dict(self._inventory),
+                "queue": dict(self._queue),
+                "health": {
+                    "status": self._policy["status"],
+                    "hourly_limit": self._policy["hourly_limit"],
+                    "max_claims": self._policy["max_claims"],
+                    "thresholds": dict(self._policy["thresholds"]),
+                },
+                "index": {"updated_at": self._index_updated_at},
+            }
+
+    def get_stats(self, user_id: int) -> dict[str, int]:
+        with self._lock:
+            cached = self._stats_cache.get(user_id)
+            if cached is not None:
+                return dict(cached)
+
+            user_total = self._user_total_claims.get(user_id, 0)
+            user_unique = len(self._user_unique_tokens.get(user_id, set()))
+            others_unique = sum(1 for claimers in self._token_claimers.values() if any(uid != user_id for uid in claimers))
+            stats = {
+                "total_tokens": int(self._inventory["total"]),
+                "available_tokens": int(self._inventory["available"]),
+                "claimed_total": int(self._total_claims),
+                "claimed_unique": len(self._token_claimers),
+                "others_claimed_total": max(0, int(self._total_claims) - user_total),
+                "others_claimed_unique": others_unique,
+                "user_claimed_total": user_total,
+                "user_claimed_unique": user_unique,
+            }
+            self._stats_cache[user_id] = stats
+            return dict(stats)
+
+    def get_leaderboard(self, window_sec: int, limit: int) -> dict[str, Any]:
+        cache_key = f"{window_sec}:{limit}"
+        cutoff = now_ts() - max(0, int(window_sec))
+        limit = max(1, int(limit))
+        with self._lock:
+            cached = self._leaderboard_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            aggregates: dict[int, dict[str, Any]] = {}
+            for event in self._claim_events:
+                if event["claimed_at_ts"] < cutoff:
+                    continue
+                user_id = int(event["user_id"])
+                current = aggregates.setdefault(
+                    user_id,
+                    {
+                        "user_id": event["public_user_id"],
+                        "username": event["username"],
+                        "name": event["name"],
+                        "count": 0,
+                    },
+                )
+                current["count"] += int(event["count"])
+
+            items = sorted(
+                aggregates.values(),
+                key=lambda item: (-int(item["count"]), str(item["username"]), str(item["user_id"])),
+            )[:limit]
+            payload = {"window": window_sec, "items": items}
+            self._leaderboard_cache[cache_key] = payload
+            return payload
+
+    def get_recent(self, limit: int) -> dict[str, Any]:
+        cache_key = str(limit)
+        limit = max(1, int(limit))
+        with self._lock:
+            cached = self._recent_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            items = [
+                {
+                    "name": event["name"],
+                    "username": event["username"],
+                    "count": int(event["count"]),
+                    "claimed_at": isoformat_from_ts(int(event["claimed_at_ts"])),
+                }
+                for event in reversed(self._claim_events[-limit:])
+            ]
+            payload = {"items": items}
+            self._recent_cache[cache_key] = payload
+            return payload
+
+    def get_trends(self, window_sec: int, bucket_sec: int) -> dict[str, Any]:
+        cache_key = f"{window_sec}:{bucket_sec}"
+        window_sec = max(1, int(window_sec))
+        bucket_sec = max(60, int(bucket_sec))
+        now = now_ts()
+        start_ts = now - window_sec
+        start_bucket = (start_ts // bucket_sec) * bucket_sec
+        end_bucket = (now // bucket_sec) * bucket_sec
+        with self._lock:
+            cached = self._trends_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            counts: dict[int, int] = {}
+            for event in self._claim_events:
+                claimed_at_ts = int(event["claimed_at_ts"])
+                if claimed_at_ts < start_ts:
+                    continue
+                bucket_ts = (claimed_at_ts // bucket_sec) * bucket_sec
+                counts[bucket_ts] = counts.get(bucket_ts, 0) + int(event["count"])
+
+            series: list[dict[str, Any]] = []
+            cursor = start_bucket
+            while cursor <= end_bucket:
+                series.append({"ts": isoformat_from_ts(int(cursor)), "count": counts.get(int(cursor), 0)})
+                cursor += bucket_sec
+
+            payload = {"window": window_sec, "bucket": bucket_sec, "series": series}
+            self._trends_cache[cache_key] = payload
+            return payload
+
+    def _invalidate_derived_locked(self) -> None:
+        self._leaderboard_cache = {}
+        self._recent_cache = {}
+        self._trends_cache = {}
+        self._stats_cache = {}
+
+
 class TokenDb:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -451,6 +687,7 @@ class TokenDb:
                     "UPDATE tokens SET is_active = 0, is_available = 0, last_seen_at_ts = ?",
                     (now,),
                 )
+        _refresh_dashboard_memory()
 
     def upsert_user(self, user: LinuxDOUser) -> dict[str, Any]:
         now = now_ts()
@@ -495,13 +732,15 @@ class TokenDb:
                 )
                 user_id = int(cursor.lastrowid)
 
-        return {
+        result = {
             "id": user_id,
             "linuxdo_user_id": str(user.id),
             "username": user.username,
             "name": user.name or user.username,
             "trust_level": user.trust_level,
         }
+        _refresh_dashboard_memory()
+        return result
 
     def get_user(self, user_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -569,17 +808,29 @@ class TokenDb:
             )
             api_key_id = int(cursor.lastrowid)
 
-        return {
+        created = {
             "id": api_key_id,
             "name": name,
             "prefix": prefix,
             "token": api_key,
             "created_at": isoformat_from_ts(now),
         }
+        with _API_KEY_CACHE_LOCK:
+            _API_KEY_CACHE_BY_HASH[key_hash] = {
+                "api_key_id": api_key_id,
+                "user_id": user_id,
+                "status": "active",
+                "last_db_touch_ts": float(now),
+            }
+        return created
 
     def revoke_api_key(self, user_id: int, api_key_id: int) -> None:
         now = now_ts()
         with self._lock, self.connect() as conn:
+            row = conn.execute(
+                "SELECT key_hash FROM api_keys WHERE id = ? AND user_id = ?",
+                (api_key_id, user_id),
+            ).fetchone()
             conn.execute(
                 """
                 UPDATE api_keys
@@ -588,11 +839,28 @@ class TokenDb:
                 """,
                 (now, api_key_id, user_id),
             )
+        if row:
+            with _API_KEY_CACHE_LOCK:
+                _API_KEY_CACHE_BY_HASH.pop(str(row["key_hash"]), None)
 
     def resolve_api_key(self, api_key: str) -> dict[str, Any] | None:
         key_hash = hash_api_key(api_key)
         now = now_ts()
-        with self._lock, self.connect() as conn:
+        with _API_KEY_CACHE_LOCK:
+            cached = _API_KEY_CACHE_BY_HASH.get(key_hash)
+
+        if cached and cached.get("status") == "active":
+            api_key_id = int(cached["api_key_id"])
+            user_id = int(cached["user_id"])
+            if now - float(cached.get("last_db_touch_ts") or 0.0) < _API_KEY_TOUCH_INTERVAL_SEC:
+                return {"api_key_id": api_key_id, "user_id": user_id}
+            with self._lock, self.connect() as conn:
+                conn.execute("UPDATE api_keys SET last_used_at_ts = ? WHERE id = ?", (now, api_key_id))
+            with _API_KEY_CACHE_LOCK:
+                cached["last_db_touch_ts"] = float(now)
+            return {"api_key_id": api_key_id, "user_id": user_id}
+
+        with self.connect() as conn:
             row = conn.execute(
                 """
                 SELECT api_keys.id as api_key_id, api_keys.user_id as user_id
@@ -601,13 +869,12 @@ class TokenDb:
                 """,
                 (key_hash,),
             ).fetchone()
-            if not row:
-                return None
-            conn.execute(
-                "UPDATE api_keys SET last_used_at_ts = ? WHERE id = ?",
-                (now, row["api_key_id"]),
-            )
-        return {"api_key_id": int(row["api_key_id"]), "user_id": int(row["user_id"])}
+        if not row:
+            return None
+        record = {"api_key_id": int(row["api_key_id"]), "user_id": int(row["user_id"])}
+        with _API_KEY_CACHE_LOCK:
+            _API_KEY_CACHE_BY_HASH[key_hash] = {**record, "status": "active", "last_db_touch_ts": 0.0}
+        return self.resolve_api_key(api_key)
 
     def get_quota_usage(self, user_id: int) -> dict[str, int]:
         now = now_ts()
@@ -838,6 +1105,7 @@ class TokenDb:
         now = now_ts()
         cutoff = now - 3600
         request_id = secrets.token_hex(8)
+        result: dict[str, Any] | None = None
 
         with self._lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -882,8 +1150,7 @@ class TokenDb:
 
             if claim_queue.has_pending_queue(self, conn=conn):
                 queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
-                _QUEUE_STATUS_CACHE.pop(user_id, None)
-                return {
+                result = {
                     "request_id": queued["request_id"],
                     "items": [],
                     "requested": target,
@@ -894,103 +1161,105 @@ class TokenDb:
                     "queue_remaining": queued["remaining"],
                     "quota": {"used": used, "limit": limit, "remaining": remaining},
                 }
-
-            available_row = conn.execute(
-                """
-                SELECT COUNT(*) as cnt
-                FROM tokens
-                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
-                """
-            ).fetchone()
-            available = int(available_row["cnt"]) if available_row else 0
-            if available < target:
-                queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
-                _QUEUE_STATUS_CACHE.pop(user_id, None)
-                return {
-                    "request_id": queued["request_id"],
-                    "items": [],
-                    "requested": target,
-                    "granted": 0,
-                    "queued": True,
-                    "queue_id": queued["queue_id"],
-                    "queue_position": queued["position"],
-                    "queue_remaining": queued["remaining"],
-                    "quota": {"used": used, "limit": limit, "remaining": remaining},
-                }
-
-            rows = conn.execute(
-                """
-                SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
-                FROM tokens
-                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
-                ORDER BY created_at_ts ASC, id ASC
-                LIMIT ?
-                """,
-                (target,),
-            ).fetchall()
-
-            if not rows:
-                queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
-                _QUEUE_STATUS_CACHE.pop(user_id, None)
-                return {
-                    "request_id": queued["request_id"],
-                    "items": [],
-                    "requested": target,
-                    "granted": 0,
-                    "queued": True,
-                    "queue_id": queued["queue_id"],
-                    "queue_position": queued["position"],
-                    "queue_remaining": queued["remaining"],
-                    "quota": {"used": used, "limit": limit, "remaining": remaining},
-                }
-
-            items: list[dict[str, Any]] = []
-            for row in rows:
-                token_id = int(row["id"])
-                new_count = int(row["claim_count"]) + 1
-                new_available = 1 if new_count < int(row["max_claims"]) else 0
-                conn.execute(
+            else:
+                available_row = conn.execute(
                     """
-                    UPDATE tokens
-                    SET claim_count = ?,
-                        is_available = ?,
-                        updated_at_ts = ?
-                    WHERE id = ?
-                    """,
-                    (new_count, new_available, now, token_id),
-                )
-                conn.execute(
+                    SELECT COUNT(*) as cnt
+                    FROM tokens
+                    WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
                     """
-                    INSERT INTO token_claims (
-                        token_id, user_id, api_key_id, claimed_at_ts, is_hidden, request_id
-                    ) VALUES (?, ?, ?, ?, 0, ?)
-                    """,
-                    (token_id, user_id, api_key_id, now, request_id),
-                )
-                claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-
-                items.append(
-                    {
-                        "claim_id": claim_id,
-                        "token_id": token_id,
-                        "file_name": row["file_name"],
-                        "file_path": row["file_path"],
-                        "encoding": row["encoding"],
-                        "content": json.loads(row["content_json"]),
+                ).fetchone()
+                available = int(available_row["cnt"]) if available_row else 0
+                if available < target:
+                    queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                    result = {
+                        "request_id": queued["request_id"],
+                        "items": [],
+                        "requested": target,
+                        "granted": 0,
+                        "queued": True,
+                        "queue_id": queued["queue_id"],
+                        "queue_position": queued["position"],
+                        "queue_remaining": queued["remaining"],
+                        "quota": {"used": used, "limit": limit, "remaining": remaining},
                     }
-                )
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
+                        FROM tokens
+                        WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
+                        ORDER BY created_at_ts ASC, id ASC
+                        LIMIT ?
+                        """,
+                        (target,),
+                    ).fetchall()
 
-            new_used = used + len(items)
-            new_remaining = max(0, limit - new_used)
+                    if not rows:
+                        queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                        result = {
+                            "request_id": queued["request_id"],
+                            "items": [],
+                            "requested": target,
+                            "granted": 0,
+                            "queued": True,
+                            "queue_id": queued["queue_id"],
+                            "queue_position": queued["position"],
+                            "queue_remaining": queued["remaining"],
+                            "quota": {"used": used, "limit": limit, "remaining": remaining},
+                        }
+                    else:
+                        items: list[dict[str, Any]] = []
+                        for row in rows:
+                            token_id = int(row["id"])
+                            new_count = int(row["claim_count"]) + 1
+                            new_available = 1 if new_count < int(row["max_claims"]) else 0
+                            conn.execute(
+                                """
+                                UPDATE tokens
+                                SET claim_count = ?,
+                                    is_available = ?,
+                                    updated_at_ts = ?
+                                WHERE id = ?
+                                """,
+                                (new_count, new_available, now, token_id),
+                            )
+                            conn.execute(
+                                """
+                                INSERT INTO token_claims (
+                                    token_id, user_id, api_key_id, claimed_at_ts, is_hidden, request_id
+                                ) VALUES (?, ?, ?, ?, 0, ?)
+                                """,
+                                (token_id, user_id, api_key_id, now, request_id),
+                            )
+                            claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
-        return {
-            "request_id": request_id,
-            "items": items,
-            "requested": target,
-            "granted": len(items),
-            "queued": False,
-            "quota": {"used": new_used, "limit": limit, "remaining": new_remaining},
-        }
+                            items.append(
+                                {
+                                    "claim_id": claim_id,
+                                    "token_id": token_id,
+                                    "file_name": row["file_name"],
+                                    "file_path": row["file_path"],
+                                    "encoding": row["encoding"],
+                                    "content": json.loads(row["content_json"]),
+                                }
+                            )
+
+                        new_used = used + len(items)
+                        new_remaining = max(0, limit - new_used)
+                        result = {
+                            "request_id": request_id,
+                            "items": items,
+                            "requested": target,
+                            "granted": len(items),
+                            "queued": False,
+                            "quota": {"used": new_used, "limit": limit, "remaining": new_remaining},
+                        }
+
+        if result is None:
+            raise RuntimeError("claim_tokens completed without a result")
+        _refresh_dashboard_memory()
+        return result
 
     def get_claimed_token(self, token_id: int, user_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -1430,6 +1699,21 @@ def get_inventory_limits() -> dict[str, dict[str, int]]:
     }
 
 
+def build_inventory_policy_from_snapshot(snapshot: dict[str, int]) -> dict[str, Any]:
+    thresholds = get_inventory_thresholds()
+    limits = get_inventory_limits()
+    unclaimed = int(snapshot["unclaimed"])
+    status = resolve_inventory_status(unclaimed, thresholds)
+    chosen = limits.get(status, limits["healthy"])
+    return {
+        "status": status,
+        "unclaimed": unclaimed,
+        "thresholds": thresholds,
+        "hourly_limit": chosen["hourly"],
+        "max_claims": chosen["max_claims"],
+    }
+
+
 def resolve_inventory_status(unclaimed: int, thresholds: dict[str, int]) -> str:
     if unclaimed < thresholds["critical"]:
         return "critical"
@@ -1444,18 +1728,7 @@ def get_inventory_policy(db_handle: "TokenDb", *, conn=None, force: bool = False
     if cached and not force and _cache_fresh(ts):
         return cached
     snapshot = db_handle.get_inventory_snapshot(conn=conn)
-    unclaimed = snapshot["unclaimed"]
-    thresholds = get_inventory_thresholds()
-    limits = get_inventory_limits()
-    status = resolve_inventory_status(unclaimed, thresholds)
-    chosen = limits.get(status, limits["healthy"])
-    policy = {
-        "status": status,
-        "unclaimed": unclaimed,
-        "thresholds": thresholds,
-        "hourly_limit": chosen["hourly"],
-        "max_claims": chosen["max_claims"],
-    }
+    policy = build_inventory_policy_from_snapshot(snapshot)
     _POLICY_CACHE["value"] = policy
     _POLICY_CACHE["ts"] = time.time()
     return policy
@@ -1695,6 +1968,8 @@ observer: Observer | None = None
 _QUEUE_FULFILL_LOCK = threading.Lock()
 _QUEUE_LAST_FULFILL_TS = 0.0
 _QUEUE_FULFILL_THROTTLE_SEC = 5.0
+_CLAIM_EVENT_WINDOW_SEC = 14 * 24 * 3600
+_API_KEY_TOUCH_INTERVAL_SEC = 300
 _STATS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _POLICY_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _POLICY_STATE: dict[str, Any] = {"status": None, "max_claims": None}
@@ -1707,6 +1982,14 @@ _CACHE_TTL_SEC = 5.0
 _QUEUE_PUMP_THREAD: threading.Thread | None = None
 _QUEUE_PUMP_STOP = threading.Event()
 _QUEUE_PUMP_INTERVAL_SEC = 20.0
+_API_KEY_CACHE_LOCK = threading.RLock()
+_API_KEY_CACHE_BY_HASH: dict[str, dict[str, Any]] = {}
+_DASHBOARD_CACHE = DashboardMemoryCache()
+
+
+def _refresh_dashboard_memory() -> None:
+    _DASHBOARD_CACHE.refresh_from_db(db, store.list_index()["updated_at"])
+    _QUEUE_STATUS_CACHE.clear()
 
 
 def try_fulfill_queue(db_handle: TokenDb) -> None:
@@ -1716,11 +1999,13 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
         if now - _QUEUE_LAST_FULFILL_TS < _QUEUE_FULFILL_THROTTLE_SEC:
             return
         _QUEUE_LAST_FULFILL_TS = now
-    claim_queue.fulfill_queue(
+    result = claim_queue.fulfill_queue(
         db_handle,
         hourly_limit=get_claim_hourly_limit(db_handle),
         apikey_rate_limit=get_apikey_rate_per_minute(),
     )
+    if result.get("fulfilled") or result.get("updated"):
+        _refresh_dashboard_memory()
 
 
 def _cache_fresh(ts: float) -> bool:
@@ -1745,6 +2030,7 @@ async def lifespan(_: FastAPI):
     db.init_db()
     sync_tokens_with_retry(db, TOKEN_DIR)
     store.refresh_all()
+    _refresh_dashboard_memory()
 
     event_handler = TokenDirectoryEventHandler(store, db)
     observer = Observer()
@@ -1875,16 +2161,7 @@ def get_dashboard_leaderboard(
     require_session_user(request)
     window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
     limit = min(limit, 50)
-    cache_key = f"{window_sec}:{limit}"
-    cached = _LEADERBOARD_CACHE.get("value")
-    if cached and _LEADERBOARD_CACHE.get("key") == cache_key and _cache_fresh(float(_LEADERBOARD_CACHE.get("ts") or 0.0)):
-        return cached
-    items = db.get_leaderboard(window_sec, limit)
-    payload = {"window": window_sec, "items": items}
-    _LEADERBOARD_CACHE["value"] = payload
-    _LEADERBOARD_CACHE["ts"] = time.time()
-    _LEADERBOARD_CACHE["key"] = cache_key
-    return payload
+    return _DASHBOARD_CACHE.get_leaderboard(window_sec, limit)
 
 
 @app.get("/dashboard/summary")
@@ -1898,89 +2175,29 @@ def get_dashboard_summary(
 ) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-
-    stats_cached = _STATS_CACHE.get("value")
-    stats_ts = float(_STATS_CACHE.get("ts") or 0.0)
-    if stats_cached is not None and _cache_fresh(stats_ts):
-        stats = stats_cached
-    else:
-        stats = db.get_dashboard_stats(user_id)
-        _STATS_CACHE["value"] = stats
-        _STATS_CACHE["ts"] = time.time()
+    full_stats = _DASHBOARD_CACHE.get_stats(user_id)
+    stats = {
+        "total_tokens": full_stats["total_tokens"],
+        "available_tokens": full_stats["available_tokens"],
+        "claimed_total": full_stats["claimed_total"],
+        "claimed_unique": full_stats["claimed_unique"],
+        "others_claimed_total": full_stats["others_claimed_total"],
+        "others_claimed_unique": full_stats["others_claimed_unique"],
+    }
 
     leaderboard_window_sec = parse_window_to_seconds(
         leaderboard_window, 24 * 3600, max_seconds=7 * 24 * 3600
     )
     leaderboard_limit = min(leaderboard_limit, 50)
-    leaderboard_key = f"{leaderboard_window_sec}:{leaderboard_limit}"
-    leaderboard_cached = _LEADERBOARD_CACHE.get("value")
-    if (
-        leaderboard_cached
-        and _LEADERBOARD_CACHE.get("key") == leaderboard_key
-        and _cache_fresh(float(_LEADERBOARD_CACHE.get("ts") or 0.0))
-    ):
-        leaderboard = leaderboard_cached
-    else:
-        leaderboard_items = db.get_leaderboard(leaderboard_window_sec, leaderboard_limit)
-        leaderboard = {"window": leaderboard_window_sec, "items": leaderboard_items}
-        _LEADERBOARD_CACHE["value"] = leaderboard
-        _LEADERBOARD_CACHE["ts"] = time.time()
-        _LEADERBOARD_CACHE["key"] = leaderboard_key
+    leaderboard = _DASHBOARD_CACHE.get_leaderboard(leaderboard_window_sec, leaderboard_limit)
 
     recent_limit = min(recent_limit, 50)
-    recent_key = str(recent_limit)
-    recent_cached = _RECENT_CLAIMS_CACHE.get("value")
-    if (
-        recent_cached
-        and _RECENT_CLAIMS_CACHE.get("key") == recent_key
-        and _cache_fresh(float(_RECENT_CLAIMS_CACHE.get("ts") or 0.0))
-    ):
-        recent = recent_cached
-    else:
-        recent_items = db.list_recent_claims(recent_limit)
-        recent = {"items": recent_items}
-        _RECENT_CLAIMS_CACHE["value"] = recent
-        _RECENT_CLAIMS_CACHE["ts"] = time.time()
-        _RECENT_CLAIMS_CACHE["key"] = recent_key
+    recent = _DASHBOARD_CACHE.get_recent(recent_limit)
 
     window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
     bucket_sec = parse_bucket_seconds(bucket, 3600)
-    trends_key = f"{window_sec}:{bucket_sec}"
-    trends_cached = _TRENDS_CACHE.get("value")
-    if (
-        trends_cached
-        and _TRENDS_CACHE.get("key") == trends_key
-        and _cache_fresh(float(_TRENDS_CACHE.get("ts") or 0.0))
-    ):
-        trends = trends_cached
-    else:
-        series = db.get_claim_trends(window_sec, bucket_sec)
-        trends = {"window": window_sec, "bucket": bucket_sec, "series": series}
-        _TRENDS_CACHE["value"] = trends
-        _TRENDS_CACHE["ts"] = time.time()
-        _TRENDS_CACHE["key"] = trends_key
-
-    system_cached = _SYSTEM_STATUS_CACHE.get("value")
-    if system_cached and _cache_fresh(float(_SYSTEM_STATUS_CACHE.get("ts") or 0.0)):
-        system = system_cached
-    else:
-        policy = db.ensure_inventory_policy()
-        snapshot = db.get_inventory_snapshot()
-        queue = db.get_queue_overview()
-        index_snapshot = store.list_index()
-        system = {
-            "inventory": snapshot,
-            "queue": queue,
-            "health": {
-                "status": policy["status"],
-                "hourly_limit": policy["hourly_limit"],
-                "max_claims": policy["max_claims"],
-                "thresholds": policy["thresholds"],
-            },
-            "index": {"updated_at": index_snapshot["updated_at"]},
-        }
-        _SYSTEM_STATUS_CACHE["value"] = system
-        _SYSTEM_STATUS_CACHE["ts"] = time.time()
+    trends = _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec)
+    system = _DASHBOARD_CACHE.get_system_status()
 
     return {
         "stats": stats,
@@ -1997,16 +2214,7 @@ def get_dashboard_recent_claims(
     limit: int = Query(default=20, ge=1, le=50),
 ) -> dict[str, Any]:
     require_session_user(request)
-    cache_key = str(limit)
-    cached = _RECENT_CLAIMS_CACHE.get("value")
-    if cached and _RECENT_CLAIMS_CACHE.get("key") == cache_key and _cache_fresh(float(_RECENT_CLAIMS_CACHE.get("ts") or 0.0)):
-        return cached
-    items = db.list_recent_claims(limit)
-    payload = {"items": items}
-    _RECENT_CLAIMS_CACHE["value"] = payload
-    _RECENT_CLAIMS_CACHE["ts"] = time.time()
-    _RECENT_CLAIMS_CACHE["key"] = cache_key
-    return payload
+    return _DASHBOARD_CACHE.get_recent(limit)
 
 
 @app.get("/dashboard/trends")
@@ -2018,56 +2226,28 @@ def get_dashboard_trends(
     require_session_user(request)
     window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
     bucket_sec = parse_bucket_seconds(bucket, 3600)
-    cache_key = f"{window_sec}:{bucket_sec}"
-    cached = _TRENDS_CACHE.get("value")
-    if cached and _TRENDS_CACHE.get("key") == cache_key and _cache_fresh(float(_TRENDS_CACHE.get("ts") or 0.0)):
-        return cached
-    series = db.get_claim_trends(window_sec, bucket_sec)
-    payload = {"window": window_sec, "bucket": bucket_sec, "series": series}
-    _TRENDS_CACHE["value"] = payload
-    _TRENDS_CACHE["ts"] = time.time()
-    _TRENDS_CACHE["key"] = cache_key
-    return payload
+    return _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec)
 
 
 @app.get("/dashboard/system-status")
 def get_dashboard_system_status(request: Request) -> dict[str, Any]:
     require_session_user(request)
-    cached = _SYSTEM_STATUS_CACHE.get("value")
-    if cached and _cache_fresh(float(_SYSTEM_STATUS_CACHE.get("ts") or 0.0)):
-        return cached
-    policy = db.ensure_inventory_policy()
-    snapshot = db.get_inventory_snapshot()
-    queue = db.get_queue_overview()
-    index_snapshot = store.list_index()
-    payload = {
-        "inventory": snapshot,
-        "queue": queue,
-        "health": {
-            "status": policy["status"],
-            "hourly_limit": policy["hourly_limit"],
-            "max_claims": policy["max_claims"],
-            "thresholds": policy["thresholds"],
-        },
-        "index": {"updated_at": index_snapshot["updated_at"]},
-    }
-    _SYSTEM_STATUS_CACHE["value"] = payload
-    _SYSTEM_STATUS_CACHE["ts"] = time.time()
-    return payload
+    return _DASHBOARD_CACHE.get_system_status()
 
 
 @app.get("/dashboard/stats")
 def get_dashboard_stats(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    cached = _STATS_CACHE.get("value")
-    ts = float(_STATS_CACHE.get("ts") or 0.0)
-    if cached is not None and _cache_fresh(ts):
-        return cached
-    stats = db.get_dashboard_stats(user_id)
-    _STATS_CACHE["value"] = stats
-    _STATS_CACHE["ts"] = time.time()
-    return stats
+    stats = _DASHBOARD_CACHE.get_stats(user_id)
+    return {
+        "total_tokens": stats["total_tokens"],
+        "available_tokens": stats["available_tokens"],
+        "claimed_total": stats["claimed_total"],
+        "claimed_unique": stats["claimed_unique"],
+        "others_claimed_total": stats["others_claimed_total"],
+        "others_claimed_unique": stats["others_claimed_unique"],
+    }
 
 
 @app.get("/me/api-keys")
