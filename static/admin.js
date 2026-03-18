@@ -76,6 +76,32 @@ function showNotice(message = "", tone = "success") {
   elements.notice.classList.toggle("hidden", !message);
 }
 
+function formatUserLabel(username, id) {
+  return username ? `@${username} (${id})` : String(id);
+}
+
+function getUserLabelFromDetail() {
+  const user = state.userDetail?.user;
+  return formatUserLabel(user?.username, state.selectedUserId);
+}
+
+function setButtonPending(button, pendingText) {
+  if (!button) {
+    return null;
+  }
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.dataset.pending = "true";
+  if (pendingText) {
+    button.textContent = pendingText;
+  }
+  return () => {
+    button.disabled = false;
+    button.dataset.pending = "false";
+    button.textContent = originalText;
+  };
+}
+
 function formatDateTime(value) {
   if (!value) {
     return "-";
@@ -279,23 +305,30 @@ function renderBans() {
         </div>
       `;
       card.querySelector("[data-ban-open]").addEventListener("click", async () => {
+        const userLabel = formatUserLabel(item.username_snapshot, item.linuxdo_user_id);
         switchTab("users");
-        await loadUsers(true);
+        showNotice(`正在定位 ${userLabel}...`);
         await loadUserDetail(item.linuxdo_user_id);
-        showNotice(`已定位到用户 ${item.linuxdo_user_id}`);
+        loadUsers();
+        showNotice(`已定位到 ${userLabel}`);
       });
       const unbanBtn = card.querySelector("[data-ban-unban]");
       if (unbanBtn) {
         unbanBtn.addEventListener("click", async () => {
+          const userLabel = formatUserLabel(item.username_snapshot, item.linuxdo_user_id);
+          const restoreButton = setButtonPending(unbanBtn, "解封中...");
+          showNotice(`正在解封 ${userLabel}...`);
           try {
             await fetchJson(`/admin/users/${encodeURIComponent(item.linuxdo_user_id)}/unban`, { method: "POST" });
+            showNotice(`已解封 ${userLabel}`);
             await Promise.all([loadUsers(), loadBans()]);
             if (state.selectedUserId === item.linuxdo_user_id) {
               await loadUserDetail(item.linuxdo_user_id);
             }
-            showNotice(`已解封用户 ${item.linuxdo_user_id}`);
           } catch (error) {
             showNotice(error.message, "error");
+          } finally {
+            restoreButton?.();
           }
         });
       }
@@ -336,15 +369,16 @@ function renderTokens() {
       `;
       const actionBtn = card.querySelector("[data-token-action]");
       actionBtn.addEventListener("click", async () => {
-        actionBtn.disabled = true;
+        const restoreButton = setButtonPending(actionBtn, `${actionText}中...`);
+        showNotice(`正在${actionText} ${item.file_name}...`);
         try {
           await fetchJson(`/admin/tokens/${item.id}/${actionPath}`, { method: "POST" });
-          await Promise.all([loadTokens(), loadPolicy()]);
           showNotice(`${item.file_name} 已${actionText}`);
+          await Promise.all([loadTokens(), loadPolicy()]);
         } catch (error) {
           showNotice(error.message, "error");
         } finally {
-          actionBtn.disabled = false;
+          restoreButton?.();
         }
       });
       elements.tokenList.appendChild(card);
@@ -455,6 +489,7 @@ async function banSelectedUser() {
   if (!state.selectedUserId) {
     return;
   }
+  const submitBtn = document.getElementById("admin-ban-submit");
   const reason = document.getElementById("admin-ban-reason")?.value.trim() || "";
   if (!reason) {
     showNotice("封禁原因必填", "error");
@@ -467,17 +502,22 @@ async function banSelectedUser() {
     return;
   }
   const expiresAt = expiresDate ? expiresDate.toISOString() : null;
+  const userLabel = getUserLabelFromDetail();
+  const restoreButton = setButtonPending(submitBtn, "保存中...");
+  showNotice(`正在保存 ${userLabel} 的封禁...`);
   try {
     await fetchJson(`/admin/users/${encodeURIComponent(state.selectedUserId)}/ban`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ reason, expires_at: expiresAt }),
     });
-    await Promise.all([loadUsers(), loadBans(true)]);
+    showNotice(`已保存对 ${userLabel} 的封禁`);
     await loadUserDetail(state.selectedUserId);
-    showNotice(`已保存对 ${state.selectedUserId} 的封禁`);
+    await Promise.all([loadUsers(), loadBans(true)]);
   } catch (error) {
     showNotice(error.message, "error");
+  } finally {
+    restoreButton?.();
   }
 }
 
@@ -485,13 +525,19 @@ async function unbanSelectedUser() {
   if (!state.selectedUserId) {
     return;
   }
+  const unbanBtn = document.getElementById("admin-unban-submit");
+  const userLabel = getUserLabelFromDetail();
+  const restoreButton = setButtonPending(unbanBtn, "解封中...");
+  showNotice(`正在解封 ${userLabel}...`);
   try {
     await fetchJson(`/admin/users/${encodeURIComponent(state.selectedUserId)}/unban`, { method: "POST" });
-    await Promise.all([loadUsers(), loadBans(true)]);
+    showNotice(`已解封 ${userLabel}`);
     await loadUserDetail(state.selectedUserId);
-    showNotice(`已解封用户 ${state.selectedUserId}`);
+    await Promise.all([loadUsers(), loadBans(true)]);
   } catch (error) {
     showNotice(error.message, "error");
+  } finally {
+    restoreButton?.();
   }
 }
 

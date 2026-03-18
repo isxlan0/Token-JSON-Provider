@@ -2243,6 +2243,16 @@ def sync_tokens_with_retry(db_handle: TokenDb, token_dir: Path, retries: int = 5
             time.sleep(delay_sec)
 
 
+def run_db_write_with_retry(func, retries: int = 4, delay_sec: float = 0.35):
+    for attempt in range(1, retries + 1):
+        try:
+            return func()
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= retries:
+                raise
+            time.sleep(delay_sec)
+
+
 def get_session_secret() -> str:
     return os.getenv(SESSION_SECRET_ENV, "change-me-session-secret")
 
@@ -2969,12 +2979,14 @@ def admin_ban_user(request: Request, linuxdo_user_id: str, payload: AdminBanPayl
             ensure_ascii=False,
         ).encode("utf-8")
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
-    ban = db.ban_user(
-        linuxdo_user_id=target["linuxdo_user_id"],
-        username_snapshot=target["linuxdo_username"],
-        reason=payload.reason,
-        banned_by_user_id=context["user_id"],
-        expires_at_ts=expires_at_ts,
+    ban = run_db_write_with_retry(
+        lambda: db.ban_user(
+            linuxdo_user_id=target["linuxdo_user_id"],
+            username_snapshot=target["linuxdo_username"],
+            reason=payload.reason,
+            banned_by_user_id=context["user_id"],
+            expires_at_ts=expires_at_ts,
+        )
     )
     return {"ok": True, "ban": ban}
 
@@ -2982,7 +2994,9 @@ def admin_ban_user(request: Request, linuxdo_user_id: str, payload: AdminBanPayl
 @app.post("/admin/users/{linuxdo_user_id}/unban")
 def admin_unban_user(request: Request, linuxdo_user_id: str) -> dict[str, Any]:
     context = require_admin_user(request)
-    changed = db.unban_user(linuxdo_user_id, unbanned_by_user_id=context["user_id"])
+    changed = run_db_write_with_retry(
+        lambda: db.unban_user(linuxdo_user_id, unbanned_by_user_id=context["user_id"])
+    )
     return {"ok": changed}
 
 
@@ -3013,7 +3027,7 @@ def admin_list_tokens(
 @app.post("/admin/tokens/{token_id}/activate")
 def admin_activate_token(request: Request, token_id: int) -> dict[str, Any]:
     require_admin_user(request)
-    token = db.set_token_enabled(token_id, True)
+    token = run_db_write_with_retry(lambda: db.set_token_enabled(token_id, True))
     if not token:
         error_json = json.dumps({"detail": "Token not found."}, ensure_ascii=False).encode("utf-8")
         return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
@@ -3023,7 +3037,7 @@ def admin_activate_token(request: Request, token_id: int) -> dict[str, Any]:
 @app.post("/admin/tokens/{token_id}/deactivate")
 def admin_deactivate_token(request: Request, token_id: int) -> dict[str, Any]:
     require_admin_user(request)
-    token = db.set_token_enabled(token_id, False)
+    token = run_db_write_with_retry(lambda: db.set_token_enabled(token_id, False))
     if not token:
         error_json = json.dumps({"detail": "Token not found."}, ensure_ascii=False).encode("utf-8")
         return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
