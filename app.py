@@ -51,6 +51,7 @@ TOKEN_HOURLY_LIMIT_CRITICAL_ENV = "TOKEN_HOURLY_LIMIT_CRITICAL"
 TOKEN_MAX_CLAIMS_HEALTHY_ENV = "TOKEN_MAX_CLAIMS_HEALTHY"
 TOKEN_MAX_CLAIMS_WARNING_ENV = "TOKEN_MAX_CLAIMS_WARNING"
 TOKEN_MAX_CLAIMS_CRITICAL_ENV = "TOKEN_MAX_CLAIMS_CRITICAL"
+TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE_ENV = "TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE"
 APIKEY_MAX_PER_USER_ENV = "TOKEN_APIKEY_MAX_PER_USER"
 APIKEY_RATE_PER_MIN_ENV = "TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE"
 PROVIDER_BASE_URL_ENV = "TOKEN_PROVIDER_BASE_URL"
@@ -99,6 +100,13 @@ def env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def get_non_healthy_max_claims_scope() -> str:
+    raw = env_value(TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE_ENV, "all_unfinished").strip().lower()
+    if raw in {"all_unfinished", "new_only", "unclaimed_only"}:
+        return raw
+    return "all_unfinished"
 
 
 def normalize_username(value: str) -> str:
@@ -1722,10 +1730,46 @@ class TokenDb:
             policy = get_inventory_policy(self, conn=target_conn, force=True)
             status = policy["status"]
             max_claims = int(policy["max_claims"])
+            non_healthy_scope = str(policy.get("non_healthy_max_claims_scope") or "all_unfinished")
             runtime_state = self._get_runtime_policy_state(target_conn)
             runtime_status = runtime_state["status"] if runtime_state else None
             runtime_max_claims = int(runtime_state["max_claims"]) if runtime_state else None
             healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
+
+            def _apply_non_healthy_scope(now: int) -> None:
+                if max_claims <= healthy_max_claims:
+                    return
+                if non_healthy_scope == "all_unfinished":
+                    target_conn.execute(
+                        """
+                        UPDATE tokens
+                        SET max_claims = ?,
+                            is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
+                            updated_at_ts = ?
+                        WHERE is_active = 1
+                          AND is_enabled = 1
+                          AND claim_count < ?
+                          AND max_claims < ?
+                        """
+                        ,
+                        (max_claims, max_claims, now, max_claims, max_claims),
+                    )
+                    return
+                target_conn.execute(
+                    """
+                    UPDATE tokens
+                    SET max_claims = ?,
+                        is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
+                        updated_at_ts = ?
+                    WHERE is_active = 1
+                      AND is_enabled = 1
+                      AND claim_count = 0
+                      AND max_claims < ?
+                    """
+                    ,
+                    (max_claims, max_claims, now, max_claims),
+                )
+
             if runtime_status != status or runtime_max_claims != max_claims:
                 now = now_ts()
                 target_conn.execute(
@@ -1739,18 +1783,7 @@ class TokenDb:
                     ,
                     (healthy_max_claims, healthy_max_claims, now),
                 )
-                if max_claims > healthy_max_claims:
-                    target_conn.execute(
-                        """
-                        UPDATE tokens
-                        SET max_claims = ?,
-                            is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
-                            updated_at_ts = ?
-                        WHERE is_active = 1 AND is_enabled = 1 AND claim_count = 0
-                        """
-                        ,
-                        (max_claims, max_claims, now),
-                    )
+                _apply_non_healthy_scope(now)
                 self._set_runtime_policy_state(
                     target_conn,
                     status=status,
@@ -1760,19 +1793,8 @@ class TokenDb:
                 _POLICY_STATE["status"] = status
                 _POLICY_STATE["max_claims"] = max_claims
             elif runtime_state:
-                if max_claims > healthy_max_claims:
-                    now = now_ts()
-                    target_conn.execute(
-                        """
-                        UPDATE tokens
-                        SET max_claims = ?,
-                            is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
-                            updated_at_ts = ?
-                        WHERE is_active = 1 AND is_enabled = 1 AND claim_count = 0 AND max_claims < ?
-                        """
-                        ,
-                        (max_claims, max_claims, now, max_claims),
-                    )
+                now = now_ts()
+                _apply_non_healthy_scope(now)
                 _POLICY_STATE["status"] = runtime_state["status"]
                 _POLICY_STATE["max_claims"] = int(runtime_state["max_claims"])
             return policy
@@ -2421,6 +2443,7 @@ def build_inventory_policy_from_snapshot(snapshot: dict[str, int]) -> dict[str, 
         "thresholds": thresholds,
         "hourly_limit": chosen["hourly"],
         "max_claims": chosen["max_claims"],
+        "non_healthy_max_claims_scope": get_non_healthy_max_claims_scope(),
     }
 
 
@@ -2983,6 +3006,7 @@ def get_admin_me(request: Request) -> dict[str, Any]:
             "hourly_limit": policy["hourly_limit"],
             "max_claims": policy["max_claims"],
             "thresholds": policy["thresholds"],
+            "non_healthy_max_claims_scope": policy["non_healthy_max_claims_scope"],
             "source": "env",
         },
         "system": _DASHBOARD_CACHE.get_system_status(),
@@ -3160,6 +3184,7 @@ def admin_get_policy(request: Request) -> dict[str, Any]:
         "hourly_limit": policy["hourly_limit"],
         "max_claims": policy["max_claims"],
         "thresholds": policy["thresholds"],
+        "non_healthy_max_claims_scope": policy["non_healthy_max_claims_scope"],
         "system": _DASHBOARD_CACHE.get_system_status(),
     }
 
