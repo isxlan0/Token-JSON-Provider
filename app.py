@@ -913,7 +913,16 @@ class TokenDb:
         with self.connect() as conn:
             total_tokens = conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1").fetchone()
             available_tokens = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims"
+                """
+                SELECT COALESCE(SUM(
+                    CASE
+                        WHEN claim_count < max_claims THEN max_claims - claim_count
+                        ELSE 0
+                    END
+                ), 0) as cnt
+                FROM tokens
+                WHERE is_active = 1
+                """
             ).fetchone()
             claimed_total = conn.execute("SELECT COUNT(*) as cnt FROM token_claims").fetchone()
             claimed_unique = conn.execute(
@@ -941,7 +950,16 @@ class TokenDb:
         def _fetch(target_conn):
             total_row = target_conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1").fetchone()
             available_row = target_conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims"
+                """
+                SELECT COALESCE(SUM(
+                    CASE
+                        WHEN claim_count < max_claims THEN max_claims - claim_count
+                        ELSE 0
+                    END
+                ), 0) as cnt
+                FROM tokens
+                WHERE is_active = 1
+                """
             ).fetchone()
             unclaimed_row = target_conn.execute(
                 "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND claim_count = 0"

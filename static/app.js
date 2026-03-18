@@ -189,7 +189,7 @@ function renderQueueStatus() {
   const remaining = status.remaining ?? status.requested ?? "-";
   elements.claimSummary.textContent =
     `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。` +
-    `当前可用库存 ${available}，库存会优先发给前面排队用户。` +
+    `当前可领取库存 ${available} 次，库存会优先发给前面排队用户。` +
     "系统每隔 15 秒自动刷新。";
   elements.claimSummary.classList.remove("hidden");
   state.queueSticky = true;
