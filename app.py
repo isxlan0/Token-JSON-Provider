@@ -1454,6 +1454,7 @@ class TokenDb:
                         is_cleaned = 1,
                         is_enabled = 0,
                         is_available = 0,
+                        content_json = '{{}}',
                         cleaned_at_ts = ?,
                         updated_at_ts = ?,
                         last_seen_at_ts = ?
