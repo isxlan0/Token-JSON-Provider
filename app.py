@@ -549,6 +549,13 @@ class TokenDb:
                     status TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS inventory_runtime (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    status TEXT NOT NULL,
+                    max_claims INTEGER NOT NULL,
+                    updated_at_ts INTEGER NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_token_claims_user_time
                     ON token_claims(user_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
@@ -576,6 +583,38 @@ class TokenDb:
             if "is_active" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
 
+    def _get_runtime_policy_state(self, conn: sqlite3.Connection) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT status, max_claims, updated_at_ts FROM inventory_runtime WHERE id = 1"
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "status": str(row["status"]),
+            "max_claims": int(row["max_claims"]),
+            "updated_at_ts": int(row["updated_at_ts"]),
+        }
+
+    def _set_runtime_policy_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        status: str,
+        max_claims: int,
+        updated_at_ts: int,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO inventory_runtime (id, status, max_claims, updated_at_ts)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                max_claims = excluded.max_claims,
+                updated_at_ts = excluded.updated_at_ts
+            """,
+            (status, max_claims, updated_at_ts),
+        )
+
     def _load_token_file(self, path: Path) -> tuple[str, str, str]:
         raw = path.read_bytes()
         encoding = detect_encoding(raw)
@@ -589,10 +628,9 @@ class TokenDb:
         files = sorted(token_dir.glob("*.json"), key=lambda path: path.name.lower())
         seen_names: set[str] = set()
         now = now_ts()
+        healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
 
         with self._lock, self.connect() as conn:
-            policy = self.ensure_inventory_policy(conn=conn)
-            max_claims = policy["max_claims"]
             for path in files:
                 try:
                     encoding, content_json, file_hash = self._load_token_file(path)
@@ -604,12 +642,13 @@ class TokenDb:
                 seen_names.add(file_name)
 
                 row = conn.execute(
-                    "SELECT id, claim_count FROM tokens WHERE file_name = ?",
+                    "SELECT id, claim_count, max_claims FROM tokens WHERE file_name = ?",
                     (file_name,),
                 ).fetchone()
                 if row:
                     claim_count = int(row["claim_count"])
-                    is_available = 1 if claim_count < max_claims else 0
+                    effective_max_claims = int(row["max_claims"])
+                    is_available = 1 if claim_count < effective_max_claims else 0
                     conn.execute(
                         """
                         UPDATE tokens
@@ -617,7 +656,6 @@ class TokenDb:
                             file_hash = ?,
                             encoding = ?,
                             content_json = ?,
-                            max_claims = ?,
                             is_active = 1,
                             is_available = ?,
                             updated_at_ts = ?,
@@ -629,7 +667,6 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
-                            max_claims,
                             is_available,
                             now,
                             now,
@@ -663,7 +700,7 @@ class TokenDb:
                             1,
                             1,
                             0,
-                            max_claims,
+                            healthy_max_claims,
                             now,
                             now,
                             now,
@@ -687,6 +724,7 @@ class TokenDb:
                     "UPDATE tokens SET is_active = 0, is_available = 0, last_seen_at_ts = ?",
                     (now,),
                 )
+            self.ensure_inventory_policy(conn=conn)
         _refresh_dashboard_memory()
 
     def upsert_user(self, user: LinuxDOUser) -> dict[str, Any]:
@@ -980,7 +1018,11 @@ class TokenDb:
             policy = get_inventory_policy(self, conn=target_conn, force=True)
             status = policy["status"]
             max_claims = int(policy["max_claims"])
-            if _POLICY_STATE.get("status") != status or _POLICY_STATE.get("max_claims") != max_claims:
+            runtime_state = self._get_runtime_policy_state(target_conn)
+            runtime_status = runtime_state["status"] if runtime_state else None
+            runtime_max_claims = int(runtime_state["max_claims"]) if runtime_state else None
+            healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
+            if runtime_status != status or runtime_max_claims != max_claims:
                 now = now_ts()
                 target_conn.execute(
                     """
@@ -991,10 +1033,44 @@ class TokenDb:
                     WHERE is_active = 1
                     """
                     ,
-                    (max_claims, max_claims, now),
+                    (healthy_max_claims, healthy_max_claims, now),
+                )
+                if max_claims > healthy_max_claims:
+                    target_conn.execute(
+                        """
+                        UPDATE tokens
+                        SET max_claims = ?,
+                            is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
+                            updated_at_ts = ?
+                        WHERE is_active = 1 AND claim_count = 0
+                        """
+                        ,
+                        (max_claims, max_claims, now),
+                    )
+                self._set_runtime_policy_state(
+                    target_conn,
+                    status=status,
+                    max_claims=max_claims,
+                    updated_at_ts=now,
                 )
                 _POLICY_STATE["status"] = status
                 _POLICY_STATE["max_claims"] = max_claims
+            elif runtime_state:
+                if max_claims > healthy_max_claims:
+                    now = now_ts()
+                    target_conn.execute(
+                        """
+                        UPDATE tokens
+                        SET max_claims = ?,
+                            is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
+                            updated_at_ts = ?
+                        WHERE is_active = 1 AND claim_count = 0 AND max_claims < ?
+                        """
+                        ,
+                        (max_claims, max_claims, now, max_claims),
+                    )
+                _POLICY_STATE["status"] = runtime_state["status"]
+                _POLICY_STATE["max_claims"] = int(runtime_state["max_claims"])
             return policy
 
         if conn is None:
@@ -1371,9 +1447,14 @@ class TokenDb:
             total_queued = int(total_row["cnt"]) if total_row else 0
             available_row = conn.execute(
                 """
-                SELECT COUNT(*) as cnt
+                SELECT COALESCE(SUM(
+                    CASE
+                        WHEN claim_count < max_claims THEN max_claims - claim_count
+                        ELSE 0
+                    END
+                ), 0) as cnt
                 FROM tokens
-                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
+                WHERE is_active = 1
                 """
             ).fetchone()
             available = int(available_row["cnt"]) if available_row else 0
