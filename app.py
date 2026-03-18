@@ -858,7 +858,6 @@ class TokenDb:
                 "api_key_id": api_key_id,
                 "user_id": user_id,
                 "status": "active",
-                "last_db_touch_ts": float(now),
             }
         return created
 
@@ -883,20 +882,11 @@ class TokenDb:
 
     def resolve_api_key(self, api_key: str) -> dict[str, Any] | None:
         key_hash = hash_api_key(api_key)
-        now = now_ts()
         with _API_KEY_CACHE_LOCK:
             cached = _API_KEY_CACHE_BY_HASH.get(key_hash)
 
         if cached and cached.get("status") == "active":
-            api_key_id = int(cached["api_key_id"])
-            user_id = int(cached["user_id"])
-            if now - float(cached.get("last_db_touch_ts") or 0.0) < _API_KEY_TOUCH_INTERVAL_SEC:
-                return {"api_key_id": api_key_id, "user_id": user_id}
-            with self._lock, self.connect() as conn:
-                conn.execute("UPDATE api_keys SET last_used_at_ts = ? WHERE id = ?", (now, api_key_id))
-            with _API_KEY_CACHE_LOCK:
-                cached["last_db_touch_ts"] = float(now)
-            return {"api_key_id": api_key_id, "user_id": user_id}
+            return {"api_key_id": int(cached["api_key_id"]), "user_id": int(cached["user_id"])}
 
         with self.connect() as conn:
             row = conn.execute(
@@ -911,8 +901,8 @@ class TokenDb:
             return None
         record = {"api_key_id": int(row["api_key_id"]), "user_id": int(row["user_id"])}
         with _API_KEY_CACHE_LOCK:
-            _API_KEY_CACHE_BY_HASH[key_hash] = {**record, "status": "active", "last_db_touch_ts": 0.0}
-        return self.resolve_api_key(api_key)
+            _API_KEY_CACHE_BY_HASH[key_hash] = {**record, "status": "active"}
+        return record
 
     def get_quota_usage(self, user_id: int) -> dict[str, int]:
         now = now_ts()
@@ -2068,7 +2058,6 @@ _QUEUE_FULFILL_LOCK = threading.Lock()
 _QUEUE_LAST_FULFILL_TS = 0.0
 _QUEUE_FULFILL_THROTTLE_SEC = 5.0
 _CLAIM_EVENT_WINDOW_SEC = 14 * 24 * 3600
-_API_KEY_TOUCH_INTERVAL_SEC = 300
 _STATS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _POLICY_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _POLICY_STATE: dict[str, Any] = {"status": None, "max_claims": None}
