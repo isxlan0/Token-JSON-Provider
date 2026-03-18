@@ -11,7 +11,7 @@
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap"
     rel="stylesheet">
   <link rel="stylesheet" href="/assets/styles.css?v=20260318">
-  <link rel="stylesheet" href="/assets/admin.css?v=20260318">
+  <link rel="stylesheet" href="/assets/admin.css?v=20260318b">
 </head>
 
 <body class="light-theme admin-body">
@@ -41,7 +41,7 @@
         </svg>
       </div>
       <h1>没有后台权限</h1>
-      <p id="admin-denied-message">当前账号无权限访问后台。</p>
+      <p id="admin-denied-message">当前账号不在管理员名单中。</p>
       <div class="banned-actions">
         <a class="btn btn-outline" href="/">返回主站</a>
         <button id="admin-denied-logout-btn" class="btn btn-primary" type="button">退出登录</button>
@@ -51,21 +51,29 @@
 
   <section id="admin-app-screen" class="admin-app hidden">
     <aside class="admin-sidebar">
-      <div>
-        <div class="sidebar-brand">
+      <div class="admin-sidebar-top">
+        <div class="sidebar-brand admin-brand">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);">
+            stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
           </svg>
-          <h1>Admin</h1>
+          <div>
+            <h1>Admin</h1>
+            <div class="admin-brand-sub">站点管理</div>
+          </div>
         </div>
-        <nav class="nav-menu admin-nav">
-          <button id="admin-tab-users" class="nav-item active" type="button">用户管理</button>
-          <button id="admin-tab-bans" class="nav-item" type="button">封禁记录</button>
-          <button id="admin-tab-tokens" class="nav-item" type="button">Token 管理</button>
-          <button id="admin-tab-policy" class="nav-item" type="button">额度策略</button>
-        </nav>
+
+        <div class="admin-nav-section">
+          <div class="admin-nav-label">管理菜单</div>
+          <nav class="nav-menu admin-nav">
+            <button id="admin-tab-users" class="nav-item active" type="button">用户管理</button>
+            <button id="admin-tab-bans" class="nav-item" type="button">封禁记录</button>
+            <button id="admin-tab-tokens" class="nav-item" type="button">Token 管理</button>
+            <button id="admin-tab-policy" class="nav-item" type="button">额度策略</button>
+          </nav>
+        </div>
       </div>
+
       <div class="admin-side-footer">
         <a class="btn btn-outline admin-side-link" href="/">回主站</a>
       </div>
@@ -73,14 +81,12 @@
 
     <main class="admin-main">
       <header class="top-header admin-header">
-        <div>
+        <div class="admin-title-wrap">
           <div class="header-title" id="admin-header-title">用户管理</div>
           <div class="admin-subtitle" id="admin-auth-summary">-</div>
         </div>
-        <div class="header-actions">
-          <div class="status-badge">
-            <div class="dot"></div><span id="admin-policy-summary" class="mono">策略 -</span>
-          </div>
+        <div class="header-actions admin-header-actions">
+          <div class="status-badge"><div class="dot"></div><span id="admin-policy-summary" class="mono">策略 -</span></div>
           <button id="admin-logout-btn" class="btn btn-ghost" type="button">退出登录</button>
         </div>
       </header>
@@ -88,17 +94,24 @@
       <div class="admin-content">
         <section id="admin-view-users" class="admin-view active">
           <div class="admin-toolbar card">
-            <input id="admin-user-search" class="form-input admin-search-input" type="text"
-              placeholder="搜索 LinuxDo ID / 用户名 / 昵称">
+            <input id="admin-user-search" class="form-input admin-search-input" type="text" placeholder="搜索 LinuxDo ID / 用户名 / 昵称">
             <select id="admin-user-filter" class="form-input admin-select">
               <option value="all">全部用户</option>
               <option value="banned">仅封禁</option>
               <option value="normal">仅正常</option>
             </select>
+            <select id="admin-user-limit" class="form-input admin-select admin-limit-select">
+              <option value="20">每页 20</option>
+              <option value="50" selected>每页 50</option>
+              <option value="100">每页 100</option>
+            </select>
             <button id="admin-user-refresh" class="btn btn-outline" type="button">刷新</button>
           </div>
-          <div class="admin-grid">
-            <div id="admin-user-list" class="admin-list"></div>
+          <div class="admin-grid users-grid">
+            <div>
+              <div id="admin-user-list" class="admin-list"></div>
+              <div id="admin-user-pager" class="admin-pager"></div>
+            </div>
             <div id="admin-user-detail" class="card admin-detail empty-state">选择一个用户查看详情</div>
           </div>
         </section>
@@ -112,9 +125,15 @@
               <option value="unbanned">已解封</option>
               <option value="all">全部记录</option>
             </select>
+            <select id="admin-ban-limit" class="form-input admin-select admin-limit-select">
+              <option value="20">每页 20</option>
+              <option value="50" selected>每页 50</option>
+              <option value="100">每页 100</option>
+            </select>
             <button id="admin-ban-refresh" class="btn btn-outline" type="button">刷新</button>
           </div>
-          <div id="admin-ban-list" class="admin-list wide-list"></div>
+          <div id="admin-ban-list" class="admin-list ban-list"></div>
+          <div id="admin-ban-pager" class="admin-pager"></div>
         </section>
 
         <section id="admin-view-tokens" class="admin-view">
@@ -125,9 +144,15 @@
               <option value="enabled">仅启用</option>
               <option value="disabled">仅停用</option>
             </select>
+            <select id="admin-token-limit" class="form-input admin-select admin-limit-select">
+              <option value="20">每页 20</option>
+              <option value="50" selected>每页 50</option>
+              <option value="100">每页 100</option>
+            </select>
             <button id="admin-token-refresh" class="btn btn-outline" type="button">刷新</button>
           </div>
-          <div id="admin-token-list" class="admin-list wide-list"></div>
+          <div id="admin-token-list" class="admin-list token-list"></div>
+          <div id="admin-token-pager" class="admin-pager"></div>
         </section>
 
         <section id="admin-view-policy" class="admin-view">
@@ -137,7 +162,7 @@
     </main>
   </section>
 
-  <script src="/assets/admin.js?v=20260318" defer></script>
+  <script src="/assets/admin.js?v=20260318b" defer></script>
 </body>
 
 </html>

@@ -894,8 +894,10 @@ class TokenDb:
         status_filter: str = "active",
         search: str = "",
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+        offset: int = 0,
+    ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
         now = now_ts()
         where_parts = ["1 = 1"]
         params: list[Any] = []
@@ -924,6 +926,15 @@ class TokenDb:
             )
             params.extend([pattern, pattern, pattern, pattern])
         with self.connect() as conn:
+            total_row = conn.execute(
+                f"""
+                SELECT COUNT(*) as cnt
+                FROM user_bans
+                LEFT JOIN users AS target ON target.linuxdo_user_id = user_bans.linuxdo_user_id
+                WHERE {' AND '.join(where_parts)}
+                """,
+                params,
+            ).fetchone()
             rows = conn.execute(
                 f"""
                 SELECT user_bans.*,
@@ -939,11 +950,16 @@ class TokenDb:
                 LEFT JOIN users AS unbanners ON unbanners.id = user_bans.unbanned_by_user_id
                 WHERE {' AND '.join(where_parts)}
                 ORDER BY user_bans.banned_at_ts DESC, user_bans.id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (*params, limit),
+                (*params, limit, offset),
             ).fetchall()
-        return [self._format_ban_row(row) for row in rows]
+        return {
+            "items": [self._format_ban_row(row) for row in rows],
+            "total": int(total_row["cnt"]) if total_row else 0,
+            "limit": limit,
+            "offset": offset,
+        }
 
     def ban_user(
         self,
@@ -1014,8 +1030,10 @@ class TokenDb:
         search: str = "",
         ban_status: str = "all",
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+        offset: int = 0,
+    ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
         now = now_ts()
         where_parts = ["1 = 1"]
         params: list[Any] = [now]
@@ -1036,6 +1054,25 @@ class TokenDb:
         elif ban_status == "normal":
             where_parts.append("ban.id IS NULL")
         with self.connect() as conn:
+            total_row = conn.execute(
+                f"""
+                SELECT COUNT(*) as cnt
+                FROM users
+                LEFT JOIN (
+                    SELECT ub.*
+                    FROM user_bans AS ub
+                    INNER JOIN (
+                        SELECT linuxdo_user_id, MAX(id) as max_id
+                        FROM user_bans
+                        WHERE unbanned_at_ts IS NULL
+                          AND (expires_at_ts IS NULL OR expires_at_ts > ?)
+                        GROUP BY linuxdo_user_id
+                    ) latest ON latest.max_id = ub.id
+                ) AS ban ON ban.linuxdo_user_id = users.linuxdo_user_id
+                WHERE {' AND '.join(where_parts)}
+                """,
+                params,
+            ).fetchone()
             rows = conn.execute(
                 f"""
                 SELECT users.*,
@@ -1070,9 +1107,9 @@ class TokenDb:
                 ) AS ban ON ban.linuxdo_user_id = users.linuxdo_user_id
                 WHERE {' AND '.join(where_parts)}
                 ORDER BY users.last_login_at_ts DESC, users.id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (*params, limit),
+                (*params, limit, offset),
             ).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:
@@ -1094,7 +1131,7 @@ class TokenDb:
                     else None,
                 }
             )
-        return items
+        return {"items": items, "total": int(total_row["cnt"]) if total_row else 0, "limit": limit, "offset": offset}
 
     def get_admin_user_detail(self, linuxdo_user_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -1163,8 +1200,16 @@ class TokenDb:
             "ban": ban,
         }
 
-    def list_tokens_for_admin(self, *, search: str = "", status_filter: str = "all", limit: int = 200) -> list[dict[str, Any]]:
+    def list_tokens_for_admin(
+        self,
+        *,
+        search: str = "",
+        status_filter: str = "all",
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
         where_parts = ["1 = 1"]
         params: list[Any] = []
         if search:
@@ -1184,6 +1229,14 @@ class TokenDb:
         elif status_filter == "disabled":
             where_parts.append("(is_active = 0 OR is_enabled = 0)")
         with self.connect() as conn:
+            total_row = conn.execute(
+                f"""
+                SELECT COUNT(*) as cnt
+                FROM tokens
+                WHERE {' AND '.join(where_parts)}
+                """,
+                params,
+            ).fetchone()
             rows = conn.execute(
                 f"""
                 SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
@@ -1191,11 +1244,12 @@ class TokenDb:
                 FROM tokens
                 WHERE {' AND '.join(where_parts)}
                 ORDER BY is_active DESC, is_enabled DESC, updated_at_ts DESC, id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (*params, limit),
+                (*params, limit, offset),
             ).fetchall()
-        return [
+        return {
+            "items": [
             {
                 "id": int(row["id"]),
                 "file_name": row["file_name"],
@@ -1211,7 +1265,11 @@ class TokenDb:
                 "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
             }
             for row in rows
-        ]
+            ],
+            "total": int(total_row["cnt"]) if total_row else 0,
+            "limit": limit,
+            "offset": offset,
+        }
 
     def set_token_enabled(self, token_id: int, enabled: bool) -> dict[str, Any] | None:
         now = now_ts()
@@ -1258,8 +1316,18 @@ class TokenDb:
         }
 
     def _format_ban_row(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        def _value(key: str) -> Any:
+            try:
+                return row[key]
+            except (KeyError, IndexError):
+                return None
+
         expires_at_ts = row["expires_at_ts"]
         unbanned_at_ts = row["unbanned_at_ts"]
+        banned_by_username = _value("banned_by_username")
+        banned_by_name = _value("banned_by_name")
+        unbanned_by_username = _value("unbanned_by_username")
+        unbanned_by_name = _value("unbanned_by_name")
         return {
             "id": int(row["id"]),
             "linuxdo_user_id": str(row["linuxdo_user_id"]),
@@ -1269,16 +1337,16 @@ class TokenDb:
             "expires_at": isoformat_from_ts(int(expires_at_ts)) if expires_at_ts else None,
             "unbanned_at": isoformat_from_ts(int(unbanned_at_ts)) if unbanned_at_ts else None,
             "banned_by": {
-                "username": row["banned_by_username"],
-                "name": row["banned_by_name"] or row["banned_by_username"],
+                "username": banned_by_username,
+                "name": banned_by_name or banned_by_username,
             }
-            if row["banned_by_username"]
+            if banned_by_username
             else None,
             "unbanned_by": {
-                "username": row["unbanned_by_username"],
-                "name": row["unbanned_by_name"] or row["unbanned_by_username"],
+                "username": unbanned_by_username,
+                "name": unbanned_by_name or unbanned_by_username,
             }
-            if row["unbanned_by_username"]
+            if unbanned_by_username
             else None,
             "is_active": unbanned_at_ts is None and (expires_at_ts is None or int(expires_at_ts) > now_ts()),
         }
@@ -2644,6 +2712,7 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
 
 
 db = TokenDb(get_db_path())
+db.init_db()
 store = TokenIndexStore(TOKEN_DIR)
 observer: Observer | None = None
 _QUEUE_FULFILL_LOCK = threading.Lock()
@@ -2863,9 +2932,10 @@ def admin_list_users(
     search: str = Query(default=""),
     ban_status: str = Query(default="all"),
     limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     require_admin_user(request)
-    return {"items": db.list_users_for_admin(search=search, ban_status=ban_status, limit=limit)}
+    return db.list_users_for_admin(search=search, ban_status=ban_status, limit=limit, offset=offset)
 
 
 @app.get("/admin/users/{linuxdo_user_id}")
@@ -2922,9 +2992,10 @@ def admin_list_bans(
     status_filter: str = Query(default="active", alias="status"),
     search: str = Query(default=""),
     limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     require_admin_user(request)
-    return {"items": db.list_bans(status_filter=status_filter, search=search, limit=limit)}
+    return db.list_bans(status_filter=status_filter, search=search, limit=limit, offset=offset)
 
 
 @app.get("/admin/tokens")
@@ -2933,9 +3004,10 @@ def admin_list_tokens(
     search: str = Query(default=""),
     status_filter: str = Query(default="all", alias="status"),
     limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     require_admin_user(request)
-    return {"items": db.list_tokens_for_admin(search=search, status_filter=status_filter, limit=limit)}
+    return db.list_tokens_for_admin(search=search, status_filter=status_filter, limit=limit, offset=offset)
 
 
 @app.post("/admin/tokens/{token_id}/activate")
