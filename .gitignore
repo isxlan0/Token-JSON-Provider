@@ -12,3 +12,4 @@ GptCodexApi/
 start.*
 .vscode/
 *.txt
+token_atlas.db*
