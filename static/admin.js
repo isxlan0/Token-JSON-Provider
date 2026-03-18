@@ -487,14 +487,14 @@ async function loadPolicy() {
 }
 
 async function cleanupExhaustedTokens() {
-  if (!window.confirm("这会删除 token 目录中所有已领完账号的文件，并在数据库里标记为已清理。是否继续？")) {
+  if (!window.confirm("这会删除 token 目录中所有已领完账号的文件，并在数据库里标记为已清理，同时压缩历史已清理账号的内容。是否继续？")) {
     return;
   }
   const restoreButton = setButtonPending(elements.tokenCleanup, "清理中...");
   showNotice("正在清理已领完账号...");
   try {
     const result = await fetchJson("/admin/tokens/cleanup-exhausted", { method: "POST" });
-    showNotice(`清理完成：处理 ${result.cleaned || 0} 个账号，删除文件 ${result.deleted_files || 0} 个`);
+    showNotice(`清理完成：处理 ${result.cleaned || 0} 个账号，删除文件 ${result.deleted_files || 0} 个，压缩历史内容 ${result.compacted_content || 0} 个`);
     await Promise.all([loadTokens(), loadPolicy()]);
   } catch (error) {
     showNotice(error.message, "error");

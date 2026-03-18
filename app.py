@@ -1421,9 +1421,6 @@ class TokenDb:
                 """
             ).fetchall()
 
-        if not rows:
-            return {"matched": 0, "cleaned": 0, "deleted_files": 0, "missing_files": 0, "failed": []}
-
         cleaned_ids: list[int] = []
         failed: list[dict[str, str]] = []
         deleted_files = 0
@@ -1443,10 +1440,11 @@ class TokenDb:
             except OSError as exc:
                 failed.append({"file_name": file_name, "detail": str(exc)})
 
-        if cleaned_ids:
-            now = now_ts()
-            placeholders = ",".join("?" for _ in cleaned_ids)
-            with self._lock, self.connect(timeout=3.0) as conn:
+        compacted_content = 0
+        now = now_ts()
+        with self._lock, self.connect(timeout=3.0) as conn:
+            if cleaned_ids:
+                placeholders = ",".join("?" for _ in cleaned_ids)
                 conn.execute(
                     f"""
                     UPDATE tokens
@@ -1462,7 +1460,21 @@ class TokenDb:
                     """,
                     (now, now, now, *cleaned_ids),
                 )
-                self.ensure_inventory_policy(conn=conn)
+            compacted_cursor = conn.execute(
+                """
+                UPDATE tokens
+                SET content_json = '{}',
+                    updated_at_ts = CASE
+                        WHEN is_cleaned = 1 AND content_json != '{}' THEN ?
+                        ELSE updated_at_ts
+                    END
+                WHERE is_cleaned = 1 AND content_json != '{}'
+                """,
+                (now,),
+            )
+            compacted_content = int(compacted_cursor.rowcount or 0)
+            self.ensure_inventory_policy(conn=conn)
+        if cleaned_ids or compacted_content:
             _refresh_dashboard_memory()
 
         return {
@@ -1470,6 +1482,7 @@ class TokenDb:
             "cleaned": len(cleaned_ids),
             "deleted_files": deleted_files,
             "missing_files": missing_files,
+            "compacted_content": compacted_content,
             "failed": failed,
         }
 
