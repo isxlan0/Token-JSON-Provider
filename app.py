@@ -44,6 +44,7 @@ LINUXDO_SCOPE_ENV = "TOKEN_INDEX_LINUXDO_SCOPE"
 LINUXDO_MIN_TRUST_LEVEL_ENV = "TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL"
 LINUXDO_ALLOWED_IDS_ENV = "TOKEN_INDEX_LINUXDO_ALLOWED_IDS"
 DB_PATH_ENV = "TOKEN_DB_PATH"
+ADMIN_IDENTITIES_ENV = "TOKEN_INDEX_ADMIN_IDENTITIES"
 TOKEN_HEALTHY_THRESHOLD_ENV = "TOKEN_HEALTHY_THRESHOLD"
 TOKEN_WARNING_THRESHOLD_ENV = "TOKEN_WARNING_THRESHOLD"
 TOKEN_CRITICAL_THRESHOLD_ENV = "TOKEN_CRITICAL_THRESHOLD"
@@ -59,6 +60,7 @@ PROVIDER_BASE_URL_ENV = "TOKEN_PROVIDER_BASE_URL"
 SESSION_COOKIE_NAME = "token_atlas_session"
 SESSION_AUTH_KEY = "auth"
 SESSION_OAUTH_STATE_KEY = "linuxdo_oauth_state"
+SESSION_POST_LOGIN_REDIRECT_KEY = "post_login_redirect"
 LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize"
 LINUXDO_TOKEN_URL = "https://connect.linux.do/oauth2/token"
 LINUXDO_USER_URL = "https://connect.linux.do/api/user"
@@ -100,6 +102,26 @@ def env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").strip().lower()
+
+
+def parse_admin_identities(raw: str) -> dict[str, set[str]]:
+    ids: set[str] = set()
+    usernames: set[str] = set()
+    for part in raw.split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("@") or not candidate.isdigit():
+            normalized = normalize_username(candidate)
+            if normalized:
+                usernames.add(normalized)
+            continue
+        ids.add(candidate)
+    return {"ids": ids, "usernames": usernames}
 
 
 def detect_encoding(raw: bytes) -> str:
@@ -217,6 +239,11 @@ class ClaimHidePayload(BaseModel):
     claim_ids: list[int] = Field(default_factory=list)
 
 
+class AdminBanPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    expires_at: str | None = None
+
+
 class LinuxDOUser(BaseModel):
     id: int
     username: str
@@ -229,6 +256,16 @@ class LinuxDOUser(BaseModel):
 
 class RateLimitError(Exception):
     pass
+
+
+class AccessDeniedError(Exception):
+    pass
+
+
+class BannedUserError(Exception):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(payload.get("detail") or "User is banned")
+        self.payload = payload
 
 
 class DashboardMemoryCache:
@@ -517,6 +554,7 @@ class TokenDb:
                     encoding TEXT NOT NULL,
                     content_json TEXT NOT NULL,
                     is_active INTEGER NOT NULL,
+                    is_enabled INTEGER NOT NULL DEFAULT 1,
                     is_available INTEGER NOT NULL,
                     claim_count INTEGER NOT NULL,
                     max_claims INTEGER NOT NULL,
@@ -556,12 +594,28 @@ class TokenDb:
                     updated_at_ts INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS user_bans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    linuxdo_user_id TEXT NOT NULL,
+                    username_snapshot TEXT,
+                    reason TEXT NOT NULL,
+                    banned_by_user_id INTEGER NOT NULL,
+                    banned_at_ts INTEGER NOT NULL,
+                    expires_at_ts INTEGER,
+                    unbanned_by_user_id INTEGER,
+                    unbanned_at_ts INTEGER,
+                    FOREIGN KEY(banned_by_user_id) REFERENCES users(id),
+                    FOREIGN KEY(unbanned_by_user_id) REFERENCES users(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_token_claims_user_time
                     ON token_claims(user_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
                     ON token_claims(api_key_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
                     ON claim_queue(status, enqueued_at_ts, id);
+                CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
+                    ON user_bans(linuxdo_user_id, banned_at_ts DESC);
                 """
             )
             claims_columns = {
@@ -582,6 +636,8 @@ class TokenDb:
             }
             if "is_active" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+            if "is_enabled" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
 
     def _get_runtime_policy_state(self, conn: sqlite3.Connection) -> dict[str, Any] | None:
         row = conn.execute(
@@ -642,13 +698,14 @@ class TokenDb:
                 seen_names.add(file_name)
 
                 row = conn.execute(
-                    "SELECT id, claim_count, max_claims FROM tokens WHERE file_name = ?",
+                    "SELECT id, claim_count, max_claims, is_enabled FROM tokens WHERE file_name = ?",
                     (file_name,),
                 ).fetchone()
                 if row:
                     claim_count = int(row["claim_count"])
                     effective_max_claims = int(row["max_claims"])
-                    is_available = 1 if claim_count < effective_max_claims else 0
+                    is_enabled = int(row["is_enabled"]) if "is_enabled" in row.keys() else 1
+                    is_available = 1 if is_enabled and claim_count < effective_max_claims else 0
                     conn.execute(
                         """
                         UPDATE tokens
@@ -683,13 +740,14 @@ class TokenDb:
                             encoding,
                             content_json,
                             is_active,
+                            is_enabled,
                             is_available,
                             claim_count,
                             max_claims,
                             created_at_ts,
                             updated_at_ts,
                             last_seen_at_ts
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             file_name,
@@ -697,6 +755,7 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
+                            1,
                             1,
                             1,
                             0,
@@ -789,6 +848,440 @@ class TokenDb:
             if not row:
                 return None
             return dict(row)
+
+    def get_user_by_linuxdo_id(self, linuxdo_user_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE linuxdo_user_id = ?",
+                (str(linuxdo_user_id),),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def get_active_ban(self, linuxdo_user_id: str, *, conn: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+        target_conn = conn or self.connect()
+        should_close = conn is None
+        try:
+            row = target_conn.execute(
+                """
+                SELECT user_bans.*,
+                       users.linuxdo_username as banned_by_username,
+                       users.linuxdo_name as banned_by_name,
+                       unbanners.linuxdo_username as unbanned_by_username,
+                       unbanners.linuxdo_name as unbanned_by_name
+                FROM user_bans
+                LEFT JOIN users ON users.id = user_bans.banned_by_user_id
+                LEFT JOIN users AS unbanners ON unbanners.id = user_bans.unbanned_by_user_id
+                WHERE user_bans.linuxdo_user_id = ?
+                  AND user_bans.unbanned_at_ts IS NULL
+                  AND (user_bans.expires_at_ts IS NULL OR user_bans.expires_at_ts > ?)
+                ORDER BY user_bans.banned_at_ts DESC, user_bans.id DESC
+                LIMIT 1
+                """,
+                (str(linuxdo_user_id), now_ts()),
+            ).fetchone()
+            if not row:
+                return None
+            return self._format_ban_row(row)
+        finally:
+            if should_close:
+                target_conn.close()
+
+    def list_bans(
+        self,
+        *,
+        status_filter: str = "active",
+        search: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        now = now_ts()
+        where_parts = ["1 = 1"]
+        params: list[Any] = []
+        if status_filter == "active":
+            where_parts.append("user_bans.unbanned_at_ts IS NULL")
+            where_parts.append("(user_bans.expires_at_ts IS NULL OR user_bans.expires_at_ts > ?)")
+            params.append(now)
+        elif status_filter == "expired":
+            where_parts.append("user_bans.unbanned_at_ts IS NULL")
+            where_parts.append("user_bans.expires_at_ts IS NOT NULL")
+            where_parts.append("user_bans.expires_at_ts <= ?")
+            params.append(now)
+        elif status_filter == "unbanned":
+            where_parts.append("user_bans.unbanned_at_ts IS NOT NULL")
+        if search:
+            pattern = f"%{search.strip().lower()}%"
+            where_parts.append(
+                """
+                (
+                    lower(user_bans.linuxdo_user_id) LIKE ?
+                    OR lower(COALESCE(user_bans.username_snapshot, '')) LIKE ?
+                    OR lower(COALESCE(target.linuxdo_username, '')) LIKE ?
+                    OR lower(COALESCE(target.linuxdo_name, '')) LIKE ?
+                )
+                """
+            )
+            params.extend([pattern, pattern, pattern, pattern])
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT user_bans.*,
+                       target.linuxdo_username as target_username,
+                       target.linuxdo_name as target_name,
+                       users.linuxdo_username as banned_by_username,
+                       users.linuxdo_name as banned_by_name,
+                       unbanners.linuxdo_username as unbanned_by_username,
+                       unbanners.linuxdo_name as unbanned_by_name
+                FROM user_bans
+                LEFT JOIN users AS target ON target.linuxdo_user_id = user_bans.linuxdo_user_id
+                LEFT JOIN users ON users.id = user_bans.banned_by_user_id
+                LEFT JOIN users AS unbanners ON unbanners.id = user_bans.unbanned_by_user_id
+                WHERE {' AND '.join(where_parts)}
+                ORDER BY user_bans.banned_at_ts DESC, user_bans.id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._format_ban_row(row) for row in rows]
+
+    def ban_user(
+        self,
+        *,
+        linuxdo_user_id: str,
+        username_snapshot: str | None,
+        reason: str,
+        banned_by_user_id: int,
+        expires_at_ts: int | None,
+    ) -> dict[str, Any]:
+        now = now_ts()
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE user_bans
+                SET unbanned_at_ts = ?,
+                    unbanned_by_user_id = ?
+                WHERE linuxdo_user_id = ?
+                  AND unbanned_at_ts IS NULL
+                """,
+                (now, banned_by_user_id, str(linuxdo_user_id)),
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO user_bans (
+                    linuxdo_user_id,
+                    username_snapshot,
+                    reason,
+                    banned_by_user_id,
+                    banned_at_ts,
+                    expires_at_ts
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (str(linuxdo_user_id), username_snapshot, reason.strip(), banned_by_user_id, now, expires_at_ts),
+            )
+            row = conn.execute(
+                """
+                SELECT user_bans.*,
+                       users.linuxdo_username as banned_by_username,
+                       users.linuxdo_name as banned_by_name
+                FROM user_bans
+                LEFT JOIN users ON users.id = user_bans.banned_by_user_id
+                WHERE user_bans.id = ?
+                """,
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return self._format_ban_row(row) if row else {}
+
+    def unban_user(self, linuxdo_user_id: str, *, unbanned_by_user_id: int) -> bool:
+        now = now_ts()
+        with self._lock, self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE user_bans
+                SET unbanned_at_ts = ?,
+                    unbanned_by_user_id = ?
+                WHERE linuxdo_user_id = ?
+                  AND unbanned_at_ts IS NULL
+                  AND (expires_at_ts IS NULL OR expires_at_ts > ?)
+                """,
+                (now, unbanned_by_user_id, str(linuxdo_user_id), now),
+            )
+        return int(result.rowcount or 0) > 0
+
+    def list_users_for_admin(
+        self,
+        *,
+        search: str = "",
+        ban_status: str = "all",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        now = now_ts()
+        where_parts = ["1 = 1"]
+        params: list[Any] = [now]
+        if search:
+            pattern = f"%{search.strip().lower()}%"
+            where_parts.append(
+                """
+                (
+                    lower(users.linuxdo_user_id) LIKE ?
+                    OR lower(users.linuxdo_username) LIKE ?
+                    OR lower(COALESCE(users.linuxdo_name, '')) LIKE ?
+                )
+                """
+            )
+            params.extend([pattern, pattern, pattern])
+        if ban_status == "banned":
+            where_parts.append("ban.id IS NOT NULL")
+        elif ban_status == "normal":
+            where_parts.append("ban.id IS NULL")
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT users.*,
+                       COALESCE(claim_totals.claim_count, 0) as claim_count,
+                       COALESCE(api_totals.active_keys, 0) as active_keys,
+                       ban.id as active_ban_id,
+                       ban.reason as ban_reason,
+                       ban.banned_at_ts as ban_banned_at_ts,
+                       ban.expires_at_ts as ban_expires_at_ts
+                FROM users
+                LEFT JOIN (
+                    SELECT user_id, COUNT(*) as claim_count
+                    FROM token_claims
+                    GROUP BY user_id
+                ) AS claim_totals ON claim_totals.user_id = users.id
+                LEFT JOIN (
+                    SELECT user_id, COUNT(*) as active_keys
+                    FROM api_keys
+                    WHERE status = 'active'
+                    GROUP BY user_id
+                ) AS api_totals ON api_totals.user_id = users.id
+                LEFT JOIN (
+                    SELECT ub.*
+                    FROM user_bans AS ub
+                    INNER JOIN (
+                        SELECT linuxdo_user_id, MAX(id) as max_id
+                        FROM user_bans
+                        WHERE unbanned_at_ts IS NULL
+                          AND (expires_at_ts IS NULL OR expires_at_ts > ?)
+                        GROUP BY linuxdo_user_id
+                    ) latest ON latest.max_id = ub.id
+                ) AS ban ON ban.linuxdo_user_id = users.linuxdo_user_id
+                WHERE {' AND '.join(where_parts)}
+                ORDER BY users.last_login_at_ts DESC, users.id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            items.append(
+                {
+                    "db_user_id": int(row["id"]),
+                    "linuxdo_user_id": str(row["linuxdo_user_id"]),
+                    "username": row["linuxdo_username"],
+                    "name": row["linuxdo_name"] or row["linuxdo_username"],
+                    "trust_level": int(row["trust_level"]),
+                    "created_at": isoformat_from_ts(int(row["created_at_ts"])),
+                    "last_login_at": isoformat_from_ts(int(row["last_login_at_ts"])),
+                    "claim_count": int(row["claim_count"]),
+                    "active_api_keys": int(row["active_keys"]),
+                    "is_banned": row["active_ban_id"] is not None,
+                    "ban_reason": row["ban_reason"],
+                    "ban_expires_at": isoformat_from_ts(int(row["ban_expires_at_ts"]))
+                    if row["ban_expires_at_ts"]
+                    else None,
+                }
+            )
+        return items
+
+    def get_admin_user_detail(self, linuxdo_user_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE linuxdo_user_id = ?",
+                (str(linuxdo_user_id),),
+            ).fetchone()
+            if not row:
+                return None
+            user = dict(row)
+            totals = conn.execute(
+                """
+                SELECT COUNT(*) as total_claims,
+                       COUNT(DISTINCT token_id) as unique_claims
+                FROM token_claims
+                WHERE user_id = ?
+                """,
+                (int(row["id"]),),
+            ).fetchone()
+            api_totals = conn.execute(
+                """
+                SELECT COUNT(*) as total_keys,
+                       COUNT(CASE WHEN status = 'active' THEN 1 END) as active_keys
+                FROM api_keys
+                WHERE user_id = ?
+                """,
+                (int(row["id"]),),
+            ).fetchone()
+            recent_claim_rows = conn.execute(
+                """
+                SELECT token_claims.claimed_at_ts, tokens.file_name
+                FROM token_claims
+                JOIN tokens ON tokens.id = token_claims.token_id
+                WHERE token_claims.user_id = ?
+                ORDER BY token_claims.claimed_at_ts DESC, token_claims.id DESC
+                LIMIT 20
+                """,
+                (int(row["id"]),),
+            ).fetchall()
+            ban = self.get_active_ban(str(linuxdo_user_id), conn=conn)
+        return {
+            "user": {
+                "db_user_id": int(user["id"]),
+                "linuxdo_user_id": str(user["linuxdo_user_id"]),
+                "username": user["linuxdo_username"],
+                "name": user["linuxdo_name"] or user["linuxdo_username"],
+                "trust_level": int(user["trust_level"]),
+                "created_at": isoformat_from_ts(int(user["created_at_ts"])),
+                "last_login_at": isoformat_from_ts(int(user["last_login_at_ts"])),
+            },
+            "claims": {
+                "total": int(totals["total_claims"]) if totals else 0,
+                "unique": int(totals["unique_claims"]) if totals else 0,
+                "recent": [
+                    {
+                        "claimed_at": isoformat_from_ts(int(item["claimed_at_ts"])),
+                        "file_name": item["file_name"],
+                    }
+                    for item in recent_claim_rows
+                ],
+            },
+            "api_keys": {
+                "total": int(api_totals["total_keys"]) if api_totals else 0,
+                "active": int(api_totals["active_keys"]) if api_totals else 0,
+            },
+            "ban": ban,
+        }
+
+    def list_tokens_for_admin(self, *, search: str = "", status_filter: str = "all", limit: int = 200) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        where_parts = ["1 = 1"]
+        params: list[Any] = []
+        if search:
+            pattern = f"%{search.strip().lower()}%"
+            where_parts.append(
+                """
+                (
+                    lower(file_name) LIKE ?
+                    OR lower(file_path) LIKE ?
+                )
+                """
+            )
+            params.extend([pattern, pattern])
+        if status_filter == "enabled":
+            where_parts.append("is_active = 1")
+            where_parts.append("is_enabled = 1")
+        elif status_filter == "disabled":
+            where_parts.append("(is_active = 0 OR is_enabled = 0)")
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
+                       claim_count, max_claims, created_at_ts, updated_at_ts, last_seen_at_ts
+                FROM tokens
+                WHERE {' AND '.join(where_parts)}
+                ORDER BY is_active DESC, is_enabled DESC, updated_at_ts DESC, id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "file_name": row["file_name"],
+                "file_path": row["file_path"],
+                "encoding": row["encoding"],
+                "is_active": bool(row["is_active"]),
+                "is_enabled": bool(row["is_enabled"]),
+                "is_available": bool(row["is_available"]),
+                "claim_count": int(row["claim_count"]),
+                "max_claims": int(row["max_claims"]),
+                "created_at": isoformat_from_ts(int(row["created_at_ts"])),
+                "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
+                "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
+            }
+            for row in rows
+        ]
+
+    def set_token_enabled(self, token_id: int, enabled: bool) -> dict[str, Any] | None:
+        now = now_ts()
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE tokens
+                SET is_enabled = ?,
+                    is_available = CASE
+                        WHEN is_active = 1 AND ? = 1 AND claim_count < max_claims THEN 1
+                        ELSE 0
+                    END,
+                    updated_at_ts = ?
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, 1 if enabled else 0, now, token_id),
+            )
+            row = conn.execute(
+                """
+                SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
+                       claim_count, max_claims, created_at_ts, updated_at_ts, last_seen_at_ts
+                FROM tokens
+                WHERE id = ?
+                """,
+                (token_id,),
+            ).fetchone()
+            self.ensure_inventory_policy(conn=conn)
+        _refresh_dashboard_memory()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "file_name": row["file_name"],
+            "file_path": row["file_path"],
+            "encoding": row["encoding"],
+            "is_active": bool(row["is_active"]),
+            "is_enabled": bool(row["is_enabled"]),
+            "is_available": bool(row["is_available"]),
+            "claim_count": int(row["claim_count"]),
+            "max_claims": int(row["max_claims"]),
+            "created_at": isoformat_from_ts(int(row["created_at_ts"])),
+            "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
+            "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
+        }
+
+    def _format_ban_row(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        expires_at_ts = row["expires_at_ts"]
+        unbanned_at_ts = row["unbanned_at_ts"]
+        return {
+            "id": int(row["id"]),
+            "linuxdo_user_id": str(row["linuxdo_user_id"]),
+            "username_snapshot": row["username_snapshot"],
+            "reason": row["reason"],
+            "banned_at": isoformat_from_ts(int(row["banned_at_ts"])),
+            "expires_at": isoformat_from_ts(int(expires_at_ts)) if expires_at_ts else None,
+            "unbanned_at": isoformat_from_ts(int(unbanned_at_ts)) if unbanned_at_ts else None,
+            "banned_by": {
+                "username": row["banned_by_username"],
+                "name": row["banned_by_name"] or row["banned_by_username"],
+            }
+            if row["banned_by_username"]
+            else None,
+            "unbanned_by": {
+                "username": row["unbanned_by_username"],
+                "name": row["unbanned_by_name"] or row["unbanned_by_username"],
+            }
+            if row["unbanned_by_username"]
+            else None,
+            "is_active": unbanned_at_ts is None and (expires_at_ts is None or int(expires_at_ts) > now_ts()),
+        }
 
     def list_api_keys(self, user_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -939,7 +1432,9 @@ class TokenDb:
 
     def get_dashboard_stats(self, user_id: int) -> dict[str, int]:
         with self.connect() as conn:
-            total_tokens = conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1").fetchone()
+            total_tokens = conn.execute(
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1"
+            ).fetchone()
             available_tokens = conn.execute(
                 """
                 SELECT COALESCE(SUM(
@@ -949,12 +1444,12 @@ class TokenDb:
                     END
                 ), 0) as cnt
                 FROM tokens
-                WHERE is_active = 1
+                WHERE is_active = 1 AND is_enabled = 1
                 """
             ).fetchone()
             claimed_total = conn.execute("SELECT COUNT(*) as cnt FROM token_claims").fetchone()
             claimed_unique = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND claim_count > 0"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND claim_count > 0"
             ).fetchone()
             others_claimed_total = conn.execute(
                 "SELECT COUNT(*) as cnt FROM token_claims WHERE user_id != ?",
@@ -976,7 +1471,9 @@ class TokenDb:
 
     def get_inventory_snapshot(self, *, conn=None) -> dict[str, int]:
         def _fetch(target_conn):
-            total_row = target_conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1").fetchone()
+            total_row = target_conn.execute(
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1"
+            ).fetchone()
             available_row = target_conn.execute(
                 """
                 SELECT COALESCE(SUM(
@@ -986,11 +1483,11 @@ class TokenDb:
                     END
                 ), 0) as cnt
                 FROM tokens
-                WHERE is_active = 1
+                WHERE is_active = 1 AND is_enabled = 1
                 """
             ).fetchone()
             unclaimed_row = target_conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND claim_count = 0"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND claim_count = 0"
             ).fetchone()
             return {
                 "total": int(total_row["cnt"]) if total_row else 0,
@@ -1020,7 +1517,7 @@ class TokenDb:
                     SET max_claims = ?,
                         is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
                         updated_at_ts = ?
-                    WHERE is_active = 1
+                    WHERE is_active = 1 AND is_enabled = 1
                     """
                     ,
                     (healthy_max_claims, healthy_max_claims, now),
@@ -1032,7 +1529,7 @@ class TokenDb:
                         SET max_claims = ?,
                             is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
                             updated_at_ts = ?
-                        WHERE is_active = 1 AND claim_count = 0
+                        WHERE is_active = 1 AND is_enabled = 1 AND claim_count = 0
                         """
                         ,
                         (max_claims, max_claims, now),
@@ -1054,7 +1551,7 @@ class TokenDb:
                         SET max_claims = ?,
                             is_available = CASE WHEN claim_count < ? THEN 1 ELSE 0 END,
                             updated_at_ts = ?
-                        WHERE is_active = 1 AND claim_count = 0 AND max_claims < ?
+                        WHERE is_active = 1 AND is_enabled = 1 AND claim_count = 0 AND max_claims < ?
                         """
                         ,
                         (max_claims, max_claims, now, max_claims),
@@ -1250,7 +1747,7 @@ class TokenDb:
                     """
                     SELECT COUNT(*) as cnt
                     FROM tokens
-                    WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
+                    WHERE is_active = 1 AND is_enabled = 1 AND is_available = 1 AND claim_count < max_claims
                     """
                 ).fetchone()
                 available = int(available_row["cnt"]) if available_row else 0
@@ -1272,7 +1769,7 @@ class TokenDb:
                         """
                         SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
                         FROM tokens
-                        WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
+                        WHERE is_active = 1 AND is_enabled = 1 AND is_available = 1 AND claim_count < max_claims
                         ORDER BY created_at_ts ASC, id ASC
                         LIMIT ?
                         """,
@@ -1444,7 +1941,7 @@ class TokenDb:
                     END
                 ), 0) as cnt
                 FROM tokens
-                WHERE is_active = 1
+                WHERE is_active = 1 AND is_enabled = 1
                 """
             ).fetchone()
             available = int(available_row["cnt"]) if available_row else 0
@@ -1845,6 +2342,41 @@ def get_apikey_rate_per_minute() -> int:
     return max(0, env_int(APIKEY_RATE_PER_MIN_ENV, 60))
 
 
+def get_admin_identities() -> dict[str, set[str]]:
+    return parse_admin_identities(env_value(ADMIN_IDENTITIES_ENV))
+
+
+def is_admin_identity(linuxdo_user_id: str | None, username: str | None) -> bool:
+    identities = get_admin_identities()
+    if linuxdo_user_id and str(linuxdo_user_id) in identities["ids"]:
+        return True
+    if username and normalize_username(username) in identities["usernames"]:
+        return True
+    return False
+
+
+def is_safe_relative_redirect(value: str | None) -> bool:
+    if not value:
+        return False
+    return value.startswith("/") and not value.startswith("//")
+
+
+def parse_expires_at_to_ts(value: str | None) -> int | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("Invalid expires_at format") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return int(parsed.timestamp())
+
+
 def generate_api_key() -> str:
     return f"tk_{secrets.token_urlsafe(24)}"
 
@@ -1952,6 +2484,7 @@ def set_linuxdo_session(request: Request, user: LinuxDOUser, db_user_id: int) ->
             "name": user.name or user.username,
             "trust_level": user.trust_level,
             "avatar_template": user.avatar_template,
+            "is_admin": is_admin_identity(str(user.id), user.username),
         },
     }
 
@@ -1959,6 +2492,7 @@ def set_linuxdo_session(request: Request, user: LinuxDOUser, db_user_id: int) ->
 def clear_auth_session(request: Request) -> None:
     request.session.pop(SESSION_AUTH_KEY, None)
     request.session.pop(SESSION_OAUTH_STATE_KEY, None)
+    request.session.pop(SESSION_POST_LOGIN_REDIRECT_KEY, None)
 
 
 def clear_auth_cookie(request: Request, response: Response) -> None:
@@ -1973,14 +2507,56 @@ def get_session_auth(request: Request) -> dict[str, Any] | None:
     return None
 
 
-def require_session_user(request: Request) -> dict[str, Any]:
+def build_ban_error_payload(context: dict[str, Any]) -> dict[str, Any]:
+    ban = context["ban"]
+    return {
+        "detail": "当前账号已被封禁",
+        "ban": ban,
+        "user": context["user"],
+    }
+
+
+def get_request_context(request: Request) -> dict[str, Any]:
     auth = get_session_auth(request)
     if not auth or auth.get("method") != "linuxdo":
         raise PermissionError
     user_id = auth.get("user_id")
     if user_id is None:
         raise PermissionError
-    return {"user_id": int(user_id), "user": auth.get("user")}
+    db_user = db.get_user(int(user_id))
+    if not db_user:
+        raise PermissionError
+    username = db_user["linuxdo_username"]
+    public_user = {
+        "id": db_user["linuxdo_user_id"],
+        "username": username,
+        "name": db_user["linuxdo_name"] or username,
+        "trust_level": int(db_user["trust_level"]),
+        "is_admin": is_admin_identity(db_user["linuxdo_user_id"], username),
+    }
+    ban = db.get_active_ban(db_user["linuxdo_user_id"])
+    return {
+        "user_id": int(db_user["id"]),
+        "db_user": db_user,
+        "user": public_user,
+        "is_admin": bool(public_user["is_admin"]),
+        "ban": ban,
+        "is_banned": ban is not None,
+    }
+
+
+def require_session_user(request: Request) -> dict[str, Any]:
+    context = get_request_context(request)
+    if context["is_banned"]:
+        raise BannedUserError(build_ban_error_payload(context))
+    return context
+
+
+def require_admin_user(request: Request) -> dict[str, Any]:
+    context = get_request_context(request)
+    if not context["is_admin"]:
+        raise AccessDeniedError("Admin access required.")
+    return context
 
 
 def extract_api_key(
@@ -1999,6 +2575,22 @@ def require_api_key(
     record = db.resolve_api_key(api_key)
     if not record:
         raise PermissionError
+    owner = db.get_user(int(record["user_id"]))
+    if not owner:
+        raise PermissionError
+    ban = db.get_active_ban(owner["linuxdo_user_id"])
+    if ban:
+        raise BannedUserError(
+            {
+                "detail": "当前账号已被封禁",
+                "ban": ban,
+                "user": {
+                    "id": owner["linuxdo_user_id"],
+                    "username": owner["linuxdo_username"],
+                    "name": owner["linuxdo_name"] or owner["linuxdo_username"],
+                },
+            }
+        )
     return record
 
 
@@ -2168,6 +2760,18 @@ def permission_error_handler(_: Any, __: PermissionError) -> Response:
     return Response(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
+@app.exception_handler(AccessDeniedError)
+def access_denied_handler(_: Any, exc: AccessDeniedError) -> Response:
+    payload = json.dumps({"detail": str(exc)}, ensure_ascii=False).encode("utf-8")
+    return Response(status_code=status.HTTP_403_FORBIDDEN, content=payload, media_type="application/json")
+
+
+@app.exception_handler(BannedUserError)
+def banned_user_handler(_: Any, exc: BannedUserError) -> Response:
+    payload = json.dumps(exc.payload, ensure_ascii=False).encode("utf-8")
+    return Response(status_code=status.HTTP_403_FORBIDDEN, content=payload, media_type="application/json")
+
+
 @app.exception_handler(RateLimitError)
 def rate_limit_error_handler(_: Any, exc: RateLimitError) -> Response:
     payload = json.dumps({"detail": str(exc)}).encode("utf-8")
@@ -2178,6 +2782,14 @@ def rate_limit_error_handler(_: Any, exc: RateLimitError) -> Response:
 def get_home() -> FileResponse:
     return FileResponse(
         STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/admin", response_class=FileResponse)
+def get_admin_home() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "admin.html",
         headers={"Cache-Control": "no-store"},
     )
 
@@ -2202,16 +2814,162 @@ def logout(request: Request) -> Response:
 @app.get("/auth/status")
 def get_auth_status(request: Request) -> dict[str, Any]:
     auth = get_session_auth(request)
+    user_payload = None
+    if auth is not None:
+        try:
+            context = get_request_context(request)
+            user_payload = {
+                **context["user"],
+                "is_banned": context["is_banned"],
+                "ban_reason": context["ban"]["reason"] if context["ban"] else None,
+                "ban_expires_at": context["ban"]["expires_at"] if context["ban"] else None,
+            }
+        except PermissionError:
+            clear_auth_session(request)
+            auth = None
     payload = {
         "authenticated": auth is not None,
         "method": auth.get("method") if auth else None,
-        "user": auth.get("user") if auth else None,
+        "user": user_payload,
         "oauth": {
             "linuxdo_enabled": is_linuxdo_enabled(),
             "linuxdo_login_url": "/auth/linuxdo/login" if is_linuxdo_enabled() else None,
         },
     }
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/admin/me")
+def get_admin_me(request: Request) -> dict[str, Any]:
+    context = require_admin_user(request)
+    policy = get_inventory_policy(db)
+    return {
+        "user": context["user"],
+        "ban": context["ban"],
+        "policy": {
+            "status": policy["status"],
+            "hourly_limit": policy["hourly_limit"],
+            "max_claims": policy["max_claims"],
+            "thresholds": policy["thresholds"],
+            "source": "env",
+        },
+        "system": _DASHBOARD_CACHE.get_system_status(),
+    }
+
+
+@app.get("/admin/users")
+def admin_list_users(
+    request: Request,
+    search: str = Query(default=""),
+    ban_status: str = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    require_admin_user(request)
+    return {"items": db.list_users_for_admin(search=search, ban_status=ban_status, limit=limit)}
+
+
+@app.get("/admin/users/{linuxdo_user_id}")
+def admin_get_user_detail(request: Request, linuxdo_user_id: str) -> dict[str, Any]:
+    require_admin_user(request)
+    detail = db.get_admin_user_detail(linuxdo_user_id)
+    if not detail:
+        error_json = json.dumps({"detail": "User not found."}, ensure_ascii=False).encode("utf-8")
+        return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
+    return detail
+
+
+@app.post("/admin/users/{linuxdo_user_id}/ban")
+def admin_ban_user(request: Request, linuxdo_user_id: str, payload: AdminBanPayload) -> dict[str, Any]:
+    context = require_admin_user(request)
+    target = db.get_user_by_linuxdo_id(linuxdo_user_id)
+    if not target:
+        error_json = json.dumps({"detail": "User not found."}, ensure_ascii=False).encode("utf-8")
+        return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
+    try:
+        expires_at_ts = parse_expires_at_to_ts(payload.expires_at)
+    except ValueError:
+        error_json = json.dumps(
+            {"detail": "Invalid expires_at. Use ISO datetime or leave empty."},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
+    if expires_at_ts is not None and expires_at_ts <= now_ts():
+        error_json = json.dumps(
+            {"detail": "expires_at must be in the future."},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
+    ban = db.ban_user(
+        linuxdo_user_id=target["linuxdo_user_id"],
+        username_snapshot=target["linuxdo_username"],
+        reason=payload.reason,
+        banned_by_user_id=context["user_id"],
+        expires_at_ts=expires_at_ts,
+    )
+    return {"ok": True, "ban": ban}
+
+
+@app.post("/admin/users/{linuxdo_user_id}/unban")
+def admin_unban_user(request: Request, linuxdo_user_id: str) -> dict[str, Any]:
+    context = require_admin_user(request)
+    changed = db.unban_user(linuxdo_user_id, unbanned_by_user_id=context["user_id"])
+    return {"ok": changed}
+
+
+@app.get("/admin/bans")
+def admin_list_bans(
+    request: Request,
+    status_filter: str = Query(default="active", alias="status"),
+    search: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    require_admin_user(request)
+    return {"items": db.list_bans(status_filter=status_filter, search=search, limit=limit)}
+
+
+@app.get("/admin/tokens")
+def admin_list_tokens(
+    request: Request,
+    search: str = Query(default=""),
+    status_filter: str = Query(default="all", alias="status"),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict[str, Any]:
+    require_admin_user(request)
+    return {"items": db.list_tokens_for_admin(search=search, status_filter=status_filter, limit=limit)}
+
+
+@app.post("/admin/tokens/{token_id}/activate")
+def admin_activate_token(request: Request, token_id: int) -> dict[str, Any]:
+    require_admin_user(request)
+    token = db.set_token_enabled(token_id, True)
+    if not token:
+        error_json = json.dumps({"detail": "Token not found."}, ensure_ascii=False).encode("utf-8")
+        return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
+    return {"ok": True, "item": token}
+
+
+@app.post("/admin/tokens/{token_id}/deactivate")
+def admin_deactivate_token(request: Request, token_id: int) -> dict[str, Any]:
+    require_admin_user(request)
+    token = db.set_token_enabled(token_id, False)
+    if not token:
+        error_json = json.dumps({"detail": "Token not found."}, ensure_ascii=False).encode("utf-8")
+        return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
+    return {"ok": True, "item": token}
+
+
+@app.get("/admin/policy")
+def admin_get_policy(request: Request) -> dict[str, Any]:
+    require_admin_user(request)
+    policy = get_inventory_policy(db)
+    return {
+        "source": "env",
+        "status": policy["status"],
+        "hourly_limit": policy["hourly_limit"],
+        "max_claims": policy["max_claims"],
+        "thresholds": policy["thresholds"],
+        "system": _DASHBOARD_CACHE.get_system_status(),
+    }
 
 
 @app.get("/me")
@@ -2230,6 +2988,8 @@ def get_me(request: Request) -> dict[str, Any]:
             "username": user["linuxdo_username"],
             "name": user["linuxdo_name"] or user["linuxdo_username"],
             "trust_level": user["trust_level"],
+            "is_admin": session["is_admin"],
+            "is_banned": False,
         },
         "quota": quota,
         "claims": totals,
@@ -2452,9 +3212,8 @@ def download_claimed_token(
             raise PermissionError
         user_id = resolved["user_id"]
     else:
-        session = get_session_auth(request)
-        if session and session.get("method") == "linuxdo":
-            user_id = int(session.get("user_id"))
+        session = require_session_user(request)
+        user_id = int(session.get("user_id"))
 
     if not user_id:
         raise PermissionError
@@ -2470,7 +3229,7 @@ def download_claimed_token(
 
 
 @app.get("/auth/linuxdo/login")
-def start_linuxdo_login(request: Request) -> Response:
+def start_linuxdo_login(request: Request, next: str | None = Query(default="/")) -> Response:
     if not is_linuxdo_enabled():
         error_json = json.dumps({"detail": "Linux.do OAuth is not configured."}).encode("utf-8")
         return Response(
@@ -2479,6 +3238,10 @@ def start_linuxdo_login(request: Request) -> Response:
             media_type="application/json",
         )
 
+    if is_safe_relative_redirect(next):
+        request.session[SESSION_POST_LOGIN_REDIRECT_KEY] = next
+    else:
+        request.session[SESSION_POST_LOGIN_REDIRECT_KEY] = "/"
     state = secrets.token_urlsafe(32)
     request.session[SESSION_OAUTH_STATE_KEY] = state
     return RedirectResponse(
@@ -2496,10 +3259,13 @@ def linuxdo_callback(
 ) -> Response:
     expected_state = request.session.get(SESSION_OAUTH_STATE_KEY)
     request.session.pop(SESSION_OAUTH_STATE_KEY, None)
+    post_login_redirect = request.session.pop(SESSION_POST_LOGIN_REDIRECT_KEY, "/")
+    if not is_safe_relative_redirect(post_login_redirect):
+        post_login_redirect = "/"
 
     if error:
         response = RedirectResponse(
-            url=f"/?auth_error={urllib.parse.quote(error)}",
+            url=f"{post_login_redirect}?auth_error={urllib.parse.quote(error)}",
             status_code=status.HTTP_302_FOUND,
         )
         clear_auth_cookie(request, response)
@@ -2507,7 +3273,7 @@ def linuxdo_callback(
 
     if not is_linuxdo_enabled():
         response = RedirectResponse(
-            url="/?auth_error=linuxdo_not_configured",
+            url=f"{post_login_redirect}?auth_error=linuxdo_not_configured",
             status_code=status.HTTP_302_FOUND,
         )
         clear_auth_cookie(request, response)
@@ -2515,7 +3281,7 @@ def linuxdo_callback(
 
     if not code or not state or state != expected_state:
         response = RedirectResponse(
-            url="/?auth_error=invalid_oauth_state",
+            url=f"{post_login_redirect}?auth_error=invalid_oauth_state",
             status_code=status.HTTP_302_FOUND,
         )
         clear_auth_cookie(request, response)
@@ -2529,7 +3295,7 @@ def linuxdo_callback(
         set_linuxdo_session(request, user, db_user["id"])
     except (PermissionError, ValueError, urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
         response = RedirectResponse(
-            url="/?auth_error=linuxdo_login_failed",
+            url=f"{post_login_redirect}?auth_error=linuxdo_login_failed",
             status_code=status.HTTP_302_FOUND,
         )
         clear_auth_cookie(request, response)
@@ -2537,8 +3303,11 @@ def linuxdo_callback(
 
     base_url = get_provider_base_url()
     if base_url:
-        return RedirectResponse(url=f"{base_url}/?auth=linuxdo", status_code=status.HTTP_302_FOUND)
-    return RedirectResponse(url="/?auth=linuxdo", status_code=status.HTTP_302_FOUND)
+        return RedirectResponse(
+            url=f"{base_url}{post_login_redirect}?auth=linuxdo",
+            status_code=status.HTTP_302_FOUND,
+        )
+    return RedirectResponse(url=f"{post_login_redirect}?auth=linuxdo", status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/json")

@@ -25,6 +25,11 @@ const elements = {
   appScreen: document.getElementById("app-screen"),
   loginBtn: document.getElementById("linuxdo-login-btn"),
   loginMessage: document.getElementById("login-message"),
+  bannedScreen: document.getElementById("banned-screen"),
+  bannedReason: document.getElementById("banned-reason"),
+  bannedExpires: document.getElementById("banned-expires"),
+  bannedAdminLink: document.getElementById("banned-admin-link"),
+  bannedLogoutBtn: document.getElementById("banned-logout-btn"),
   logoutBtn: document.getElementById("logout-btn"),
   summaryOrigin: document.getElementById("summary-origin"),
   authSummary: document.getElementById("auth-summary"),
@@ -87,13 +92,14 @@ const elements = {
   claimResults: document.getElementById("claim-results"),
 };
 
-function showLoggedIn(loggedIn) {
-  if (loggedIn) {
-    elements.loginScreen.classList.add("hidden");
-    elements.appScreen.classList.remove("hidden");
-  } else {
-    elements.appScreen.classList.add("hidden");
-    elements.loginScreen.classList.remove("hidden");
+function showScreen(name) {
+  const loginVisible = name === "login";
+  const appVisible = name === "app";
+  const bannedVisible = name === "banned";
+  elements.loginScreen.classList.toggle("hidden", !loginVisible);
+  elements.appScreen.classList.toggle("hidden", !appVisible);
+  if (elements.bannedScreen) {
+    elements.bannedScreen.classList.toggle("hidden", !bannedVisible);
   }
 }
 
@@ -205,9 +211,42 @@ async function fetchJson(url, options = {}) {
   if (!response.ok) {
     const error = new Error(payload.detail || `请求失败: ${response.status}`);
     error.status = response.status;
+    error.payload = payload;
     throw error;
   }
   return payload;
+}
+
+function renderBannedUser(user) {
+  if (elements.bannedReason) {
+    elements.bannedReason.textContent = user?.ban_reason || "未提供";
+  }
+  if (elements.bannedExpires) {
+    elements.bannedExpires.textContent = user?.ban_expires_at ? formatDateTime(user.ban_expires_at) : "永久";
+  }
+  if (elements.bannedAdminLink) {
+    elements.bannedAdminLink.classList.toggle("hidden", !user?.is_admin);
+  }
+}
+
+function handleAccessError(error) {
+  if (error?.status === 403 && error?.payload?.ban) {
+    const bannedUser = {
+      ...(error.payload.user || {}),
+      ban_reason: error.payload.ban.reason,
+      ban_expires_at: error.payload.ban.expires_at,
+      is_admin: Boolean(state.user?.is_admin),
+    };
+    state.user = bannedUser;
+    renderBannedUser(bannedUser);
+    if (state.refreshTimer) {
+      clearInterval(state.refreshTimer);
+      state.refreshTimer = null;
+    }
+    showScreen("banned");
+    return true;
+  }
+  return false;
 }
 
 function renderUser() {
@@ -796,7 +835,7 @@ async function logout() {
     clearInterval(state.refreshTimer);
     state.refreshTimer = null;
   }
-  showLoggedIn(false);
+  showScreen("login");
 }
 
 async function refreshAll() {
@@ -810,7 +849,9 @@ async function refreshAll() {
     await loadClaims();
     await loadQueueStatus();
   } catch (error) {
-    // ignore refresh errors
+    if (!handleAccessError(error)) {
+      // ignore refresh errors
+    }
   } finally {
     state.refreshing = false;
   }
@@ -831,6 +872,9 @@ function bindEvents() {
   }
   if (elements.logoutBtn) {
     elements.logoutBtn.addEventListener("click", logout);
+  }
+  if (elements.bannedLogoutBtn) {
+    elements.bannedLogoutBtn.addEventListener("click", logout);
   }
   if (elements.tabData) {
     elements.tabData.addEventListener("click", () => switchTab("data"));
@@ -881,6 +925,8 @@ function bindEvents() {
 async function init() {
   bindEvents();
   elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
+  const url = new URL(window.location.href);
+  const authError = url.searchParams.get("auth_error");
 
   try {
     applyDocsBaseUrl();
@@ -890,32 +936,40 @@ async function init() {
         clearInterval(state.refreshTimer);
         state.refreshTimer = null;
       }
-      showLoggedIn(false);
-      return;
+      showScreen("login");
+      if (authError) {
+        setLoginMessage(`登录失败：${authError}`, "error");
+      }
+    } else if (status.user?.is_banned) {
+      state.user = status.user;
+      renderBannedUser(status.user);
+      showScreen("banned");
+    } else {
+      showScreen("app");
+      switchTab("data");
+      await loadDashboard();
+      await loadDashboardSummary();
+      await loadClaims();
+      await loadQueueStatus();
+      startAutoRefresh();
     }
-    showLoggedIn(true);
-    switchTab("data");
-    await loadDashboard();
-    await loadDashboardSummary();
-    await loadClaims();
-    await loadQueueStatus();
-    startAutoRefresh();
   } catch (error) {
     if (error.status === 401) {
       if (state.refreshTimer) {
         clearInterval(state.refreshTimer);
         state.refreshTimer = null;
       }
-      showLoggedIn(false);
-      return;
+      showScreen("login");
+      if (authError) {
+        setLoginMessage(`登录失败：${authError}`, "error");
+      }
+    } else if (!handleAccessError(error)) {
+      setLoginMessage(error.message, "error");
+      showScreen("login");
     }
-    setLoginMessage(error.message, "error");
   }
 
-  const url = new URL(window.location.href);
-  const authError = url.searchParams.get("auth_error");
   if (authError) {
-    setLoginMessage(`登录失败：${authError}`, "error");
     url.searchParams.delete("auth_error");
     window.history.replaceState({}, document.title, `${url.pathname}${url.search}`);
   }

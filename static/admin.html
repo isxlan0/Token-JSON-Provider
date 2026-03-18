@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Token Atlas Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260318">
+  <link rel="stylesheet" href="/assets/admin.css?v=20260318">
+</head>
+
+<body class="light-theme admin-body">
+  <section id="admin-login-screen" class="screen login-screen">
+    <div class="card login-card">
+      <div class="brand-logo">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+        </svg>
+      </div>
+      <h1>管理后台</h1>
+      <p>仅允许在 <code>.env</code> 中配置的管理员进入。</p>
+      <button id="admin-login-btn" class="btn btn-primary" type="button">使用 LinuxDo 登录</button>
+      <div id="admin-login-message" class="message"></div>
+    </div>
+  </section>
+
+  <section id="admin-denied-screen" class="screen login-screen hidden">
+    <div class="card login-card banned-card">
+      <div class="brand-logo danger">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+          stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="12" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+      </div>
+      <h1>没有后台权限</h1>
+      <p id="admin-denied-message">当前账号无权限访问后台。</p>
+      <div class="banned-actions">
+        <a class="btn btn-outline" href="/">返回主站</a>
+        <button id="admin-denied-logout-btn" class="btn btn-primary" type="button">退出登录</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="admin-app-screen" class="admin-app hidden">
+    <aside class="admin-sidebar">
+      <div>
+        <div class="sidebar-brand">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);">
+            <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+          </svg>
+          <h1>Admin</h1>
+        </div>
+        <nav class="nav-menu admin-nav">
+          <button id="admin-tab-users" class="nav-item active" type="button">用户管理</button>
+          <button id="admin-tab-bans" class="nav-item" type="button">封禁记录</button>
+          <button id="admin-tab-tokens" class="nav-item" type="button">Token 管理</button>
+          <button id="admin-tab-policy" class="nav-item" type="button">额度策略</button>
+        </nav>
+      </div>
+      <div class="admin-side-footer">
+        <a class="btn btn-outline admin-side-link" href="/">回主站</a>
+      </div>
+    </aside>
+
+    <main class="admin-main">
+      <header class="top-header admin-header">
+        <div>
+          <div class="header-title" id="admin-header-title">用户管理</div>
+          <div class="admin-subtitle" id="admin-auth-summary">-</div>
+        </div>
+        <div class="header-actions">
+          <div class="status-badge">
+            <div class="dot"></div><span id="admin-policy-summary" class="mono">策略 -</span>
+          </div>
+          <button id="admin-logout-btn" class="btn btn-ghost" type="button">退出登录</button>
+        </div>
+      </header>
+
+      <div class="admin-content">
+        <section id="admin-view-users" class="admin-view active">
+          <div class="admin-toolbar card">
+            <input id="admin-user-search" class="form-input admin-search-input" type="text"
+              placeholder="搜索 LinuxDo ID / 用户名 / 昵称">
+            <select id="admin-user-filter" class="form-input admin-select">
+              <option value="all">全部用户</option>
+              <option value="banned">仅封禁</option>
+              <option value="normal">仅正常</option>
+            </select>
+            <button id="admin-user-refresh" class="btn btn-outline" type="button">刷新</button>
+          </div>
+          <div class="admin-grid">
+            <div id="admin-user-list" class="admin-list"></div>
+            <div id="admin-user-detail" class="card admin-detail empty-state">选择一个用户查看详情</div>
+          </div>
+        </section>
+
+        <section id="admin-view-bans" class="admin-view">
+          <div class="admin-toolbar card">
+            <input id="admin-ban-search" class="form-input admin-search-input" type="text" placeholder="搜索被封 ID / 用户名">
+            <select id="admin-ban-filter" class="form-input admin-select">
+              <option value="active">有效封禁</option>
+              <option value="expired">已过期</option>
+              <option value="unbanned">已解封</option>
+              <option value="all">全部记录</option>
+            </select>
+            <button id="admin-ban-refresh" class="btn btn-outline" type="button">刷新</button>
+          </div>
+          <div id="admin-ban-list" class="admin-list wide-list"></div>
+        </section>
+
+        <section id="admin-view-tokens" class="admin-view">
+          <div class="admin-toolbar card">
+            <input id="admin-token-search" class="form-input admin-search-input" type="text" placeholder="搜索文件名 / 路径">
+            <select id="admin-token-filter" class="form-input admin-select">
+              <option value="all">全部 Token</option>
+              <option value="enabled">仅启用</option>
+              <option value="disabled">仅停用</option>
+            </select>
+            <button id="admin-token-refresh" class="btn btn-outline" type="button">刷新</button>
+          </div>
+          <div id="admin-token-list" class="admin-list wide-list"></div>
+        </section>
+
+        <section id="admin-view-policy" class="admin-view">
+          <div id="admin-policy-panel" class="card admin-policy-panel"></div>
+        </section>
+      </div>
+    </main>
+  </section>
+
+  <script src="/assets/admin.js?v=20260318" defer></script>
+</body>
+
+</html>

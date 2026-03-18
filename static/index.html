@@ -12,7 +12,7 @@
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap"
     rel="stylesheet">
 
-  <link rel="stylesheet" href="/assets/styles.css?v=20260317">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260318">
 </head>
 
 <body class="light-theme">
@@ -48,6 +48,28 @@
     </footer>
   </section>
 
+    <section id="banned-screen" class="screen login-screen hidden">
+    <div class="card login-card banned-card">
+      <div class="brand-logo danger">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+          stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="12" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+      </div>
+      <h1>账号已被封禁</h1>
+      <p>当前账号不能进入主站进行领取、下载或 API Key 操作。</p>
+      <div class="banned-meta">
+        <div>原因：<span id="banned-reason">-</span></div>
+        <div>到期：<span id="banned-expires">永久</span></div>
+      </div>
+      <div class="banned-actions">
+        <a id="banned-admin-link" class="btn btn-outline hidden" href="/admin">进入管理后台</a>
+        <button id="banned-logout-btn" class="btn btn-primary" type="button">退出登录</button>
+      </div>
+    </div>
+  </section>
   <section id="app-screen" class="screen app-screen hidden">
     <aside class="sidebar">
       <div class="sidebar-brand">
@@ -338,7 +360,7 @@
     </main>
   </section>
 
-  <script src="/assets/app.js?v=20260317" defer></script>
+  <script src="/assets/app.js?v=20260318" defer></script>
 </body>
 
 </html>

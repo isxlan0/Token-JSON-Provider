@@ -5,6 +5,9 @@
 ## 功能
 
 - LinuxDo OAuth2 登录
+- `.env` 配置后台管理员（支持 LinuxDo ID / `@用户名`）
+- 独立 `/admin` 管理后台
+- 用户封禁 / 解封，封禁后禁止进入主站操作
 - 自动同步 `token/` 目录
 - 领取额度与速率限制可配置
 - API Key 管理与限流
@@ -30,6 +33,7 @@ TOKEN_INDEX_LINUXDO_REDIRECT_URI=
 TOKEN_INDEX_LINUXDO_SCOPE=read
 TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL=0
 TOKEN_INDEX_LINUXDO_ALLOWED_IDS=
+TOKEN_INDEX_ADMIN_IDENTITIES=
 
 # 数据库路径（默认 ./token_atlas.db）
 TOKEN_DB_PATH=
@@ -83,6 +87,20 @@ http://<服务器IP>:8000/
 - `GET /auth/linuxdo/callback`：OAuth2 回调
 - `GET /me`：返回当前用户、额度、领取统计
 - `GET /dashboard/stats`：返回库存与全站领取统计
+
+### 管理后台
+
+- `GET /admin`：管理后台页面
+- `GET /admin/me`：后台当前管理员与策略摘要
+- `GET /admin/users`：用户列表
+- `GET /admin/users/{linuxdo_user_id}`：用户详情
+- `POST /admin/users/{linuxdo_user_id}/ban`：封禁用户
+- `POST /admin/users/{linuxdo_user_id}/unban`：解封用户
+- `GET /admin/bans`：封禁记录
+- `GET /admin/tokens`：Token 列表
+- `POST /admin/tokens/{id}/activate`：启用 Token
+- `POST /admin/tokens/{id}/deactivate`：停用 Token
+- `GET /admin/policy`：只读查看当前额度策略
 
 ### API Key 管理
 
