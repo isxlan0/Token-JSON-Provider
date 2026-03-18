@@ -374,3 +374,24 @@
     flex-wrap: wrap;
   }
 }
+.admin-notice {
+  margin-bottom: 0.85rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-base);
+  background: #f8fafc;
+  color: var(--text-main);
+  padding: 0.7rem 0.9rem;
+  font-size: 0.9rem;
+}
+
+.admin-notice.success {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.admin-notice.error {
+  border-color: #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+}

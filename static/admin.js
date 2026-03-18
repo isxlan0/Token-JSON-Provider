@@ -52,6 +52,7 @@ const elements = {
   tokenList: document.getElementById("admin-token-list"),
   tokenPager: document.getElementById("admin-token-pager"),
   policyPanel: document.getElementById("admin-policy-panel"),
+  notice: document.getElementById("admin-notice"),
 };
 
 function showScreen(name) {
@@ -64,6 +65,15 @@ function setLoginMessage(message = "", tone = "error") {
   elements.loginMessage.textContent = message;
   elements.loginMessage.dataset.tone = tone;
   elements.loginMessage.classList.toggle("hidden", !message);
+}
+
+function showNotice(message = "", tone = "success") {
+  if (!elements.notice) {
+    return;
+  }
+  elements.notice.textContent = message;
+  elements.notice.className = `admin-notice ${tone}`;
+  elements.notice.classList.toggle("hidden", !message);
 }
 
 function formatDateTime(value) {
@@ -129,29 +139,34 @@ function renderPolicySummary() {
 }
 
 function renderPager(container, page, onPageChange) {
-  const total = Number(page.total || 0);
-  const limit = Math.max(1, Number(page.limit || 50));
-  const offset = Math.max(0, Number(page.offset || 0));
   if (!container) {
     return;
   }
-  if (total <= limit) {
-    container.innerHTML = "";
-    container.classList.add("hidden");
-    return;
-  }
-  container.classList.remove("hidden");
+  const total = Number(page.total || 0);
+  const limit = Math.max(1, Number(page.limit || 50));
+  const offset = Math.max(0, Number(page.offset || 0));
   const current = Math.floor(offset / limit) + 1;
-  const pages = Math.max(1, Math.ceil(total / limit));
+  const pages = Math.max(1, Math.ceil(Math.max(total, 1) / limit));
   const prevDisabled = offset <= 0 ? "disabled" : "";
   const nextDisabled = offset + limit >= total ? "disabled" : "";
+  container.classList.remove("hidden");
   container.innerHTML = `
     <button class="btn btn-outline btn-inline" data-page="prev" ${prevDisabled}>上一页</button>
     <span>第 ${current} / ${pages} 页，共 ${total} 条</span>
     <button class="btn btn-outline btn-inline" data-page="next" ${nextDisabled}>下一页</button>
   `;
-  container.querySelector('[data-page="prev"]')?.addEventListener('click', () => onPageChange(Math.max(0, offset - limit)));
-  container.querySelector('[data-page="next"]')?.addEventListener('click', () => onPageChange(offset + limit));
+  container.querySelector('[data-page="prev"]')?.addEventListener("click", () => {
+    if (offset <= 0) {
+      return;
+    }
+    onPageChange(Math.max(0, offset - limit));
+  });
+  container.querySelector('[data-page="next"]')?.addEventListener("click", () => {
+    if (offset + limit >= total) {
+      return;
+    }
+    onPageChange(offset + limit);
+  });
 }
 
 function renderUsers() {
@@ -267,14 +282,20 @@ function renderBans() {
         switchTab("users");
         await loadUsers(true);
         await loadUserDetail(item.linuxdo_user_id);
+        showNotice(`已定位到用户 ${item.linuxdo_user_id}`);
       });
       const unbanBtn = card.querySelector("[data-ban-unban]");
       if (unbanBtn) {
         unbanBtn.addEventListener("click", async () => {
-          await fetchJson(`/admin/users/${encodeURIComponent(item.linuxdo_user_id)}/unban`, { method: "POST" });
-          await Promise.all([loadUsers(), loadBans()]);
-          if (state.selectedUserId === item.linuxdo_user_id) {
-            await loadUserDetail(item.linuxdo_user_id);
+          try {
+            await fetchJson(`/admin/users/${encodeURIComponent(item.linuxdo_user_id)}/unban`, { method: "POST" });
+            await Promise.all([loadUsers(), loadBans()]);
+            if (state.selectedUserId === item.linuxdo_user_id) {
+              await loadUserDetail(item.linuxdo_user_id);
+            }
+            showNotice(`已解封用户 ${item.linuxdo_user_id}`);
+          } catch (error) {
+            showNotice(error.message, "error");
           }
         });
       }
@@ -319,6 +340,9 @@ function renderTokens() {
         try {
           await fetchJson(`/admin/tokens/${item.id}/${actionPath}`, { method: "POST" });
           await Promise.all([loadTokens(), loadPolicy()]);
+          showNotice(`${item.file_name} 已${actionText}`);
+        } catch (error) {
+          showNotice(error.message, "error");
         } finally {
           actionBtn.disabled = false;
         }
@@ -433,27 +457,42 @@ async function banSelectedUser() {
   }
   const reason = document.getElementById("admin-ban-reason")?.value.trim() || "";
   if (!reason) {
-    alert("封禁原因必填");
+    showNotice("封禁原因必填", "error");
     return;
   }
   const expiresValue = document.getElementById("admin-ban-expires")?.value || "";
-  const expiresAt = expiresValue ? new Date(expiresValue).toISOString() : null;
-  await fetchJson(`/admin/users/${encodeURIComponent(state.selectedUserId)}/ban`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reason, expires_at: expiresAt }),
-  });
-  await Promise.all([loadUsers(), loadBans(true)]);
-  await loadUserDetail(state.selectedUserId);
+  const expiresDate = expiresValue ? new Date(expiresValue) : null;
+  if (expiresDate && Number.isNaN(expiresDate.getTime())) {
+    showNotice("封禁到期时间格式无效", "error");
+    return;
+  }
+  const expiresAt = expiresDate ? expiresDate.toISOString() : null;
+  try {
+    await fetchJson(`/admin/users/${encodeURIComponent(state.selectedUserId)}/ban`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason, expires_at: expiresAt }),
+    });
+    await Promise.all([loadUsers(), loadBans(true)]);
+    await loadUserDetail(state.selectedUserId);
+    showNotice(`已保存对 ${state.selectedUserId} 的封禁`);
+  } catch (error) {
+    showNotice(error.message, "error");
+  }
 }
 
 async function unbanSelectedUser() {
   if (!state.selectedUserId) {
     return;
   }
-  await fetchJson(`/admin/users/${encodeURIComponent(state.selectedUserId)}/unban`, { method: "POST" });
-  await Promise.all([loadUsers(), loadBans(true)]);
-  await loadUserDetail(state.selectedUserId);
+  try {
+    await fetchJson(`/admin/users/${encodeURIComponent(state.selectedUserId)}/unban`, { method: "POST" });
+    await Promise.all([loadUsers(), loadBans(true)]);
+    await loadUserDetail(state.selectedUserId);
+    showNotice(`已解封用户 ${state.selectedUserId}`);
+  } catch (error) {
+    showNotice(error.message, "error");
+  }
 }
 
 async function logout() {
