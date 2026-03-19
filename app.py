@@ -2871,9 +2871,8 @@ def _queue_pump_loop() -> None:
 def _token_import_loop() -> None:
     while not _TOKEN_IMPORT_STOP.wait(timeout=_TOKEN_IMPORT_INTERVAL_SEC):
         try:
-            result = sync_new_tokens_with_retry(db, TOKEN_DIR)
-            if result.get("imported"):
-                try_fulfill_queue(db)
+            sync_tokens_with_retry(db, TOKEN_DIR)
+            try_fulfill_queue(db)
         except Exception:
             pass
 
@@ -2882,6 +2881,8 @@ def _token_import_loop() -> None:
 async def lifespan(_: FastAPI):
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db()
+    sync_tokens_with_retry(db, TOKEN_DIR)
+    try_fulfill_queue(db)
     _refresh_dashboard_memory()
 
     _QUEUE_PUMP_STOP.clear()
