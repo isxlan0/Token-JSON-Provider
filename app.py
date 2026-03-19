@@ -2023,7 +2023,10 @@ class TokenDb:
                         SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
                         FROM tokens
                         WHERE is_active = 1 AND is_enabled = 1 AND is_available = 1 AND claim_count < max_claims
-                        ORDER BY created_at_ts ASC, id ASC
+                        ORDER BY
+                            CASE WHEN claim_count > 0 THEN 0 ELSE 1 END ASC,
+                            created_at_ts ASC,
+                            id ASC
                         LIMIT ?
                         """,
                         (target,),
