@@ -429,19 +429,21 @@ def _extract_upload_candidate(content: Any) -> dict[str, Any]:
     return content
 
 
-def normalize_upload_content(content: Any) -> dict[str, str]:
+def normalize_upload_content(content: Any) -> dict[str, Any]:
     candidate = _extract_upload_candidate(content)
-    normalized = {
+    normalized_required = {
         key: normalize_uploaded_value(candidate.get(key))
         for key in REQUIRED_UPLOAD_FIELDS
     }
-    missing = [key for key, value in normalized.items() if not value]
+    missing = [key for key, value in normalized_required.items() if not value]
     if missing:
         raise UploadValidationError(f"缺少必填字段：{', '.join(missing)}")
+    normalized = dict(candidate)
+    normalized.update(normalized_required)
     return normalized
 
 
-def load_uploaded_json(raw: bytes) -> tuple[str, dict[str, str], str]:
+def load_uploaded_json(raw: bytes) -> tuple[str, dict[str, Any], str]:
     encoding = detect_encoding(raw)
     decoded = raw.decode(encoding)
     parsed = json.loads(decoded.lstrip("\ufeff"))
@@ -4140,6 +4142,10 @@ def get_cache_queue_snapshot_ttl() -> int:
     return max(get_cache_queue_ttl(), 86400)
 
 
+def get_cache_upload_results_ttl() -> int:
+    return max(get_cache_me_ttl(), 7 * 24 * 3600)
+
+
 def get_cache_dashboard_ttl() -> int:
     return max(1, env_int(CACHE_DASHBOARD_TTL_ENV, 10))
 
@@ -4474,6 +4480,7 @@ def set_user_api_key_summary_snapshot(user_id: int, payload: dict[str, Any]) -> 
 def get_default_upload_results_snapshot() -> dict[str, Any]:
     return {
         "batch_id": None,
+        "created_at": None,
         "summary": {
             "total": 0,
             "accepted": 0,
@@ -4485,6 +4492,7 @@ def get_default_upload_results_snapshot() -> dict[str, Any]:
             "processing": 0,
         },
         "items": [],
+        "history": [],
         "queue_status": None,
     }
 
@@ -4493,10 +4501,21 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
     key = build_user_upload_results_cache_key(user_id)
     cached = _get_cached_snapshot(key)
     if cached is not None:
+        history = list(cached.get("history") or [])
+        if not history and cached.get("items"):
+            history = [
+                build_upload_history_entry(
+                    str(cached.get("batch_id") or "legacy"),
+                    list(cached.get("items") or []),
+                    created_at=str(cached.get("created_at") or isoformat_now()),
+                )
+            ]
         return {
             "batch_id": cached.get("batch_id"),
+            "created_at": cached.get("created_at"),
             "summary": dict(cached.get("summary") or get_default_upload_results_snapshot()["summary"]),
             "items": list(cached.get("items") or []),
+            "history": history,
             "queue_status": dict(cached.get("queue_status") or {}) if isinstance(cached.get("queue_status"), dict) else None,
         }
     return get_default_upload_results_snapshot()
@@ -4504,13 +4523,24 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
 
 def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     key = build_user_upload_results_cache_key(user_id)
+    history = list(payload.get("history") or [])
+    if not history and payload.get("items"):
+        history = [
+            build_upload_history_entry(
+                str(payload.get("batch_id") or "latest"),
+                list(payload.get("items") or []),
+                created_at=str(payload.get("created_at") or isoformat_now()),
+            )
+        ]
     normalized = {
         "batch_id": payload.get("batch_id"),
+        "created_at": payload.get("created_at"),
         "summary": dict(payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
         "items": list(payload.get("items") or []),
+        "history": history,
         "queue_status": dict(payload.get("queue_status") or {}) if isinstance(payload.get("queue_status"), dict) else None,
     }
-    return _set_cached_snapshot(key, normalized, get_cache_me_ttl())
+    return _set_cached_snapshot(key, normalized, get_cache_upload_results_ttl())
 
 
 def get_cached_user_queue_snapshot(user_id: int) -> dict[str, Any] | None:
@@ -5070,6 +5100,8 @@ def build_upload_response(
     items: list[dict[str, Any]],
     *,
     batch_id: str | None = None,
+    created_at: str | None = None,
+    history: list[dict[str, Any]] | None = None,
     queue_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = {
@@ -5088,9 +5120,26 @@ def build_upload_response(
     }
     return {
         "batch_id": batch_id,
+        "created_at": created_at,
         "summary": summary,
         "items": items,
+        "history": list(history or []),
         "queue_status": dict(queue_status) if isinstance(queue_status, dict) else None,
+    }
+
+
+def build_upload_history_entry(
+    batch_id: str,
+    items: list[dict[str, Any]],
+    *,
+    created_at: str,
+) -> dict[str, Any]:
+    payload = build_upload_response(items, batch_id=batch_id, created_at=created_at)
+    return {
+        "batch_id": payload["batch_id"],
+        "created_at": payload["created_at"],
+        "summary": payload["summary"],
+        "items": payload["items"],
     }
 
 
@@ -5113,9 +5162,15 @@ def update_user_upload_results_snapshot(
     item_payload: dict[str, Any],
 ) -> dict[str, Any] | None:
     current = get_user_upload_results_snapshot(user_id)
-    if current.get("batch_id") != batch_id:
+    history = list(current.get("history") or [])
+    batch_position = next(
+        (index for index, batch in enumerate(history) if batch.get("batch_id") == batch_id),
+        None,
+    )
+    if batch_position is None:
         return None
-    items = list(current.get("items") or [])
+    batch_entry = dict(history[batch_position])
+    items = list(batch_entry.get("items") or [])
     target_position = next(
         (
             index
@@ -5129,9 +5184,17 @@ def update_user_upload_results_snapshot(
     merged = dict(items[target_position])
     merged.update(item_payload)
     items[target_position] = merged
-    payload = build_upload_response(
+    history[batch_position] = build_upload_history_entry(
+        batch_id,
         items,
-        batch_id=batch_id,
+        created_at=str(batch_entry.get("created_at") or isoformat_now()),
+    )
+    latest = history[0] if history else get_default_upload_results_snapshot()
+    payload = build_upload_response(
+        list(latest.get("items") or []),
+        batch_id=latest.get("batch_id"),
+        created_at=latest.get("created_at"),
+        history=history,
         queue_status=get_current_user_queue_status_snapshot(user_id),
     )
     return set_user_upload_results_snapshot(user_id, payload)
@@ -6580,6 +6643,7 @@ def upload_tokens_session(
     results: list[dict[str, Any]] = []
     queued_tasks: list[QueuedUploadTask] = []
     batch_id = secrets.token_hex(8)
+    created_at = isoformat_now()
     for request_index, upload in enumerate(files):
         original_name = os.path.basename(upload.name or "upload.json")
         upload_log(
@@ -6671,9 +6735,22 @@ def upload_tokens_session(
         )
 
     queue_status_payload = get_current_user_queue_status_snapshot(session["user_id"])
+    previous_snapshot = get_user_upload_results_snapshot(session["user_id"])
+    history = list(previous_snapshot.get("history") or [])
+    history.insert(
+        0,
+        build_upload_history_entry(
+            batch_id,
+            results,
+            created_at=created_at,
+        ),
+    )
+    history = history[:20]
     response_payload = build_upload_response(
         results,
         batch_id=batch_id,
+        created_at=created_at,
+        history=history,
         queue_status=queue_status_payload,
     )
     set_user_upload_results_snapshot(session["user_id"], response_payload)
