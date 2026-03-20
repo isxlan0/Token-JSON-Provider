@@ -26,6 +26,7 @@ const state = {
   claimsInitialized: false,
   skipNextClaimModal: false,
   refreshCounter: 0,
+  pendingHiddenClaimIds: new Set(),
   isClaimSubmitting: false,
   isClaimQueued: false,
   uploadPolicy: null,
@@ -192,7 +193,14 @@ function setLoginMessage(message = "", tone = "error") {
 
 async function loadClaims() {
   const payload = await fetchJson("/me/claims");
-  const items = payload.items || [];
+  const hiddenIds = state.pendingHiddenClaimIds || new Set();
+  const serverIds = new Set((payload.items || []).map((item) => item.claim_id));
+  Array.from(hiddenIds).forEach((id) => {
+    if (!serverIds.has(id)) {
+      hiddenIds.delete(id);
+    }
+  });
+  const items = (payload.items || []).filter((item) => !hiddenIds.has(item.claim_id));
   const total = items.length;
   if (state.claimsInitialized) {
     const lastTotal = state.lastClaimTotal ?? total;
@@ -244,7 +252,7 @@ function renderQueueStatus() {
   elements.claimSummary.textContent =
     `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。` +
     `当前可领取库存 ${available} 次，库存会优先发给前面排队用户。` +
-    "系统每隔 15 秒自动刷新。";
+    "系统每隔 5 秒自动刷新。";
   elements.claimSummary.classList.remove("hidden");
   state.queueSticky = true;
 }
@@ -344,7 +352,7 @@ function renderStats() {
 }
 
 function renderMyClaims() {
-  const total = state.claims?.total ?? 0;
+  const total = Math.max(0, (state.claims?.total ?? 0) - (state.pendingHiddenClaimIds?.size ?? 0));
   elements.myClaimsTotal.textContent = total;
 }
 
@@ -846,12 +854,15 @@ function renderUploadResults() {
     `;
     list.appendChild(header);
     (batch.items || []).forEach((item) => {
+      const metaText = item.queue_position
+        ? `${item.reason || "-"}（队列第 ${item.queue_position} 个）`
+        : (item.reason || "-");
       const row = document.createElement("div");
       row.className = "upload-result-item";
       row.innerHTML = `
         <div class="upload-result-main">
           <div class="upload-selected-name">${escapeHtml(item.file_name || "-")}</div>
-          <div class="upload-selected-meta">${escapeHtml(item.reason || "-")}</div>
+          <div class="upload-selected-meta">${escapeHtml(metaText)}</div>
         </div>
         <div class="upload-result-status is-${item.status}">
           <span>${uploadStatusLabel(item.status)}</span>
@@ -968,14 +979,29 @@ async function removeSelectedClaims() {
     return;
   }
   const ids = Array.from(state.claimSelected);
-  await fetchJson("/me/claims/hide", {
+  const removedCount = state.claimResults.filter((item) => state.claimSelected.has(item.claim_id)).length;
+  ids.forEach((id) => state.pendingHiddenClaimIds.add(id));
+  state.claimResults = state.claimResults.filter((item) => !state.claimSelected.has(item.claim_id));
+  state.claimSelected.clear();
+  if (state.claims) {
+    state.claims = {
+      ...state.claims,
+      total: Math.max(0, (state.claims.total || 0) - removedCount),
+    };
+    renderMyClaims();
+  }
+  renderClaimResults();
+  fetchJson("/me/claims/hide", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ claim_ids: ids }),
+  }).catch((error) => {
+    ids.forEach((id) => state.pendingHiddenClaimIds.delete(id));
+    elements.claimError.textContent = error.message;
+    elements.claimError.classList.remove("hidden");
+    loadClaimSummary().catch(() => {});
+    loadClaims().catch(() => {});
   });
-  state.claimResults = state.claimResults.filter((item) => !state.claimSelected.has(item.claim_id));
-  state.claimSelected.clear();
-  renderClaimResults();
 }
 
 function toggleClaimSelection(claimId, checked) {
@@ -1062,15 +1088,31 @@ function renderClaimResults() {
     });
     removeBtn.addEventListener("click", async () => {
       if (item.claim_id != null) {
-        await fetchJson("/me/claims/hide", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ claim_ids: [item.claim_id] }),
-        });
+        state.pendingHiddenClaimIds.add(item.claim_id);
       }
       state.claimResults = state.claimResults.filter((row) => row.claim_id !== item.claim_id);
       state.claimSelected.clear();
+      if (item.claim_id != null && state.claims) {
+        state.claims = {
+          ...state.claims,
+          total: Math.max(0, (state.claims.total || 0) - 1),
+        };
+        renderMyClaims();
+      }
       renderClaimResults();
+      if (item.claim_id != null) {
+        fetchJson("/me/claims/hide", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ claim_ids: [item.claim_id] }),
+        }).catch((error) => {
+          state.pendingHiddenClaimIds.delete(item.claim_id);
+          elements.claimError.textContent = error.message;
+          elements.claimError.classList.remove("hidden");
+          loadClaimSummary().catch(() => {});
+          loadClaims().catch(() => {});
+        });
+      }
     });
     elements.claimResults.appendChild(card);
   });
@@ -1226,16 +1268,31 @@ async function clearClaimResults() {
     return;
   }
   const ids = state.claimResults.map((item) => item.claim_id).filter((id) => id != null);
+  ids.forEach((id) => state.pendingHiddenClaimIds.add(id));
+  const removedCount = state.claimResults.length;
+  state.claimResults = [];
+  state.claimSelected.clear();
+  if (state.claims) {
+    state.claims = {
+      ...state.claims,
+      total: Math.max(0, (state.claims.total || 0) - removedCount),
+    };
+    renderMyClaims();
+  }
+  renderClaimResults();
   if (ids.length) {
-    await fetchJson("/me/claims/hide", {
+    fetchJson("/me/claims/hide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ claim_ids: ids }),
+    }).catch((error) => {
+      ids.forEach((id) => state.pendingHiddenClaimIds.delete(id));
+      elements.claimError.textContent = error.message;
+      elements.claimError.classList.remove("hidden");
+      loadClaimSummary().catch(() => {});
+      loadClaims().catch(() => {});
     });
   }
-  state.claimResults = [];
-  state.claimSelected.clear();
-  renderClaimResults();
 }
 
 async function logout() {
@@ -1281,7 +1338,7 @@ function startAutoRefresh() {
   if (state.refreshTimer) {
     clearInterval(state.refreshTimer);
   }
-  state.refreshTimer = setInterval(refreshAll, 15000);
+  state.refreshTimer = setInterval(refreshAll, 5000);
 }
 
 function bindEvents() {

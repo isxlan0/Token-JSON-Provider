@@ -392,6 +392,12 @@ class QueuedUploadTask:
     access_token_hash: str
 
 
+@dataclass
+class HideClaimsTask:
+    user_id: int
+    claim_ids: list[int]
+
+
 class LinuxDOUser(BaseModel):
     id: int
     username: str
@@ -3617,10 +3623,6 @@ class TokenDb:
         api_key_id: int | None,
         count: int,
     ) -> dict[str, Any]:
-        try:
-            try_fulfill_queue(self)
-        except Exception:
-            pass
         requested = max(1, count)
         request_id = secrets.token_hex(8)
         now = now_ts()
@@ -4771,7 +4773,7 @@ def get_apikey_rate_per_minute() -> int:
 
 
 def get_codex_probe_delay_sec() -> float:
-    return max(0.0, env_float(TOKEN_CODEX_PROBE_DELAY_SEC_ENV, 1.5))
+    return max(0.0, env_float(TOKEN_CODEX_PROBE_DELAY_SEC_ENV, 0.1))
 
 
 def get_codex_probe_timeout_sec() -> float:
@@ -5244,13 +5246,18 @@ _SYSTEM_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _CACHE_TTL_SEC = 5.0
 _QUEUE_PUMP_THREAD: threading.Thread | None = None
 _QUEUE_PUMP_STOP = threading.Event()
-_QUEUE_PUMP_INTERVAL_SEC = 20.0
+_QUEUE_PUMP_INTERVAL_SEC = 5.0
 _TOKEN_IMPORT_THREAD: threading.Thread | None = None
 _TOKEN_IMPORT_STOP = threading.Event()
 _TOKEN_IMPORT_QUEUE: queue.Queue[tuple[str, int, str]] = queue.Queue()
 _UPLOAD_TASK_THREAD: threading.Thread | None = None
 _UPLOAD_TASK_STOP = threading.Event()
 _UPLOAD_TASK_QUEUE: queue.Queue[QueuedUploadTask] = queue.Queue()
+_UPLOAD_TASK_STATE_LOCK = threading.RLock()
+_UPLOAD_TASK_ACTIVE_COUNT = 0
+_HIDE_CLAIMS_THREAD: threading.Thread | None = None
+_HIDE_CLAIMS_STOP = threading.Event()
+_HIDE_CLAIMS_QUEUE: queue.Queue[HideClaimsTask] = queue.Queue()
 _TOKEN_IMPORT_DELAYED_LOCK = threading.RLock()
 _TOKEN_IMPORT_DELAYED_QUEUE: list[tuple[float, int, str, int, str]] = []
 _TOKEN_IMPORT_DELAYED_SEQUENCE = itertools.count()
@@ -5834,6 +5841,26 @@ def _clear_upload_task_queue() -> None:
         upload_log(f"[upload-worker] cleared queued tasks count={cleared}")
 
 
+def _clear_hide_claims_queue() -> None:
+    cleared = 0
+    while True:
+        try:
+            _HIDE_CLAIMS_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        else:
+            cleared += 1
+            _HIDE_CLAIMS_QUEUE.task_done()
+    if cleared:
+        upload_log(f"[hide-claims] cleared queued tasks count={cleared}")
+
+
+def get_upload_task_queue_position(offset: int = 0) -> int:
+    with _UPLOAD_TASK_STATE_LOCK:
+        active = _UPLOAD_TASK_ACTIVE_COUNT
+    return max(1, int(active) + _UPLOAD_TASK_QUEUE.qsize() + int(offset) + 1)
+
+
 def _process_upload_task(task: QueuedUploadTask) -> None:
     update_user_upload_results_snapshot(
         task.user_id,
@@ -5841,7 +5868,7 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
         task.request_index,
         {
             "status": "processing",
-            "reason": "后台校验中，请稍候刷新结果。",
+            "reason": "正在处理，请稍候刷新结果。",
         },
     )
     upload_log(
@@ -5951,14 +5978,6 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
                         raise
                     else:
                         invalidate_user_cache(task.user_id)
-                        try:
-                            try_fulfill_queue(db)
-                        except Exception as exc:
-                            upload_log(
-                                f"[upload-worker] fulfill_failed user_id={task.user_id} "
-                                f"batch={task.batch_id} index={task.request_index} "
-                                f"error={type(exc).__name__}:{exc}"
-                            )
                         result_item = {
                             "status": "accepted",
                             "reason": "校验通过，已加入可领取库存",
@@ -5983,6 +6002,7 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
 
 
 def _upload_task_loop() -> None:
+    global _UPLOAD_TASK_ACTIVE_COUNT
     upload_log("[upload-worker] background worker started")
     while not _UPLOAD_TASK_STOP.is_set():
         try:
@@ -5990,10 +6010,37 @@ def _upload_task_loop() -> None:
         except queue.Empty:
             continue
         try:
+            with _UPLOAD_TASK_STATE_LOCK:
+                _UPLOAD_TASK_ACTIVE_COUNT += 1
             _process_upload_task(task)
         finally:
+            with _UPLOAD_TASK_STATE_LOCK:
+                _UPLOAD_TASK_ACTIVE_COUNT = max(0, _UPLOAD_TASK_ACTIVE_COUNT - 1)
             _UPLOAD_TASK_QUEUE.task_done()
     upload_log("[upload-worker] background worker stopped")
+
+
+def _hide_claims_loop() -> None:
+    upload_log("[hide-claims] background worker started")
+    while not _HIDE_CLAIMS_STOP.is_set():
+        try:
+            task = _HIDE_CLAIMS_QUEUE.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            hidden = db.hide_claims(task.user_id, task.claim_ids)
+            upload_log(
+                f"[hide-claims] finished user_id={task.user_id} "
+                f"requested={len(task.claim_ids)} hidden={hidden}"
+            )
+        except Exception as exc:
+            upload_log(
+                f"[hide-claims] failed user_id={task.user_id} "
+                f"claims={len(task.claim_ids)} error={type(exc).__name__}:{exc}"
+            )
+        finally:
+            _HIDE_CLAIMS_QUEUE.task_done()
+    upload_log("[hide-claims] background worker stopped")
 
 
 @asynccontextmanager
@@ -6032,9 +6079,14 @@ async def lifespan(_: FastAPI):
     _QUEUE_PUMP_STOP.clear()
     _TOKEN_IMPORT_STOP.clear()
     _UPLOAD_TASK_STOP.clear()
+    _HIDE_CLAIMS_STOP.clear()
     _clear_token_import_queue()
     _clear_delayed_token_imports()
     _clear_upload_task_queue()
+    _clear_hide_claims_queue()
+    with _UPLOAD_TASK_STATE_LOCK:
+        global _UPLOAD_TASK_ACTIVE_COUNT
+        _UPLOAD_TASK_ACTIVE_COUNT = 0
     with _TOKEN_IMPORT_PENDING_LOCK:
         _TOKEN_IMPORT_PENDING_FILES.clear()
         _TOKEN_IMPORT_DIRTY_FILES.clear()
@@ -6042,6 +6094,7 @@ async def lifespan(_: FastAPI):
     global _QUEUE_PUMP_THREAD
     global _TOKEN_IMPORT_THREAD
     global _UPLOAD_TASK_THREAD
+    global _HIDE_CLAIMS_THREAD
     _QUEUE_PUMP_THREAD = threading.Thread(
         target=_queue_pump_loop,
         daemon=True,
@@ -6060,6 +6113,12 @@ async def lifespan(_: FastAPI):
         name="upload-task-pump",
     )
     _UPLOAD_TASK_THREAD.start()
+    _HIDE_CLAIMS_THREAD = threading.Thread(
+        target=_hide_claims_loop,
+        daemon=True,
+        name="hide-claims-pump",
+    )
+    _HIDE_CLAIMS_THREAD.start()
 
     try:
         yield
@@ -6067,6 +6126,7 @@ async def lifespan(_: FastAPI):
         _QUEUE_PUMP_STOP.set()
         _TOKEN_IMPORT_STOP.set()
         _UPLOAD_TASK_STOP.set()
+        _HIDE_CLAIMS_STOP.set()
         _CODEX_PROBE.stop()
         if _QUEUE_PUMP_THREAD is not None:
             _QUEUE_PUMP_THREAD.join(timeout=5)
@@ -6077,9 +6137,15 @@ async def lifespan(_: FastAPI):
         if _UPLOAD_TASK_THREAD is not None:
             _UPLOAD_TASK_THREAD.join(timeout=5)
             _UPLOAD_TASK_THREAD = None
+        if _HIDE_CLAIMS_THREAD is not None:
+            _HIDE_CLAIMS_THREAD.join(timeout=5)
+            _HIDE_CLAIMS_THREAD = None
         _clear_token_import_queue()
         _clear_delayed_token_imports()
         _clear_upload_task_queue()
+        _clear_hide_claims_queue()
+        with _UPLOAD_TASK_STATE_LOCK:
+            _UPLOAD_TASK_ACTIVE_COUNT = 0
         with _TOKEN_IMPORT_PENDING_LOCK:
             _TOKEN_IMPORT_PENDING_FILES.clear()
             _TOKEN_IMPORT_DIRTY_FILES.clear()
@@ -6704,17 +6770,19 @@ def upload_tokens_session(
             continue
 
         access_token_hash = hash_token_value(normalized["access_token"])
+        queue_position = get_upload_task_queue_position(len(queued_tasks))
         upload_log(
             f"[upload-queue] queued user_id={user['id']} index={request_index} "
-            f"file={original_name} account_id={normalized['account_id']}"
+            f"file={original_name} account_id={normalized['account_id']} position={queue_position}"
         )
         results.append(
             {
                 "request_index": request_index,
                 "file_name": original_name,
                 "status": "queued",
-                "reason": "已进入上传队列，后台校验中。",
+                "reason": "已进入上传队列。",
                 "account_id": normalized["account_id"],
+                "queue_position": queue_position,
             }
         )
         queued_tasks.append(
@@ -6791,8 +6859,13 @@ def hide_claims(request: Request, payload: ClaimHidePayload) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
     claim_ids = [int(cid) for cid in payload.claim_ids if isinstance(cid, int) or str(cid).isdigit()]
-    updated = db.hide_claims(user_id, claim_ids)
-    return {"hidden": updated}
+    if not claim_ids:
+        return {"queued": 0, "accepted": 0}
+    unique_ids = sorted({int(claim_id) for claim_id in claim_ids})
+    invalidate_user_claims_cache(user_id)
+    invalidate_user_profile_cache(user_id)
+    _HIDE_CLAIMS_QUEUE.put(HideClaimsTask(user_id=user_id, claim_ids=unique_ids))
+    return {"queued": len(unique_ids), "accepted": len(unique_ids)}
 
 
 @app.get("/me/claims/archive")

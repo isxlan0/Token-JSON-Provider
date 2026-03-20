@@ -142,7 +142,7 @@ def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> 
 
 
 class CodexProbeQueue:
-    def __init__(self, *, delay_sec: float = 1.5, timeout_sec: float = 20.0) -> None:
+    def __init__(self, *, delay_sec: float = 0.1, timeout_sec: float = 20.0) -> None:
         self._delay_sec = max(0.0, float(delay_sec))
         self._timeout_sec = max(1.0, float(timeout_sec))
         self._tasks: queue.Queue[_ProbeTask | None] = queue.Queue()
