@@ -4500,6 +4500,17 @@ def get_default_upload_results_snapshot() -> dict[str, Any]:
 
 
 def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
+    with _UPLOAD_RESULTS_MEMORY_LOCK:
+        memory_payload = _UPLOAD_RESULTS_MEMORY.get(int(user_id))
+        if isinstance(memory_payload, dict):
+            return {
+                "batch_id": memory_payload.get("batch_id"),
+                "created_at": memory_payload.get("created_at"),
+                "summary": dict(memory_payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
+                "items": list(memory_payload.get("items") or []),
+                "history": [],
+                "queue_status": dict(memory_payload.get("queue_status") or {}) if isinstance(memory_payload.get("queue_status"), dict) else None,
+            }
     key = build_user_upload_results_cache_key(user_id)
     cached = _get_cached_snapshot(key)
     if cached is not None:
@@ -4524,6 +4535,8 @@ def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> d
         "history": [],
         "queue_status": dict(payload.get("queue_status") or {}) if isinstance(payload.get("queue_status"), dict) else None,
     }
+    with _UPLOAD_RESULTS_MEMORY_LOCK:
+        _UPLOAD_RESULTS_MEMORY[int(user_id)] = dict(normalized)
     return _set_cached_snapshot(key, normalized, get_cache_upload_results_ttl())
 
 
@@ -5227,6 +5240,8 @@ _UPLOAD_TASK_STATE_LOCK = threading.RLock()
 _UPLOAD_TASK_ACTIVE_COUNT = 0
 _UPLOAD_TASK_STATUS_LOCK = threading.RLock()
 _UPLOAD_TASK_STATUS: dict[str, dict[int, dict[str, Any]]] = {}
+_UPLOAD_RESULTS_MEMORY_LOCK = threading.RLock()
+_UPLOAD_RESULTS_MEMORY: dict[int, dict[str, Any]] = {}
 _HIDE_CLAIMS_THREAD: threading.Thread | None = None
 _HIDE_CLAIMS_STOP = threading.Event()
 _HIDE_CLAIMS_QUEUE: queue.Queue[HideClaimsTask] = queue.Queue()
@@ -5813,6 +5828,8 @@ def _clear_upload_task_queue() -> None:
         upload_log(f"[upload-worker] cleared queued tasks count={cleared}")
     with _UPLOAD_TASK_STATUS_LOCK:
         _UPLOAD_TASK_STATUS.clear()
+    with _UPLOAD_RESULTS_MEMORY_LOCK:
+        _UPLOAD_RESULTS_MEMORY.clear()
 
 
 def _clear_hide_claims_queue() -> None:
@@ -5894,6 +5911,22 @@ def apply_runtime_upload_task_status(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def refresh_user_upload_results_memory(user_id: int) -> dict[str, Any]:
+    payload = get_user_upload_results_snapshot(user_id)
+    payload["queue_status"] = get_current_user_queue_status_snapshot(user_id)
+    payload = apply_runtime_upload_task_status(payload)
+    with _UPLOAD_RESULTS_MEMORY_LOCK:
+        _UPLOAD_RESULTS_MEMORY[int(user_id)] = {
+            "batch_id": payload.get("batch_id"),
+            "created_at": payload.get("created_at"),
+            "summary": dict(payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
+            "items": list(payload.get("items") or []),
+            "history": [],
+            "queue_status": dict(payload.get("queue_status") or {}) if isinstance(payload.get("queue_status"), dict) else None,
+        }
+        return dict(_UPLOAD_RESULTS_MEMORY[int(user_id)])
+
+
 def _process_upload_task(task: QueuedUploadTask) -> None:
     set_upload_task_status(
         task.batch_id,
@@ -5912,6 +5945,7 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
             "reason": "正在处理，请稍候刷新结果。",
         },
     )
+    refresh_user_upload_results_memory(task.user_id)
     upload_log(
         f"[upload-worker] start user_id={task.user_id} batch={task.batch_id} "
         f"index={task.request_index} file={task.file_name} account_id={task.account_id}"
@@ -6037,11 +6071,12 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
         }
     set_upload_task_status(task.batch_id, task.request_index, result_item)
     update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
-    clear_upload_task_status_if_done(task.batch_id)
+    refresh_user_upload_results_memory(task.user_id)
     upload_log(
         f"[upload-worker] finished user_id={task.user_id} batch={task.batch_id} "
         f"index={task.request_index} file={task.file_name} status={result_item['status']}"
     )
+    clear_upload_task_status_if_done(task.batch_id)
 
 
 def _upload_task_loop() -> None:
@@ -6547,9 +6582,7 @@ def get_me_apikey_summary(request: Request) -> dict[str, int]:
 @app.get("/me/uploads/results")
 def get_me_upload_results(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
-    payload = get_user_upload_results_snapshot(session["user_id"])
-    payload["queue_status"] = get_current_user_queue_status_snapshot(session["user_id"])
-    return apply_runtime_upload_task_status(payload)
+    return refresh_user_upload_results_memory(session["user_id"])
 
 
 @app.get("/dashboard/leaderboard")
@@ -6866,6 +6899,7 @@ def upload_tokens_session(
         queue_status=queue_status_payload,
     )
     set_user_upload_results_snapshot(session["user_id"], response_payload)
+    refresh_user_upload_results_memory(session["user_id"])
     for task in queued_tasks:
         _UPLOAD_TASK_QUEUE.put(task)
     success_count = sum(1 for item in results if item.get("status") == "accepted")
