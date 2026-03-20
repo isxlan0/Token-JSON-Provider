@@ -1754,13 +1754,17 @@ class TokenDb:
             invalidate_all_runtime_cache(include_admin=True)
         return changed
 
-    def import_token_file(self, path: Path, *, timeout: float = 3.0) -> dict[str, Any]:
+    def _sync_token_file_in_conn(
+        self,
+        path: Path,
+        *,
+        conn: sqlite3.Connection,
+        now: int,
+    ) -> dict[str, Any]:
         file_name = path.name
         if not file_name.lower().endswith(".json"):
             return {"status": "ignored", "file_name": file_name}
 
-        now = now_ts()
-        healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
         try:
             encoding, content_json, file_hash = self._load_token_file(path)
             normalized = normalize_upload_content(json.loads(content_json))
@@ -1769,123 +1773,140 @@ class TokenDb:
         except UploadValidationError as exc:
             return {"status": "error", "file_name": file_name, "reason": str(exc)}
 
+        healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
         file_path = path.relative_to(BASE_DIR).as_posix()
-        result: dict[str, Any]
-        with self._lock, self.connect(timeout=timeout) as conn:
-            existing = conn.execute(
-                "SELECT id, claim_count, max_claims, is_enabled, is_banned FROM tokens WHERE file_name = ?",
-                (file_name,),
-            ).fetchone()
-            current_token_id = int(existing["id"]) if existing else None
-            conflict = self._find_sync_token_conflict(
-                current_token_id=current_token_id,
-                normalized=normalized,
-                conn=conn,
-            )
-            if conflict:
-                if existing:
-                    conn.execute(
-                        """
-                        UPDATE tokens
-                        SET is_active = 0,
-                            is_available = 0,
-                            updated_at_ts = ?,
-                            last_seen_at_ts = ?
-                        WHERE id = ?
-                        """,
-                        (now, now, current_token_id),
-                    )
-                    self.ensure_inventory_policy(conn=conn)
-                    action = "deactivated"
-                else:
-                    action = "skipped"
-                result = {"status": action, "file_name": file_name, "reason": "token_conflict"}
-            elif existing:
-                claim_count = int(existing["claim_count"])
-                effective_max_claims = int(existing["max_claims"])
-                is_enabled = int(existing["is_enabled"]) if "is_enabled" in existing.keys() else 1
-                is_banned = int(existing["is_banned"]) if "is_banned" in existing.keys() else 0
-                is_available = 1 if is_enabled and not is_banned and claim_count < effective_max_claims else 0
+        existing = conn.execute(
+            "SELECT id, claim_count, max_claims, is_enabled, is_banned FROM tokens WHERE file_name = ?",
+            (file_name,),
+        ).fetchone()
+        current_token_id = int(existing["id"]) if existing else None
+        conflict = self._find_sync_token_conflict(
+            current_token_id=current_token_id,
+            normalized=normalized,
+            conn=conn,
+        )
+        if conflict:
+            if existing:
                 conn.execute(
                     """
                     UPDATE tokens
-                    SET file_path = ?,
-                        file_hash = ?,
-                        encoding = ?,
-                        content_json = ?,
-                        account_id = ?,
-                        access_token_hash = ?,
-                        is_active = 1,
-                        is_available = ?,
+                    SET is_active = 0,
+                        is_available = 0,
                         updated_at_ts = ?,
                         last_seen_at_ts = ?
                     WHERE id = ?
                     """,
-                    (
-                        file_path,
-                        file_hash,
-                        encoding,
-                        content_json,
-                        normalized["account_id"],
-                        hash_token_value(normalized["access_token"]),
-                        is_available,
-                        now,
-                        now,
-                        current_token_id,
-                    ),
+                    (now, now, current_token_id),
                 )
-                result = {"status": "updated", "file_name": file_name}
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO tokens (
-                        file_name,
-                        file_path,
-                        file_hash,
-                        encoding,
-                        content_json,
-                        account_id,
-                        access_token_hash,
-                        is_active,
-                        is_cleaned,
-                        is_enabled,
-                        is_banned,
-                        is_available,
-                        claim_count,
-                        max_claims,
-                        created_at_ts,
-                        cleaned_at_ts,
-                        updated_at_ts,
-                        last_seen_at_ts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        file_name,
-                        file_path,
-                        file_hash,
-                        encoding,
-                        content_json,
-                        normalized["account_id"],
-                        hash_token_value(normalized["access_token"]),
-                        1,
-                        0,
-                        1,
-                        0,
-                        1,
-                        0,
-                        healthy_max_claims,
-                        now,
-                        None,
-                        now,
-                        now,
-                    ),
-                )
-                result = {"status": "imported", "file_name": file_name}
+                return {"status": "deactivated", "file_name": file_name, "reason": "token_conflict"}
+            return {"status": "skipped", "file_name": file_name, "reason": "token_conflict"}
+
+        if existing:
+            claim_count = int(existing["claim_count"])
+            effective_max_claims = int(existing["max_claims"])
+            is_enabled = int(existing["is_enabled"]) if "is_enabled" in existing.keys() else 1
+            is_banned = int(existing["is_banned"]) if "is_banned" in existing.keys() else 0
+            is_available = 1 if is_enabled and not is_banned and claim_count < effective_max_claims else 0
+            conn.execute(
+                """
+                UPDATE tokens
+                SET file_path = ?,
+                    file_hash = ?,
+                    encoding = ?,
+                    content_json = ?,
+                    account_id = ?,
+                    access_token_hash = ?,
+                    is_active = 1,
+                    is_available = ?,
+                    updated_at_ts = ?,
+                    last_seen_at_ts = ?
+                WHERE id = ?
+                """,
+                (
+                    file_path,
+                    file_hash,
+                    encoding,
+                    content_json,
+                    normalized["account_id"],
+                    hash_token_value(normalized["access_token"]),
+                    is_available,
+                    now,
+                    now,
+                    current_token_id,
+                ),
+            )
+            return {"status": "updated", "file_name": file_name}
+
+        conn.execute(
+            """
+            INSERT INTO tokens (
+                file_name,
+                file_path,
+                file_hash,
+                encoding,
+                content_json,
+                account_id,
+                access_token_hash,
+                is_active,
+                is_cleaned,
+                is_enabled,
+                is_banned,
+                is_available,
+                claim_count,
+                max_claims,
+                created_at_ts,
+                cleaned_at_ts,
+                updated_at_ts,
+                last_seen_at_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                file_name,
+                file_path,
+                file_hash,
+                encoding,
+                content_json,
+                normalized["account_id"],
+                hash_token_value(normalized["access_token"]),
+                1,
+                0,
+                1,
+                0,
+                1,
+                0,
+                healthy_max_claims,
+                now,
+                None,
+                now,
+                now,
+            ),
+        )
+        return {"status": "imported", "file_name": file_name}
+
+    def import_token_files(self, paths: list[Path], *, timeout: float = 3.0) -> list[dict[str, Any]]:
+        if not paths:
+            return []
+
+        now = now_ts()
+        results: list[dict[str, Any]] = []
+        changed = False
+        with self._lock, self.connect(timeout=timeout) as conn:
+            for path in paths:
+                result = self._sync_token_file_in_conn(path, conn=conn, now=now)
+                results.append(result)
+                if result.get("status") != "skipped":
+                    changed = True
             self.ensure_inventory_policy(conn=conn)
-        if result["status"] != "skipped":
+        if changed:
             _refresh_dashboard_memory()
             invalidate_all_runtime_cache(include_admin=True)
-        return result
+        return results
+
+    def import_token_file(self, path: Path, *, timeout: float = 3.0) -> dict[str, Any]:
+        results = self.import_token_files([path], timeout=timeout)
+        if not results:
+            return {"status": "ignored", "file_name": path.name}
+        return results[0]
 
     def upsert_user(self, user: LinuxDOUser) -> dict[str, Any]:
         now = now_ts()
@@ -4003,12 +4024,27 @@ def build_download_url(request: Request, token_id: int) -> str:
     return f"{base_url}{parsed.path}{query}"
 
 
+def get_expected_request_origin(request: Request) -> str:
+    provider_base_url = get_provider_base_url()
+    if provider_base_url:
+        parsed = urllib.parse.urlparse(provider_base_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+
+    return str(request.base_url).rstrip("/")
+
+
 def require_web_upload_request(request: Request) -> None:
     origin = (request.headers.get("origin") or "").rstrip("/")
     referer = request.headers.get("referer") or ""
     fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
     upload_source = (request.headers.get("x-upload-source") or "").strip().lower()
-    expected_origin = str(request.base_url).rstrip("/")
+    expected_origin = get_expected_request_origin(request)
 
     if upload_source != "web":
         raise AccessDeniedError("上传仅允许从网页端发起。")
@@ -4700,57 +4736,43 @@ def _poll_token_directory_changes(previous_stats: dict[str, tuple[int, int]]) ->
     return current_stats
 
 
-def _process_token_import_task(file_name: str, attempt: int, reason: str) -> None:
-    path = TOKEN_DIR / file_name
-    keep_pending = False
-    try:
-        if not _wait_for_token_file_ready(path):
-            if _TOKEN_IMPORT_STOP.is_set():
-                return
-            if attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
-                keep_pending = True
-                _requeue_token_import(
-                    file_name,
-                    reason=f"{reason}:waiting_for_ready",
-                    attempt=attempt + 1,
-                )
-            else:
-                token_import_log(f"failed file={file_name} reason=file_not_ready attempts={attempt + 1}")
-            return
-
+def _drain_token_import_batch(
+    first_task: tuple[str, int, str],
+    *,
+    max_batch_size: int = 128,
+) -> list[tuple[str, int, str]]:
+    tasks = [first_task]
+    while len(tasks) < max_batch_size:
         try:
-            result = db.import_token_file(path, timeout=3.0)
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc).lower() and attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
-                keep_pending = True
-                _requeue_token_import(
-                    file_name,
-                    reason=f"{reason}:db_locked",
-                    attempt=attempt + 1,
-                )
-                return
-            token_import_log(
-                f"failed file={file_name} reason=database_error error={type(exc).__name__}:{exc}"
-            )
-            return
+            tasks.append(_TOKEN_IMPORT_QUEUE.get_nowait())
+        except queue.Empty:
+            break
+    return tasks
 
+
+def _handle_token_import_results(
+    tasks: list[tuple[str, int, str]],
+    results: list[dict[str, Any]],
+) -> bool:
+    imported_any = False
+    for (file_name, attempt, reason), result in zip(tasks, results):
         status = str(result.get("status", "unknown"))
         if status in {"imported", "updated"}:
+            imported_any = True
             token_import_log(f"imported file={file_name} reason={reason}")
-            try:
-                try_fulfill_queue(db)
-            except Exception as exc:
-                token_import_log(
-                    f"queue fulfill after import failed file={file_name} error={type(exc).__name__}:{exc}"
-                )
-            return
+            _release_token_import(file_name)
+            continue
+        if status == "deactivated":
+            token_import_log(f"deactivated file={file_name} reason={result.get('reason', reason)}")
+            _release_token_import(file_name)
+            continue
         if status == "skipped":
-            token_import_log(
-                f"skipped file={file_name} reason={result.get('reason', 'unknown')}"
-            )
-            return
+            token_import_log(f"skipped file={file_name} reason={result.get('reason', 'unknown')}")
+            _release_token_import(file_name)
+            continue
         if status == "ignored":
-            return
+            _release_token_import(file_name)
+            continue
 
         retryable = str(result.get("reason", "")).lower() in {
             "oserror",
@@ -4758,19 +4780,71 @@ def _process_token_import_task(file_name: str, attempt: int, reason: str) -> Non
             "jsondecodeerror",
         }
         if retryable and attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
-            keep_pending = True
             _requeue_token_import(
                 file_name,
                 reason=f"{reason}:{result.get('reason', 'retry')}",
                 attempt=attempt + 1,
             )
-            return
-        token_import_log(
-            f"failed file={file_name} reason={result.get('reason', 'unknown')} attempts={attempt + 1}"
-        )
-    finally:
-        if not keep_pending:
+            continue
+        token_import_log(f"failed file={file_name} reason={result.get('reason', 'unknown')} attempts={attempt + 1}")
+        _release_token_import(file_name)
+    return imported_any
+
+
+def _process_token_import_batch(tasks: list[tuple[str, int, str]]) -> None:
+    ready_tasks: list[tuple[str, int, str]] = []
+    ready_paths: list[Path] = []
+
+    for file_name, attempt, reason in tasks:
+        path = TOKEN_DIR / file_name
+        if _wait_for_token_file_ready(path):
+            ready_tasks.append((file_name, attempt, reason))
+            ready_paths.append(path)
+            continue
+        if _TOKEN_IMPORT_STOP.is_set():
+            continue
+        if attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
+            _requeue_token_import(
+                file_name,
+                reason=f"{reason}:waiting_for_ready",
+                attempt=attempt + 1,
+            )
+        else:
+            token_import_log(f"failed file={file_name} reason=file_not_ready attempts={attempt + 1}")
             _release_token_import(file_name)
+
+    if not ready_paths:
+        return
+
+    token_import_log(f"processing batch size={len(ready_paths)}")
+    try:
+        results = db.import_token_files(ready_paths, timeout=3.0)
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            for file_name, attempt, reason in ready_tasks:
+                if attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
+                    _requeue_token_import(
+                        file_name,
+                        reason=f"{reason}:db_locked",
+                        attempt=attempt + 1,
+                    )
+                else:
+                    token_import_log(
+                        f"failed file={file_name} reason=database_locked attempts={attempt + 1}"
+                    )
+                    _release_token_import(file_name)
+            return
+        for file_name, _attempt, _reason in ready_tasks:
+            _release_token_import(file_name)
+        token_import_log(f"batch failed reason=database_error error={type(exc).__name__}:{exc}")
+        return
+
+    imported_any = _handle_token_import_results(ready_tasks, results)
+    if imported_any:
+        try:
+            try_fulfill_queue(db)
+        except Exception as exc:
+            token_import_log(f"queue fulfill after batch import failed error={type(exc).__name__}:{exc}")
 
 
 class _TokenImportEventHandler(FileSystemEventHandler):
@@ -4851,16 +4925,18 @@ def _token_import_loop() -> None:
     try:
         while not _TOKEN_IMPORT_STOP.is_set():
             try:
-                file_name, attempt, reason = _TOKEN_IMPORT_QUEUE.get(timeout=0.5)
+                first_task = _TOKEN_IMPORT_QUEUE.get(timeout=0.5)
             except queue.Empty:
                 if observer is None and time.time() >= next_fallback_scan_at:
                     fallback_snapshot = _poll_token_directory_changes(fallback_snapshot)
                     next_fallback_scan_at = time.time() + _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC
                 continue
+            batch_tasks = _drain_token_import_batch(first_task)
             try:
-                _process_token_import_task(file_name, attempt, reason)
+                _process_token_import_batch(batch_tasks)
             finally:
-                _TOKEN_IMPORT_QUEUE.task_done()
+                for _ in batch_tasks:
+                    _TOKEN_IMPORT_QUEUE.task_done()
     finally:
         if observer is not None:
             observer.stop()
