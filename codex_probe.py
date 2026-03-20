@@ -67,7 +67,6 @@ def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> 
 
     body = {
         "model": "gpt-5",
-        "store": False,
         "instructions": "",
         "input": [
             {
