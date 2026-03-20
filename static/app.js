@@ -19,6 +19,7 @@ const state = {
   claimsInitialized: false,
   skipNextClaimModal: false,
   refreshCounter: 0,
+  isClaimSubmitting: false,
 };
 
 const elements = {
@@ -565,6 +566,17 @@ function showModal(title, message) {
   });
 }
 
+function setClaimSubmitting(submitting) {
+  state.isClaimSubmitting = submitting;
+  if (!elements.claimBtn) {
+    return;
+  }
+  elements.claimBtn.disabled = submitting;
+  elements.claimBtn.classList.toggle("is-loading", submitting);
+  elements.claimBtn.setAttribute("aria-busy", submitting ? "true" : "false");
+  elements.claimBtn.textContent = submitting ? "申请中..." : "申请账号";
+}
+
 function renderApiKeys(limit) {
   elements.apiKeyList.innerHTML = "";
   const keys = (state.apiKeys || []).filter((key) => key.status === "active");
@@ -760,6 +772,9 @@ async function revokeApiKey(keyId) {
 }
 
 async function claimTokens() {
+  if (state.isClaimSubmitting) {
+    return;
+  }
   elements.claimSummary.classList.add("hidden");
   elements.claimError.classList.add("hidden");
 
@@ -769,6 +784,10 @@ async function claimTokens() {
     elements.claimError.classList.remove("hidden");
     return;
   }
+
+  setClaimSubmitting(true);
+  elements.claimSummary.textContent = "正在申请账号，请稍候...";
+  elements.claimSummary.classList.remove("hidden");
 
   try {
     const result = await fetchJson("/me/claim", {
@@ -794,7 +813,7 @@ async function claimTokens() {
       elements.claimSummary.textContent = `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
       elements.claimSummary.classList.remove("hidden");
       if (result.granted && result.granted > 0) {
-        showModal("领取成功", `共 ${result.granted} 个账号`);
+        showModal("申请成功", `共 ${result.granted} 个账号`);
       }
     }
     renderClaimResults();
@@ -802,8 +821,11 @@ async function claimTokens() {
     await loadDashboardSummary();
     await loadQueueStatus();
   } catch (error) {
+    elements.claimSummary.classList.add("hidden");
     elements.claimError.textContent = error.message;
     elements.claimError.classList.remove("hidden");
+  } finally {
+    setClaimSubmitting(false);
   }
 }
 
