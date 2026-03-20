@@ -938,7 +938,15 @@ async function uploadTokens() {
       state.uploadQueue = [];
     }
     renderUploadSelected();
-    await loadDashboardSummary();
+    const followUpResults = await Promise.allSettled([
+      loadDashboardSummary(),
+      loadUploadResultsSnapshot(),
+    ]);
+    followUpResults.forEach((result) => {
+      if (result.status === "rejected") {
+        handleAccessError(result.reason);
+      }
+    });
   } catch (error) {
     elements.uploadError.textContent = error.message;
     elements.uploadError.classList.remove("hidden");
@@ -1289,14 +1297,25 @@ async function refreshAll() {
   try {
     state.refreshCounter += 1;
     const shouldRefreshClaims = state.refreshCounter % 4 === 0;
-    await loadDashboardSummary();
-    await loadQueueStatus();
-    await loadQuotaSummary();
-    await loadApiKeySummary();
-    await loadUploadResultsSnapshot();
+    const results = await Promise.allSettled([
+      loadDashboardSummary(),
+      loadQueueStatus(),
+      loadQuotaSummary(),
+      loadApiKeySummary(),
+      loadUploadResultsSnapshot(),
+      ...(shouldRefreshClaims ? [loadClaimSummary(), loadClaims()] : []),
+    ]);
+    const accessHandled = results.some((result) => {
+      if (result.status !== "rejected") {
+        return false;
+      }
+      return handleAccessError(result.reason);
+    });
+    if (accessHandled) {
+      return;
+    }
     if (shouldRefreshClaims) {
-      await loadClaimSummary();
-      await loadClaims();
+      // ignore refresh errors
     }
   } catch (error) {
     if (!handleAccessError(error)) {
