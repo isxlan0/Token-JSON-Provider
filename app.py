@@ -5092,6 +5092,10 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
         invalidate_dashboard_cache()
 
 
+def _cache_fresh(ts: float, ttl_sec: float | None = None) -> bool:
+    return time.time() - ts < (ttl_sec if ttl_sec is not None else _CACHE_TTL_SEC)
+
+
 def _queue_pump_loop() -> None:
     first_iteration = True
     while not _QUEUE_PUMP_STOP.is_set():
