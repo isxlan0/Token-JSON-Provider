@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import secrets
-import sqlite3
 import time
 from typing import Any
 
@@ -147,14 +146,11 @@ def fulfill_queue(
     updated = 0
     queue_removed = 0
     claim_events: dict[tuple[int, str], dict[str, Any]] = {}
-
-    with db._lock, db.connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with db.connect() as conn:
         try:
             db.ensure_inventory_policy(conn=conn)
         except Exception:
             pass
-
         queue_rows = conn.execute(
             """
             SELECT id, user_id, api_key_id, remaining, request_id
@@ -164,117 +160,72 @@ def fulfill_queue(
             """
         ).fetchall()
 
-        if not queue_rows:
-            return {"fulfilled": 0, "updated": 0, "queue_removed": 0, "events": []}
+    if not queue_rows:
+        return {"fulfilled": 0, "updated": 0, "queue_removed": 0, "events": []}
 
-        for row in queue_rows:
-            if max_batch is not None and fulfilled >= max_batch:
-                break
+    for row in queue_rows:
+        if max_batch is not None and fulfilled >= max_batch:
+            break
 
-            queue_id = int(row["id"])
-            user_id = int(row["user_id"])
-            api_key_id = row["api_key_id"]
-            remaining = int(row["remaining"])
-            if remaining <= 0:
-                continue
+        queue_id = int(row["id"])
+        user_id = int(row["user_id"])
+        api_key_id = row["api_key_id"]
+        remaining = int(row["remaining"])
+        if remaining <= 0:
+            continue
 
+        with db.connect() as conn:
             remaining_quota = _remaining_hourly_quota(conn, user_id, now, hourly_limit)
             if remaining_quota <= 0:
                 continue
-
             allowed = min(remaining, remaining_quota)
             if api_key_id is not None and apikey_rate_limit > 0:
-                remaining_minute = _remaining_minute_quota(
-                    conn, int(api_key_id), now, apikey_rate_limit
-                )
+                remaining_minute = _remaining_minute_quota(conn, int(api_key_id), now, apikey_rate_limit)
                 if remaining_minute <= 0:
                     continue
                 allowed = min(allowed, remaining_minute)
 
-            if allowed <= 0:
-                continue
+        if allowed <= 0:
+            continue
 
-            token_rows = db.list_claimable_tokens_for_user(conn, user_id, allowed)
+        granted = 0
+        while granted < allowed:
+            if max_batch is not None and fulfilled >= max_batch:
+                break
+            item = db.allocate_claimable_token(
+                user_id,
+                api_key_id,
+                str(row["request_id"]),
+                hourly_limit=hourly_limit,
+                apikey_rate_limit=apikey_rate_limit,
+            )
+            if item is None:
+                break
+            fulfilled += 1
+            granted += 1
+            event_key = (user_id, str(row["request_id"]))
+            event = claim_events.setdefault(
+                event_key,
+                {
+                    "user_id": user_id,
+                    "request_id": str(row["request_id"]),
+                    "claimed_at_ts": now,
+                    "token_ids": [],
+                    "first_claim_count": 0,
+                    "granted": 0,
+                },
+            )
+            event["token_ids"].append(int(item["token_id"]))
+            event["granted"] += 1
+            if bool(item.get("first_claim")):
+                event["first_claim_count"] += 1
 
-            if not token_rows:
-                continue
-
-            granted = 0
-            for token in token_rows:
-                token_id = int(token["id"])
-                first_claim = int(token["claim_count"]) <= 0
-                new_count = int(token["claim_count"]) + 1
-                new_available = 1 if new_count < int(token["max_claims"]) else 0
-                savepoint = f"queue_claim_{queue_id}_{token_id}"
-                try:
-                    conn.execute(f"SAVEPOINT {savepoint}")
-                    conn.execute(
-                        """
-                        UPDATE tokens
-                        SET claim_count = ?,
-                            is_available = ?,
-                            updated_at_ts = ?
-                        WHERE id = ?
-                        """,
-                        (new_count, new_available, now, token_id),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO token_claims (
-                            token_id, user_id, api_key_id, claimed_at_ts, is_hidden, request_id
-                        ) VALUES (?, ?, ?, ?, 0, ?)
-                        """,
-                        (token_id, user_id, api_key_id, now, row["request_id"]),
-                    )
-                    claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-                    conn.execute(
-                        """
-                        INSERT INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (user_id, token_id, claim_id, now),
-                    )
-                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                except sqlite3.IntegrityError:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                    continue
-                fulfilled += 1
-                granted += 1
-                event_key = (user_id, str(row["request_id"]))
-                event = claim_events.setdefault(
-                    event_key,
-                    {
-                        "user_id": user_id,
-                        "request_id": str(row["request_id"]),
-                        "claimed_at_ts": now,
-                        "token_ids": [],
-                        "first_claim_count": 0,
-                        "granted": 0,
-                    },
-                )
-                event["token_ids"].append(token_id)
-                event["granted"] += 1
-                if first_claim:
-                    event["first_claim_count"] += 1
-
-            remaining_after = remaining - granted
-            if remaining_after <= 0:
-                conn.execute(
-                    "DELETE FROM claim_queue WHERE id = ?",
-                    (queue_id,),
-                )
-                queue_removed += 1
-            else:
-                conn.execute(
-                    """
-                    UPDATE claim_queue
-                    SET remaining = ?, status = 'queued'
-                    WHERE id = ?
-                    """,
-                    (max(0, remaining_after), queue_id),
-                )
-            updated += 1
+        if granted <= 0:
+            continue
+        queue_state = db.consume_queue_grant(queue_id, granted)
+        if bool(queue_state.get("removed")):
+            queue_removed += 1
+        updated += 1
 
     return {
         "fulfilled": fulfilled,

@@ -349,10 +349,12 @@ function renderTokens() {
     elements.tokenList.innerHTML = '<div class="card admin-card empty-state">没有匹配的 Token</div>';
   } else {
     state.tokens.forEach((item) => {
-      const statusClass = item.is_cleaned ? "cleaned" : !item.is_active ? "inactive" : item.is_enabled ? "enabled" : "disabled";
-      const statusText = item.is_cleaned ? "已清理" : !item.is_active ? "文件缺失" : item.is_enabled ? "已启用" : "已停用";
+      const statusClass = item.is_cleaned ? "cleaned" : item.is_banned ? "disabled" : !item.is_active ? "inactive" : item.is_enabled ? "enabled" : "disabled";
+      const statusText = item.is_cleaned ? "已清理" : item.is_banned ? "已封禁" : !item.is_active ? "文件缺失" : item.is_enabled ? "已启用" : "已停用";
       const actionText = item.is_enabled ? "停用" : "启用";
       const actionPath = item.is_enabled ? "deactivate" : "activate";
+      const probeMeta = item.last_probe_status ? ` · 探活 ${item.last_probe_status}${item.last_probe_at ? ` @ ${formatDateTime(item.last_probe_at)}` : ""}` : "";
+      const banMeta = item.is_banned ? ` · 原因 ${item.ban_reason || "upstream_401"}` : "";
       const card = document.createElement("div");
       card.className = "admin-card";
       card.innerHTML = `
@@ -364,9 +366,9 @@ function renderTokens() {
           <span class="admin-badge ${statusClass}">${statusText}</span>
         </div>
         <div class="admin-card-meta">编码：${item.encoding} · 领取 ${item.claim_count} / 上限 ${item.max_claims}</div>
-        <div class="admin-card-meta">最后同步：${formatDateTime(item.last_seen_at)}</div>
+        <div class="admin-card-meta">最后同步：${formatDateTime(item.last_seen_at)}${probeMeta}${banMeta}</div>
         <div class="admin-card-actions">
-          <button class="btn btn-outline btn-inline" data-token-action="${item.id}" ${!item.is_active || item.is_cleaned ? "disabled" : ""}>${actionText}</button>
+          <button class="btn btn-outline btn-inline" data-token-action="${item.id}" ${!item.is_active || item.is_cleaned || item.is_banned ? "disabled" : ""}>${actionText}</button>
         </div>
       `;
       const actionBtn = card.querySelector("[data-token-action]");

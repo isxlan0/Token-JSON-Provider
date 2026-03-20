@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 import claim_queue
+import codex_probe
 
 try:
     import redis
@@ -72,6 +73,9 @@ CACHE_CLAIMS_TTL_ENV = "TOKEN_CACHE_CLAIMS_TTL_SEC"
 CACHE_ADMIN_TTL_ENV = "TOKEN_CACHE_ADMIN_TTL_SEC"
 CACHE_QUEUE_TTL_ENV = "TOKEN_CACHE_QUEUE_TTL_SEC"
 CACHE_DASHBOARD_TTL_ENV = "TOKEN_CACHE_DASHBOARD_TTL_SEC"
+TOKEN_CODEX_PROBE_DELAY_SEC_ENV = "TOKEN_CODEX_PROBE_DELAY_SEC"
+TOKEN_CODEX_PROBE_TIMEOUT_SEC_ENV = "TOKEN_CODEX_PROBE_TIMEOUT_SEC"
+TOKEN_CODEX_PROBE_RESERVE_SEC_ENV = "TOKEN_CODEX_PROBE_RESERVE_SEC"
 SESSION_COOKIE_NAME = "token_atlas_session"
 SESSION_AUTH_KEY = "auth"
 SESSION_OAUTH_STATE_KEY = "linuxdo_oauth_state"
@@ -115,6 +119,16 @@ def env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = env_value(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 
@@ -808,11 +822,17 @@ class TokenDb:
                     is_active INTEGER NOT NULL,
                     is_cleaned INTEGER NOT NULL DEFAULT 0,
                     is_enabled INTEGER NOT NULL DEFAULT 1,
+                    is_banned INTEGER NOT NULL DEFAULT 0,
                     is_available INTEGER NOT NULL,
                     claim_count INTEGER NOT NULL,
                     max_claims INTEGER NOT NULL,
                     created_at_ts INTEGER NOT NULL,
+                    banned_at_ts INTEGER,
+                    ban_reason TEXT,
                     cleaned_at_ts INTEGER,
+                    last_probe_at_ts INTEGER,
+                    last_probe_status TEXT,
+                    probe_lock_until_ts INTEGER,
                     updated_at_ts INTEGER NOT NULL,
                     last_seen_at_ts INTEGER NOT NULL
                 );
@@ -930,8 +950,20 @@ class TokenDb:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_cleaned INTEGER NOT NULL DEFAULT 0")
             if "is_enabled" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
+            if "is_banned" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0")
+            if "banned_at_ts" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN banned_at_ts INTEGER")
+            if "ban_reason" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN ban_reason TEXT")
             if "cleaned_at_ts" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN cleaned_at_ts INTEGER")
+            if "last_probe_at_ts" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN last_probe_at_ts INTEGER")
+            if "last_probe_status" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN last_probe_status TEXT")
+            if "probe_lock_until_ts" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN probe_lock_until_ts INTEGER")
             conn.execute(
                 """
                 UPDATE token_claims
@@ -1048,14 +1080,15 @@ class TokenDb:
                 seen_names.add(file_name)
 
                 row = conn.execute(
-                    "SELECT id, claim_count, max_claims, is_enabled FROM tokens WHERE file_name = ?",
+                    "SELECT id, claim_count, max_claims, is_enabled, is_banned FROM tokens WHERE file_name = ?",
                     (file_name,),
                 ).fetchone()
                 if row:
                     claim_count = int(row["claim_count"])
                     effective_max_claims = int(row["max_claims"])
                     is_enabled = int(row["is_enabled"]) if "is_enabled" in row.keys() else 1
-                    is_available = 1 if is_enabled and claim_count < effective_max_claims else 0
+                    is_banned = int(row["is_banned"]) if "is_banned" in row.keys() else 0
+                    is_available = 1 if is_enabled and not is_banned and claim_count < effective_max_claims else 0
                     conn.execute(
                         """
                         UPDATE tokens
@@ -1091,13 +1124,14 @@ class TokenDb:
                             content_json,
                             is_active,
                             is_enabled,
+                            is_banned,
                             is_available,
                             claim_count,
                             max_claims,
                             created_at_ts,
                             updated_at_ts,
                             last_seen_at_ts
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             file_name,
@@ -1107,6 +1141,7 @@ class TokenDb:
                             content_json,
                             1,
                             1,
+                            0,
                             1,
                             0,
                             healthy_max_claims,
@@ -1181,6 +1216,7 @@ class TokenDb:
                         is_active,
                         is_cleaned,
                         is_enabled,
+                        is_banned,
                         is_available,
                         claim_count,
                         max_claims,
@@ -1188,7 +1224,7 @@ class TokenDb:
                         cleaned_at_ts,
                         updated_at_ts,
                         last_seen_at_ts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         file_name,
@@ -1199,6 +1235,7 @@ class TokenDb:
                         1,
                         0,
                         1,
+                        0,
                         1,
                         0,
                         healthy_max_claims,
@@ -1643,6 +1680,37 @@ class TokenDb:
             "ban": ban,
         }
 
+    def _token_row_to_admin_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "file_name": row["file_name"],
+            "file_path": row["file_path"],
+            "encoding": row["encoding"],
+            "is_active": bool(row["is_active"]),
+            "is_cleaned": bool(row["is_cleaned"]),
+            "is_enabled": bool(row["is_enabled"]),
+            "is_banned": bool(row["is_banned"]) if "is_banned" in row.keys() else False,
+            "is_available": bool(row["is_available"]),
+            "claim_count": int(row["claim_count"]),
+            "max_claims": int(row["max_claims"]),
+            "ban_reason": row["ban_reason"] if "ban_reason" in row.keys() else None,
+            "banned_at": (
+                isoformat_from_ts(int(row["banned_at_ts"]))
+                if "banned_at_ts" in row.keys() and row["banned_at_ts"]
+                else None
+            ),
+            "last_probe_status": row["last_probe_status"] if "last_probe_status" in row.keys() else None,
+            "last_probe_at": (
+                isoformat_from_ts(int(row["last_probe_at_ts"]))
+                if "last_probe_at_ts" in row.keys() and row["last_probe_at_ts"]
+                else None
+            ),
+            "cleaned_at": isoformat_from_ts(int(row["cleaned_at_ts"])) if row["cleaned_at_ts"] else None,
+            "created_at": isoformat_from_ts(int(row["created_at_ts"])),
+            "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
+            "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
+        }
+
     def list_tokens_for_admin(
         self,
         *,
@@ -1669,8 +1737,11 @@ class TokenDb:
         if status_filter == "enabled":
             where_parts.append("is_active = 1")
             where_parts.append("is_enabled = 1")
+            where_parts.append("is_banned = 0")
+        elif status_filter == "banned":
+            where_parts.append("is_banned = 1")
         elif status_filter == "disabled":
-            where_parts.append("(is_active = 0 OR is_enabled = 0)")
+            where_parts.append("(is_active = 0 OR is_enabled = 0 OR is_banned = 1)")
         with self.connect() as conn:
             total_row = conn.execute(
                 f"""
@@ -1682,35 +1753,18 @@ class TokenDb:
             ).fetchone()
             rows = conn.execute(
                 f"""
-                SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
-                       is_cleaned, claim_count, max_claims, cleaned_at_ts, created_at_ts, updated_at_ts, last_seen_at_ts
+                SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_banned, is_available,
+                       is_cleaned, claim_count, max_claims, banned_at_ts, ban_reason, cleaned_at_ts,
+                       last_probe_at_ts, last_probe_status, created_at_ts, updated_at_ts, last_seen_at_ts
                 FROM tokens
                 WHERE {' AND '.join(where_parts)}
-                ORDER BY is_active DESC, is_enabled DESC, updated_at_ts DESC, id DESC
+                ORDER BY is_banned ASC, is_active DESC, is_enabled DESC, updated_at_ts DESC, id DESC
                 LIMIT ? OFFSET ?
                 """,
                 (*params, limit, offset),
             ).fetchall()
         return {
-            "items": [
-            {
-                "id": int(row["id"]),
-                "file_name": row["file_name"],
-                "file_path": row["file_path"],
-                "encoding": row["encoding"],
-                "is_active": bool(row["is_active"]),
-                "is_cleaned": bool(row["is_cleaned"]),
-                "is_enabled": bool(row["is_enabled"]),
-                "is_available": bool(row["is_available"]),
-                "claim_count": int(row["claim_count"]),
-                "max_claims": int(row["max_claims"]),
-                "cleaned_at": isoformat_from_ts(int(row["cleaned_at_ts"])) if row["cleaned_at_ts"] else None,
-                "created_at": isoformat_from_ts(int(row["created_at_ts"])),
-                "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
-                "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
-            }
-            for row in rows
-            ],
+            "items": [self._token_row_to_admin_payload(row) for row in rows],
             "total": int(total_row["cnt"]) if total_row else 0,
             "limit": limit,
             "offset": offset,
@@ -1724,18 +1778,20 @@ class TokenDb:
                 UPDATE tokens
                 SET is_enabled = ?,
                     is_available = CASE
-                        WHEN is_active = 1 AND ? = 1 AND claim_count < max_claims THEN 1
+                        WHEN is_active = 1 AND is_banned = 0 AND ? = 1 AND claim_count < max_claims THEN 1
                         ELSE 0
                     END,
                     updated_at_ts = ?
                 WHERE id = ?
+                  AND (? = 0 OR is_banned = 0)
                 """,
-                (1 if enabled else 0, 1 if enabled else 0, now, token_id),
+                (1 if enabled else 0, 1 if enabled else 0, now, token_id, 1 if enabled else 0),
             )
             row = conn.execute(
                 """
-                SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_available,
-                       is_cleaned, claim_count, max_claims, cleaned_at_ts, created_at_ts, updated_at_ts, last_seen_at_ts
+                SELECT id, file_name, file_path, encoding, is_active, is_enabled, is_banned, is_available,
+                       is_cleaned, claim_count, max_claims, banned_at_ts, ban_reason, cleaned_at_ts,
+                       last_probe_at_ts, last_probe_status, created_at_ts, updated_at_ts, last_seen_at_ts
                 FROM tokens
                 WHERE id = ?
                 """,
@@ -1746,22 +1802,321 @@ class TokenDb:
         invalidate_all_runtime_cache(include_admin=True)
         if not row:
             return None
-        return {
-            "id": int(row["id"]),
-            "file_name": row["file_name"],
-            "file_path": row["file_path"],
-            "encoding": row["encoding"],
-            "is_active": bool(row["is_active"]),
-            "is_cleaned": bool(row["is_cleaned"]),
-            "is_enabled": bool(row["is_enabled"]),
-            "is_available": bool(row["is_available"]),
-            "claim_count": int(row["claim_count"]),
-            "max_claims": int(row["max_claims"]),
-            "cleaned_at": isoformat_from_ts(int(row["cleaned_at_ts"])) if row["cleaned_at_ts"] else None,
-            "created_at": isoformat_from_ts(int(row["created_at_ts"])),
-            "updated_at": isoformat_from_ts(int(row["updated_at_ts"])),
-            "last_seen_at": isoformat_from_ts(int(row["last_seen_at_ts"])),
-        }
+        return self._token_row_to_admin_payload(row)
+
+    def reserve_claimable_token_for_user(self, user_id: int, *, timeout_s: float = 30.0) -> dict[str, Any] | None:
+        now = now_ts()
+        reserve_until = now + get_codex_probe_reserve_sec()
+        with self._lock, self.connect(timeout=timeout_s) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
+                FROM tokens
+                WHERE is_active = 1
+                  AND is_enabled = 1
+                  AND is_banned = 0
+                  AND is_available = 1
+                  AND claim_count < max_claims
+                  AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM user_token_claims
+                      WHERE user_token_claims.user_id = ?
+                        AND user_token_claims.token_id = tokens.id
+                  )
+                ORDER BY
+                    CASE WHEN claim_count > 0 THEN 0 ELSE 1 END ASC,
+                    created_at_ts ASC,
+                    id ASC
+                LIMIT 1
+                """,
+                (now, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE tokens
+                SET probe_lock_until_ts = ?,
+                    updated_at_ts = ?
+                WHERE id = ?
+                  AND is_active = 1
+                  AND is_enabled = 1
+                  AND is_banned = 0
+                  AND is_available = 1
+                  AND claim_count < max_claims
+                  AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
+                """,
+                (reserve_until, now, int(row["id"]), now),
+            )
+            if int(cursor.rowcount or 0) <= 0:
+                return None
+        payload = dict(row)
+        payload["content"] = json.loads(str(row["content_json"]))
+        return payload
+
+    def record_probe_status(
+        self,
+        token_id: int,
+        status_text: str,
+        *,
+        clear_lock: bool = True,
+        timeout_s: float = 30.0,
+    ) -> None:
+        now = now_ts()
+        with self._lock, self.connect(timeout=timeout_s) as conn:
+            conn.execute(
+                """
+                UPDATE tokens
+                SET last_probe_at_ts = ?,
+                    last_probe_status = ?,
+                    probe_lock_until_ts = CASE WHEN ? = 1 THEN NULL ELSE probe_lock_until_ts END,
+                    updated_at_ts = ?
+                WHERE id = ?
+                """,
+                (now, status_text, 1 if clear_lock else 0, now, token_id),
+            )
+
+    def mark_token_banned(
+        self,
+        token_id: int,
+        *,
+        reason: str = "upstream_401",
+        timeout_s: float = 30.0,
+    ) -> None:
+        now = now_ts()
+        with self._lock, self.connect(timeout=timeout_s) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE tokens
+                SET is_banned = 1,
+                    is_enabled = 0,
+                    is_available = 0,
+                    banned_at_ts = COALESCE(banned_at_ts, ?),
+                    ban_reason = ?,
+                    last_probe_at_ts = ?,
+                    last_probe_status = 'banned_401',
+                    probe_lock_until_ts = NULL,
+                    updated_at_ts = ?
+                WHERE id = ?
+                """,
+                (now, reason, now, now, token_id),
+            )
+            self.ensure_inventory_policy(conn=conn)
+        _refresh_dashboard_memory()
+        invalidate_all_runtime_cache(include_admin=True)
+
+    def finalize_claim_reserved_token(
+        self,
+        token_id: int,
+        user_id: int,
+        api_key_id: int | None,
+        request_id: str,
+        *,
+        hourly_limit: int | None = None,
+        apikey_rate_limit: int | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any] | None:
+        now = now_ts()
+        with self._lock, self.connect(timeout=timeout_s) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims,
+                       is_active, is_enabled, is_banned, is_available
+                FROM tokens
+                WHERE id = ?
+                """,
+                (token_id,),
+            ).fetchone()
+            if not row:
+                return None
+            already_claimed = conn.execute(
+                """
+                SELECT 1
+                FROM user_token_claims
+                WHERE user_id = ? AND token_id = ?
+                LIMIT 1
+                """,
+                (user_id, token_id),
+            ).fetchone()
+            if (
+                already_claimed
+                or int(row["is_active"]) != 1
+                or int(row["is_enabled"]) != 1
+                or int(row["is_banned"]) != 0
+                or int(row["is_available"]) != 1
+                or int(row["claim_count"]) >= int(row["max_claims"])
+            ):
+                conn.execute(
+                    """
+                    UPDATE tokens
+                    SET probe_lock_until_ts = NULL,
+                        updated_at_ts = ?
+                    WHERE id = ?
+                    """,
+                    (now, token_id),
+                )
+                return None
+            if hourly_limit is not None and hourly_limit > 0:
+                used_row = conn.execute(
+                    """
+                    SELECT COUNT(*) as cnt
+                    FROM token_claims
+                    WHERE user_id = ? AND claimed_at_ts >= ?
+                    """,
+                    (user_id, now - 3600),
+                ).fetchone()
+                used = int(used_row["cnt"]) if used_row else 0
+                if used >= hourly_limit:
+                    conn.execute(
+                        """
+                        UPDATE tokens
+                        SET probe_lock_until_ts = NULL,
+                            updated_at_ts = ?
+                        WHERE id = ?
+                        """,
+                        (now, token_id),
+                    )
+                    return None
+            if api_key_id is not None and apikey_rate_limit is not None and apikey_rate_limit > 0:
+                minute_row = conn.execute(
+                    """
+                    SELECT COUNT(*) as cnt
+                    FROM token_claims
+                    WHERE api_key_id = ? AND claimed_at_ts >= ?
+                    """,
+                    (api_key_id, now - 60),
+                ).fetchone()
+                minute_used = int(minute_row["cnt"]) if minute_row else 0
+                if minute_used >= apikey_rate_limit:
+                    conn.execute(
+                        """
+                        UPDATE tokens
+                        SET probe_lock_until_ts = NULL,
+                            updated_at_ts = ?
+                        WHERE id = ?
+                        """,
+                        (now, token_id),
+                    )
+                    return None
+               
+
+            first_claim = int(row["claim_count"]) <= 0
+            new_count = int(row["claim_count"]) + 1
+            new_available = 1 if new_count < int(row["max_claims"]) else 0
+            savepoint = f"claim_token_{token_id}"
+            try:
+                conn.execute(f"SAVEPOINT {savepoint}")
+                conn.execute(
+                    """
+                    UPDATE tokens
+                    SET claim_count = ?,
+                        is_available = ?,
+                        probe_lock_until_ts = NULL,
+                        last_probe_at_ts = COALESCE(last_probe_at_ts, ?),
+                        last_probe_status = CASE
+                            WHEN last_probe_status IS NULL OR last_probe_status = '' THEN 'ok'
+                            ELSE last_probe_status
+                        END,
+                        updated_at_ts = ?
+                    WHERE id = ?
+                      AND is_banned = 0
+                    """,
+                    (new_count, new_available, now, now, token_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO token_claims (
+                        token_id, user_id, api_key_id, claimed_at_ts, is_hidden,
+                        claim_file_name, claim_file_path, claim_encoding, claim_content_json,
+                        request_id
+                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        token_id,
+                        user_id,
+                        api_key_id,
+                        now,
+                        row["file_name"],
+                        row["file_path"],
+                        row["encoding"],
+                        row["content_json"],
+                        request_id,
+                    ),
+                )
+                claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                conn.execute(
+                    """
+                    INSERT INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (user_id, token_id, claim_id, now),
+                )
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except sqlite3.IntegrityError:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                conn.execute(
+                    """
+                    UPDATE tokens
+                    SET probe_lock_until_ts = NULL,
+                        updated_at_ts = ?
+                    WHERE id = ?
+                    """,
+                    (now, token_id),
+                )
+                return None
+
+            return {
+                "claim_id": claim_id,
+                "token_id": token_id,
+                "file_name": row["file_name"],
+                "file_path": row["file_path"],
+                "encoding": row["encoding"],
+                "content": json.loads(str(row["content_json"])),
+                "first_claim": first_claim,
+            }
+
+    def allocate_claimable_token(
+        self,
+        user_id: int,
+        api_key_id: int | None,
+        request_id: str,
+        *,
+        hourly_limit: int | None = None,
+        apikey_rate_limit: int | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any] | None:
+        while True:
+            candidate = self.reserve_claimable_token_for_user(user_id, timeout_s=timeout_s)
+            if not candidate:
+                return None
+            probe_result = _CODEX_PROBE.submit(
+                candidate["content"],
+                wait_timeout_sec=get_codex_probe_timeout_sec() + get_codex_probe_delay_sec() + 5.0,
+            )
+            token_id = int(candidate["id"])
+            if probe_result.is_banned:
+                self.mark_token_banned(token_id, reason="upstream_401", timeout_s=timeout_s)
+                continue
+            if probe_result.status != "ok":
+                self.record_probe_status(token_id, probe_result.status, clear_lock=False, timeout_s=timeout_s)
+            item = self.finalize_claim_reserved_token(
+                token_id,
+                user_id,
+                api_key_id,
+                request_id,
+                hourly_limit=hourly_limit,
+                apikey_rate_limit=apikey_rate_limit,
+                timeout_s=timeout_s,
+            )
+            if item is None:
+                continue
+            item["probe_status"] = probe_result.status
+            return item
 
     def cleanup_exhausted_tokens(self, token_dir: Path) -> dict[str, Any]:
         return self.cleanup_exhausted_tokens_with_mode(token_dir, mode="files_and_db")
@@ -2066,7 +2421,7 @@ class TokenDb:
     def get_dashboard_stats(self, user_id: int) -> dict[str, int]:
         with self.connect() as conn:
             total_tokens = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0"
             ).fetchone()
             available_tokens = conn.execute(
                 """
@@ -2077,12 +2432,12 @@ class TokenDb:
                     END
                 ), 0) as cnt
                 FROM tokens
-                WHERE is_active = 1 AND is_enabled = 1
+                WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0
                 """
             ).fetchone()
             claimed_total = conn.execute("SELECT COUNT(*) as cnt FROM token_claims").fetchone()
             claimed_unique = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND claim_count > 0"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0 AND claim_count > 0"
             ).fetchone()
             others_claimed_total = conn.execute(
                 "SELECT COUNT(*) as cnt FROM token_claims WHERE user_id != ?",
@@ -2105,7 +2460,7 @@ class TokenDb:
     def get_inventory_snapshot(self, *, conn=None) -> dict[str, int]:
         def _fetch(target_conn):
             total_row = target_conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0"
             ).fetchone()
             available_row = target_conn.execute(
                 """
@@ -2116,11 +2471,11 @@ class TokenDb:
                     END
                 ), 0) as cnt
                 FROM tokens
-                WHERE is_active = 1 AND is_enabled = 1
+                WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0
                 """
             ).fetchone()
             unclaimed_row = target_conn.execute(
-                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND claim_count = 0"
+                "SELECT COUNT(*) as cnt FROM tokens WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0 AND claim_count = 0"
             ).fetchone()
             return {
                 "total": int(total_row["cnt"]) if total_row else 0,
@@ -2320,14 +2675,17 @@ class TokenDb:
         return {"total": total}
 
     def count_claimable_tokens_for_user(self, conn: sqlite3.Connection, user_id: int) -> int:
+        now = now_ts()
         row = conn.execute(
             """
             SELECT COUNT(*) as cnt
             FROM tokens
             WHERE is_active = 1
               AND is_enabled = 1
+              AND is_banned = 0
               AND is_available = 1
               AND claim_count < max_claims
+              AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
               AND NOT EXISTS (
                   SELECT 1
                   FROM user_token_claims
@@ -2335,7 +2693,7 @@ class TokenDb:
                     AND user_token_claims.token_id = tokens.id
               )
             """,
-            (user_id,),
+            (now, user_id),
         ).fetchone()
         return int(row["cnt"]) if row else 0
 
@@ -2345,14 +2703,17 @@ class TokenDb:
         user_id: int,
         limit: int,
     ) -> list[sqlite3.Row]:
+        now = now_ts()
         return conn.execute(
             """
             SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
             FROM tokens
             WHERE is_active = 1
               AND is_enabled = 1
+              AND is_banned = 0
               AND is_available = 1
               AND claim_count < max_claims
+              AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
               AND NOT EXISTS (
                   SELECT 1
                   FROM user_token_claims
@@ -2365,7 +2726,7 @@ class TokenDb:
                 id ASC
             LIMIT ?
             """,
-            (user_id, max(0, int(limit))),
+            (now, user_id, max(0, int(limit))),
         ).fetchall()
 
     def claim_tokens(
@@ -2379,16 +2740,12 @@ class TokenDb:
         except Exception:
             pass
         requested = max(1, count)
-        now = now_ts()
-        cutoff = now - 3600
         request_id = secrets.token_hex(8)
-        result: dict[str, Any] | None = None
+        now = now_ts()
         granted_token_ids: list[int] = []
         first_claim_count = 0
         queued_created = False
-
-        with self._lock, self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.connect() as conn:
             self.ensure_inventory_policy(conn=conn)
             batch_limit = get_claim_batch_limit(self, conn=conn)
             requested = min(requested, batch_limit)
@@ -2398,36 +2755,31 @@ class TokenDb:
                 FROM token_claims
                 WHERE user_id = ? AND claimed_at_ts >= ?
                 """,
-                (user_id, cutoff),
+                (user_id, now - 3600),
             ).fetchone()
             used = int(used_row["cnt"]) if used_row else 0
             limit = get_claim_hourly_limit(self, conn=conn)
             remaining = max(0, limit - used)
             if remaining <= 0:
                 raise RateLimitError("您当前小时内的兑换额度已用完")
-
-            if api_key_id is not None:
-                per_minute = get_apikey_rate_per_minute()
-                if per_minute > 0:
-                    minute_cutoff = now - 60
-                    minute_row = conn.execute(
-                        """
-                        SELECT COUNT(*) as cnt
-                        FROM token_claims
-                        WHERE api_key_id = ? AND claimed_at_ts >= ?
-                        """,
-                        (api_key_id, minute_cutoff),
-                    ).fetchone()
-                    minute_used = int(minute_row["cnt"]) if minute_row else 0
-                    remaining_minute = max(0, per_minute - minute_used)
-                    if remaining_minute <= 0:
-                        raise RateLimitError("API key rate limit exceeded.")
-                    requested = min(requested, remaining_minute)
-
+            per_minute = get_apikey_rate_per_minute() if api_key_id is not None else 0
+            if api_key_id is not None and per_minute > 0:
+                minute_row = conn.execute(
+                    """
+                    SELECT COUNT(*) as cnt
+                    FROM token_claims
+                    WHERE api_key_id = ? AND claimed_at_ts >= ?
+                    """,
+                    (api_key_id, now - 60),
+                ).fetchone()
+                minute_used = int(minute_row["cnt"]) if minute_row else 0
+                remaining_minute = max(0, per_minute - minute_used)
+                if remaining_minute <= 0:
+                    raise RateLimitError("API key rate limit exceeded.")
+                requested = min(requested, remaining_minute)
             target = min(requested, remaining)
             if target <= 0:
                 raise RateLimitError("您当前小时内的兑换额度已用完")
-
             if claim_queue.has_pending_queue(self, conn=conn):
                 queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
                 queued_created = not bool(queued.get("existing"))
@@ -2442,121 +2794,62 @@ class TokenDb:
                     "queue_remaining": queued["remaining"],
                     "quota": {"used": used, "limit": limit, "remaining": remaining},
                 }
-            else:
-                available = self.count_claimable_tokens_for_user(conn, user_id)
-                if available < target:
-                    queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
-                    queued_created = not bool(queued.get("existing"))
-                    result = {
-                        "request_id": queued["request_id"],
-                        "items": [],
-                        "requested": target,
-                        "granted": 0,
-                        "queued": True,
-                        "queue_id": queued["queue_id"],
-                        "queue_position": queued["position"],
-                        "queue_remaining": queued["remaining"],
-                        "quota": {"used": used, "limit": limit, "remaining": remaining},
-                    }
-                else:
-                    rows = self.list_claimable_tokens_for_user(conn, user_id, target)
+                if queued_created:
+                    _DASHBOARD_CACHE.adjust_queue_total(1)
+                invalidate_all_runtime_cache(user_id=user_id, include_admin=True)
+                return result
 
-                    if not rows:
-                        queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
-                        queued_created = not bool(queued.get("existing"))
-                        result = {
-                            "request_id": queued["request_id"],
-                            "items": [],
-                            "requested": target,
-                            "granted": 0,
-                            "queued": True,
-                            "queue_id": queued["queue_id"],
-                            "queue_position": queued["position"],
-                            "queue_remaining": queued["remaining"],
-                            "quota": {"used": used, "limit": limit, "remaining": remaining},
-                        }
-                    else:
-                        items: list[dict[str, Any]] = []
-                        for row in rows:
-                            token_id = int(row["id"])
-                            first_claim = int(row["claim_count"]) <= 0
-                            new_count = int(row["claim_count"]) + 1
-                            new_available = 1 if new_count < int(row["max_claims"]) else 0
-                            savepoint = f"claim_token_{token_id}"
-                            claim_id: int | None = None
-                            try:
-                                conn.execute(f"SAVEPOINT {savepoint}")
-                                conn.execute(
-                                    """
-                                    UPDATE tokens
-                                    SET claim_count = ?,
-                                        is_available = ?,
-                                        updated_at_ts = ?
-                                    WHERE id = ?
-                                    """,
-                                    (new_count, new_available, now, token_id),
-                                )
-                                conn.execute(
-                                    """
-                                    INSERT INTO token_claims (
-                                        token_id, user_id, api_key_id, claimed_at_ts, is_hidden,
-                                        claim_file_name, claim_file_path, claim_encoding, claim_content_json,
-                                        request_id
-                                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        token_id,
-                                        user_id,
-                                        api_key_id,
-                                        now,
-                                        row["file_name"],
-                                        row["file_path"],
-                                        row["encoding"],
-                                        row["content_json"],
-                                        request_id,
-                                    ),
-                                )
-                                claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-                                conn.execute(
-                                    """
-                                    INSERT INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
-                                    VALUES (?, ?, ?, ?)
-                                    """,
-                                    (user_id, token_id, claim_id, now),
-                                )
-                                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                            except sqlite3.IntegrityError:
-                                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                                continue
+        items: list[dict[str, Any]] = []
+        while len(items) < target:
+            item = self.allocate_claimable_token(
+                user_id,
+                api_key_id,
+                request_id,
+                hourly_limit=limit,
+                apikey_rate_limit=per_minute,
+            )
+            if item is None:
+                break
+            if bool(item.get("first_claim")):
+                first_claim_count += 1
+            granted_token_ids.append(int(item["token_id"]))
+            items.append(
+                {
+                    "claim_id": item["claim_id"],
+                    "token_id": item["token_id"],
+                    "file_name": item["file_name"],
+                    "file_path": item["file_path"],
+                    "encoding": item["encoding"],
+                    "content": item["content"],
+                }
+            )
 
-                            if first_claim:
-                                first_claim_count += 1
-                            granted_token_ids.append(token_id)
-                            items.append(
-                                {
-                                    "claim_id": claim_id,
-                                    "token_id": token_id,
-                                    "file_name": row["file_name"],
-                                    "file_path": row["file_path"],
-                                    "encoding": row["encoding"],
-                                    "content": json.loads(row["content_json"]),
-                                }
-                            )
+        if not items:
+            queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target)
+            queued_created = not bool(queued.get("existing"))
+            result = {
+                "request_id": queued["request_id"],
+                "items": [],
+                "requested": target,
+                "granted": 0,
+                "queued": True,
+                "queue_id": queued["queue_id"],
+                "queue_position": queued["position"],
+                "queue_remaining": queued["remaining"],
+                "quota": {"used": used, "limit": limit, "remaining": remaining},
+            }
+        else:
+            new_used = used + len(items)
+            new_remaining = max(0, limit - new_used)
+            result = {
+                "request_id": request_id,
+                "items": items,
+                "requested": target,
+                "granted": len(items),
+                "queued": False,
+                "quota": {"used": new_used, "limit": limit, "remaining": new_remaining},
+            }
 
-                        new_used = used + len(items)
-                        new_remaining = max(0, limit - new_used)
-                        result = {
-                            "request_id": request_id,
-                            "items": items,
-                            "requested": target,
-                            "granted": len(items),
-                            "queued": False,
-                            "quota": {"used": new_used, "limit": limit, "remaining": new_remaining},
-                        }
-
-        if result is None:
-            raise RuntimeError("claim_tokens completed without a result")
         if queued_created:
             _DASHBOARD_CACHE.adjust_queue_total(1)
         if result.get("granted"):
@@ -2635,6 +2928,7 @@ class TokenDb:
         return items
 
     def get_queue_status(self, user_id: int) -> dict[str, Any] | None:
+        now = now_ts()
         with self.connect() as conn:
             row = conn.execute(
                 """
@@ -2672,8 +2966,10 @@ class TokenDb:
                 SELECT COUNT(*) as cnt
                 FROM tokens
                 WHERE is_active = 1 AND is_enabled = 1
+                  AND is_banned = 0
                   AND is_available = 1
                   AND claim_count < max_claims
+                  AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
                   AND NOT EXISTS (
                       SELECT 1
                       FROM user_token_claims
@@ -2682,7 +2978,7 @@ class TokenDb:
                   )
                 """
                 ,
-                (user_id,),
+                (now, user_id),
             ).fetchone()
             available = int(available_row["cnt"]) if available_row else 0
         return {
@@ -2696,6 +2992,32 @@ class TokenDb:
             "enqueued_at": isoformat_from_ts(int(row["enqueued_at_ts"])),
             "request_id": row["request_id"],
         }
+
+    def consume_queue_grant(self, queue_id: int, granted: int, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        granted = max(0, int(granted))
+        if granted <= 0:
+            return {"removed": False, "remaining": None}
+        with self._lock, self.connect(timeout=timeout_s) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT remaining FROM claim_queue WHERE id = ? AND status = 'queued'",
+                (queue_id,),
+            ).fetchone()
+            if not row:
+                return {"removed": False, "remaining": None}
+            remaining_after = max(0, int(row["remaining"]) - granted)
+            if remaining_after <= 0:
+                conn.execute("DELETE FROM claim_queue WHERE id = ?", (queue_id,))
+                return {"removed": True, "remaining": 0}
+            conn.execute(
+                """
+                UPDATE claim_queue
+                SET remaining = ?, status = 'queued'
+                WHERE id = ?
+                """,
+                (remaining_after, queue_id),
+            )
+            return {"removed": False, "remaining": remaining_after}
 
     def hide_claims(self, user_id: int, claim_ids: list[int]) -> int:
         if not claim_ids:
@@ -3114,6 +3436,18 @@ def get_apikey_rate_per_minute() -> int:
     return max(0, env_int(APIKEY_RATE_PER_MIN_ENV, 60))
 
 
+def get_codex_probe_delay_sec() -> float:
+    return max(0.0, env_float(TOKEN_CODEX_PROBE_DELAY_SEC_ENV, 1.5))
+
+
+def get_codex_probe_timeout_sec() -> float:
+    return max(1.0, env_float(TOKEN_CODEX_PROBE_TIMEOUT_SEC_ENV, 20.0))
+
+
+def get_codex_probe_reserve_sec() -> int:
+    return max(5, int(env_float(TOKEN_CODEX_PROBE_RESERVE_SEC_ENV, 30.0)))
+
+
 def get_admin_identities() -> dict[str, set[str]]:
     return parse_admin_identities(env_value(ADMIN_IDENTITIES_ENV))
 
@@ -3418,6 +3752,10 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
 
 db = TokenDb(get_db_path())
 db.init_db()
+_CODEX_PROBE = codex_probe.CodexProbeQueue(
+    delay_sec=get_codex_probe_delay_sec(),
+    timeout_sec=get_codex_probe_timeout_sec(),
+)
 _QUEUE_FULFILL_LOCK = threading.Lock()
 _QUEUE_LAST_FULFILL_TS = 0.0
 _QUEUE_FULFILL_THROTTLE_SEC = 5.0
@@ -3506,6 +3844,7 @@ def _token_import_loop() -> None:
 async def lifespan(_: FastAPI):
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     _APP_CACHE.configure(emit_log=True)
+    _CODEX_PROBE.start()
     db.init_db()
     sync_tokens_with_retry(db, TOKEN_DIR)
     try_fulfill_queue(db)
@@ -3534,6 +3873,7 @@ async def lifespan(_: FastAPI):
     finally:
         _QUEUE_PUMP_STOP.set()
         _TOKEN_IMPORT_STOP.set()
+        _CODEX_PROBE.stop()
         if _QUEUE_PUMP_THREAD is not None:
             _QUEUE_PUMP_THREAD.join(timeout=5)
             _QUEUE_PUMP_THREAD = None
