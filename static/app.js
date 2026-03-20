@@ -20,6 +20,7 @@ const state = {
   skipNextClaimModal: false,
   refreshCounter: 0,
   isClaimSubmitting: false,
+  isClaimQueued: false,
 };
 
 const elements = {
@@ -185,12 +186,16 @@ function applyDocsBaseUrl() {
 function renderQueueStatus() {
   const status = state.queueStatus;
   if (!status || !status.queued) {
+    state.isClaimQueued = false;
+    syncClaimButtonState();
     if (state.queueSticky) {
       elements.claimSummary.classList.add("hidden");
       state.queueSticky = false;
     }
     return;
   }
+  state.isClaimQueued = true;
+  syncClaimButtonState();
   const position = status.position ?? "-";
   const total = status.total_queued ?? "-";
   const available = status.available_tokens ?? "-";
@@ -566,15 +571,29 @@ function showModal(title, message) {
   });
 }
 
-function setClaimSubmitting(submitting) {
-  state.isClaimSubmitting = submitting;
+function syncClaimButtonState() {
   if (!elements.claimBtn) {
     return;
   }
-  elements.claimBtn.disabled = submitting;
-  elements.claimBtn.classList.toggle("is-loading", submitting);
-  elements.claimBtn.setAttribute("aria-busy", submitting ? "true" : "false");
-  elements.claimBtn.textContent = submitting ? "申请中..." : "申请账号";
+  const busy = state.isClaimSubmitting || state.isClaimQueued;
+  elements.claimBtn.disabled = busy;
+  elements.claimBtn.classList.toggle("is-loading", busy);
+  elements.claimBtn.setAttribute("aria-busy", busy ? "true" : "false");
+  if (state.isClaimQueued) {
+    elements.claimBtn.textContent = "排队中...";
+    return;
+  }
+  elements.claimBtn.textContent = state.isClaimSubmitting ? "申请中..." : "申请账号";
+}
+
+function setClaimSubmitting(submitting) {
+  state.isClaimSubmitting = submitting;
+  syncClaimButtonState();
+}
+
+function setClaimQueued(queued) {
+  state.isClaimQueued = queued;
+  syncClaimButtonState();
 }
 
 function renderApiKeys(limit) {
@@ -772,7 +791,7 @@ async function revokeApiKey(keyId) {
 }
 
 async function claimTokens() {
-  if (state.isClaimSubmitting) {
+  if (state.isClaimSubmitting || state.isClaimQueued) {
     return;
   }
   elements.claimSummary.classList.add("hidden");
@@ -800,6 +819,7 @@ async function claimTokens() {
     }
     await loadClaims();
     if (result.queued) {
+      setClaimQueued(true);
       state.queueStatus = {
         queued: true,
         position: result.queue_position,
@@ -808,6 +828,7 @@ async function claimTokens() {
       };
       renderQueueStatus();
     } else {
+      setClaimQueued(false);
       state.queueStatus = { queued: false };
       state.queueSticky = false;
       elements.claimSummary.textContent = `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
@@ -821,6 +842,7 @@ async function claimTokens() {
     await loadDashboardSummary();
     await loadQueueStatus();
   } catch (error) {
+    setClaimQueued(false);
     elements.claimSummary.classList.add("hidden");
     elements.claimError.textContent = error.message;
     elements.claimError.classList.remove("hidden");
