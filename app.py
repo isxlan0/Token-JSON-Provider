@@ -989,33 +989,6 @@ class TokenDb:
                     FOREIGN KEY(banned_by_user_id) REFERENCES users(id),
                     FOREIGN KEY(unbanned_by_user_id) REFERENCES users(id)
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_token_claims_user_time
-                    ON token_claims(user_id, claimed_at_ts);
-                CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
-                    ON token_claims(api_key_id, claimed_at_ts);
-                CREATE INDEX IF NOT EXISTS idx_token_claims_user_hidden_time
-                    ON token_claims(user_id, is_hidden, claimed_at_ts DESC, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_token_claims_user_token_hidden_time
-                    ON token_claims(user_id, token_id, is_hidden, claimed_at_ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_token_claims_request_user_time
-                    ON token_claims(request_id, user_id, claimed_at_ts);
-                CREATE INDEX IF NOT EXISTS idx_user_token_claims_user
-                    ON user_token_claims(user_id, token_id);
-                CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
-                    ON claim_queue(status, enqueued_at_ts, id);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_account_id_unique
-                    ON tokens(account_id)
-                    WHERE account_id IS NOT NULL AND account_id != '';
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_access_token_hash_unique
-                    ON tokens(access_token_hash)
-                    WHERE access_token_hash IS NOT NULL AND access_token_hash != '';
-                CREATE INDEX IF NOT EXISTS idx_api_keys_user_status
-                    ON api_keys(user_id, status);
-                CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
-                    ON user_bans(linuxdo_user_id, banned_at_ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_user_bans_active_lookup
-                    ON user_bans(linuxdo_user_id, unbanned_at_ts, expires_at_ts, id DESC);
                 """
             )
             claims_columns = {
@@ -1181,6 +1154,38 @@ class TokenDb:
                       AND user_token_claims.token_id = token_claims.token_id
                       AND user_token_claims.first_claim_id <> token_claims.id
                 )
+                """
+            )
+            # Create indexes only after schema backfill so legacy databases
+            # without the newer columns can migrate successfully.
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_token_claims_user_time
+                    ON token_claims(user_id, claimed_at_ts);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
+                    ON token_claims(api_key_id, claimed_at_ts);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_user_hidden_time
+                    ON token_claims(user_id, is_hidden, claimed_at_ts DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_user_token_hidden_time
+                    ON token_claims(user_id, token_id, is_hidden, claimed_at_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_request_user_time
+                    ON token_claims(request_id, user_id, claimed_at_ts);
+                CREATE INDEX IF NOT EXISTS idx_user_token_claims_user
+                    ON user_token_claims(user_id, token_id);
+                CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
+                    ON claim_queue(status, enqueued_at_ts, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_account_id_unique
+                    ON tokens(account_id)
+                    WHERE account_id IS NOT NULL AND account_id != '';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_access_token_hash_unique
+                    ON tokens(access_token_hash)
+                    WHERE access_token_hash IS NOT NULL AND access_token_hash != '';
+                CREATE INDEX IF NOT EXISTS idx_api_keys_user_status
+                    ON api_keys(user_id, status);
+                CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
+                    ON user_bans(linuxdo_user_id, banned_at_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_user_bans_active_lookup
+                    ON user_bans(linuxdo_user_id, unbanned_at_ts, expires_at_ts, id DESC);
                 """
             )
 
