@@ -50,14 +50,23 @@ def _extract_credentials(token_content: dict[str, Any]) -> tuple[str, str]:
     return access_token, account_id
 
 
-def _apply_codex_headers(request: urllib.request.Request, access_token: str, account_id: str) -> None:
+def _apply_codex_headers(
+    request: urllib.request.Request,
+    access_token: str,
+    account_id: str,
+    *,
+    stream: bool,
+) -> None:
     request.add_header("Content-Type", "application/json")
     request.add_header("Authorization", f"Bearer {access_token}")
     request.add_header("Version", CODEX_CLIENT_VERSION)
     request.add_header("Openai-Beta", "responses=experimental")
     request.add_header("Session_id", str(uuid.uuid4()))
     request.add_header("User-Agent", CODEX_USER_AGENT)
-    request.add_header("Accept", "application/json")
+    if stream:
+        request.add_header("Accept", "text/event-stream")
+    else:
+        request.add_header("Accept", "application/json")
     request.add_header("Connection", "Keep-Alive")
     request.add_header("Originator", "codex_cli_rs")
     if account_id:
@@ -73,9 +82,10 @@ def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> 
     _probe_log(
         f"[probe-request] start account_id={account_id or '-'} timeout_sec={float(timeout_sec):.1f}"
     )
+    stream = True
     body = {
         "model": "gpt-5",
-        "stream": False,
+        "stream": stream,
         "store": False,
         "instructions": "",
         "input": [
@@ -93,7 +103,11 @@ def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> 
         data=json.dumps(body).encode("utf-8"),
         method="POST",
     )
-    _apply_codex_headers(req, access_token, account_id)
+    _apply_codex_headers(req, access_token, account_id, stream=stream)
+    _probe_log(
+        f"[probe-request] headers account_id_header={int(bool(account_id))} "
+        f"accept={req.headers.get('Accept', '-')}"
+    )
     try:
         with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_sec))) as resp:
             resp.read()
