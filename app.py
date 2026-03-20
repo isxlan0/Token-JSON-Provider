@@ -4549,12 +4549,14 @@ def _cache_fresh(ts: float, ttl_sec: float | None = None) -> bool:
 
 
 def _queue_pump_loop() -> None:
+    first_iteration = True
     while not _QUEUE_PUMP_STOP.is_set():
         try:
-            if claim_queue.has_pending_queue(db):
+            if first_iteration or claim_queue.has_pending_queue(db):
                 try_fulfill_queue(db)
         except Exception:
             pass
+        first_iteration = False
         _QUEUE_PUMP_STOP.wait(timeout=_QUEUE_PUMP_INTERVAL_SEC)
 
 
@@ -4896,7 +4898,6 @@ async def lifespan(_: FastAPI):
     run_startup_step("configure cache backend", lambda: _APP_CACHE.configure(emit_log=True))
     run_startup_step("start codex probe", _CODEX_PROBE.start)
     run_startup_step("initialize database", db.init_db)
-    run_startup_step("fulfill queued claims", lambda: try_fulfill_queue(db))
     run_startup_step("refresh dashboard memory", _refresh_dashboard_memory)
     run_startup_step("refresh queue snapshot", lambda: refresh_queue_total_snapshot(db))
     startup_log(f"application startup finished in {time.perf_counter() - startup_begin:.3f}s")
