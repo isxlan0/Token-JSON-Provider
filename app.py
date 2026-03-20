@@ -4161,7 +4161,7 @@ def get_cache_queue_snapshot_ttl() -> int:
 
 
 def get_cache_upload_results_ttl() -> int:
-    return max(get_cache_me_ttl(), 7 * 24 * 3600)
+    return max(get_cache_me_ttl(), 60)
 
 
 def get_cache_dashboard_ttl() -> int:
@@ -4267,6 +4267,10 @@ def invalidate_user_claims_cache(user_id: int) -> None:
 
 def invalidate_user_queue_cache(user_id: int) -> None:
     bump_cache_scope("user-queue", user_id)
+
+
+def invalidate_user_upload_results_cache(user_id: int) -> None:
+    bump_cache_scope("user-upload-results", user_id)
 
 
 def invalidate_inventory_cache() -> None:
@@ -4516,17 +4520,6 @@ def get_default_upload_results_snapshot() -> dict[str, Any]:
 
 
 def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
-    key = build_user_upload_results_cache_key(user_id)
-    cached = _get_cached_snapshot(key)
-    if cached is not None:
-        return {
-            "batch_id": cached.get("batch_id"),
-            "created_at": cached.get("created_at"),
-            "summary": dict(cached.get("summary") or get_default_upload_results_snapshot()["summary"]),
-            "items": list(cached.get("items") or []),
-            "history": [],
-            "queue_status": dict(cached.get("queue_status") or {}) if isinstance(cached.get("queue_status"), dict) else None,
-        }
     with _UPLOAD_RESULTS_MEMORY_LOCK:
         memory_payload = _UPLOAD_RESULTS_MEMORY.get(int(user_id))
         if isinstance(memory_payload, dict):
@@ -4538,10 +4531,22 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
                 "history": [],
                 "queue_status": dict(memory_payload.get("queue_status") or {}) if isinstance(memory_payload.get("queue_status"), dict) else None,
             }
+    key = build_user_upload_results_cache_key(user_id)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return {
+            "batch_id": cached.get("batch_id"),
+            "created_at": cached.get("created_at"),
+            "summary": dict(cached.get("summary") or get_default_upload_results_snapshot()["summary"]),
+            "items": list(cached.get("items") or []),
+            "history": [],
+            "queue_status": dict(cached.get("queue_status") or {}) if isinstance(cached.get("queue_status"), dict) else None,
+        }
     return get_default_upload_results_snapshot()
 
 
 def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    invalidate_user_upload_results_cache(user_id)
     key = build_user_upload_results_cache_key(user_id)
     normalized = {
         "batch_id": payload.get("batch_id"),
@@ -5176,6 +5181,10 @@ def update_user_upload_results_snapshot(
 ) -> dict[str, Any] | None:
     current = get_user_upload_results_snapshot(user_id)
     if str(current.get("batch_id") or "") != str(batch_id):
+        upload_log(
+            f"[upload-results] snapshot_batch_mismatch user_id={user_id} "
+            f"expected_batch={batch_id} actual_batch={current.get('batch_id')}"
+        )
         return None
     items = list(current.get("items") or [])
     target_position = next(
@@ -5187,6 +5196,10 @@ def update_user_upload_results_snapshot(
         None,
     )
     if target_position is None:
+        upload_log(
+            f"[upload-results] snapshot_item_missing user_id={user_id} "
+            f"batch={batch_id} request_index={request_index}"
+        )
         return None
     merged = dict(items[target_position])
     merged.update(item_payload)
@@ -5990,29 +6003,32 @@ def set_upload_task_status(batch_id: str, request_index: int, item_payload: dict
         batch[int(request_index)] = current
 
 
-def clear_upload_task_status_if_done(batch_id: str) -> None:
+def clear_upload_task_status_if_done(batch_id: str, *, snapshot_persisted: bool = False) -> bool:
     with _UPLOAD_TASK_STATUS_LOCK:
         batch = _UPLOAD_TASK_STATUS.get(str(batch_id))
         if not batch:
             _UPLOAD_TASK_STATUS.pop(str(batch_id), None)
-            return
+            return True
         if any(item.get("status") in {"queued", "processing"} for item in batch.values()):
-            return
+            return False
+        if not snapshot_persisted:
+            return False
         _UPLOAD_TASK_STATUS.pop(str(batch_id), None)
+        return True
 
 
-def apply_runtime_upload_task_status(payload: dict[str, Any]) -> dict[str, Any]:
+def apply_runtime_upload_task_status(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     items = list(payload.get("items") or [])
     batch_id = str(payload.get("batch_id") or "")
     if not items or not batch_id:
-        return payload
+        return payload, False
     with _UPLOAD_TASK_STATUS_LOCK:
         runtime_items = {
             int(idx): dict(item)
             for idx, item in (_UPLOAD_TASK_STATUS.get(batch_id) or {}).items()
         }
     if not runtime_items:
-        return payload
+        return payload, False
 
     changed = False
     next_items: list[dict[str, Any]] = []
@@ -6031,14 +6047,31 @@ def apply_runtime_upload_task_status(payload: dict[str, Any]) -> dict[str, Any]:
         if merged != item:
             changed = True
     if not changed:
-        return payload
-    return build_upload_response(
-        next_items,
-        batch_id=batch_id,
-        created_at=str(payload.get("created_at") or isoformat_now()),
-        history=[],
-        queue_status=payload.get("queue_status") if isinstance(payload.get("queue_status"), dict) else None,
+        return payload, False
+    return (
+        build_upload_response(
+            next_items,
+            batch_id=batch_id,
+            created_at=str(payload.get("created_at") or isoformat_now()),
+            history=[],
+            queue_status=payload.get("queue_status") if isinstance(payload.get("queue_status"), dict) else None,
+        ),
+        True,
     )
+
+
+def persist_runtime_upload_results_snapshot(user_id: int, batch_id: str) -> tuple[dict[str, Any], bool]:
+    payload = get_user_upload_results_snapshot(user_id)
+    if str(payload.get("batch_id") or "") != str(batch_id):
+        upload_log(
+            f"[upload-results] persist_batch_mismatch user_id={user_id} "
+            f"expected_batch={batch_id} actual_batch={payload.get('batch_id')}"
+        )
+        return payload, False
+    merged_payload, changed = apply_runtime_upload_task_status(payload)
+    if changed:
+        merged_payload = set_user_upload_results_snapshot(user_id, merged_payload)
+    return merged_payload, True
 
 
 def advance_upload_tasks_on_demand(*, max_tasks: int = 1) -> int:
@@ -6064,7 +6097,13 @@ def advance_upload_tasks_on_demand(*, max_tasks: int = 1) -> int:
 
 def refresh_user_upload_results_memory(user_id: int) -> dict[str, Any]:
     payload = get_user_upload_results_snapshot(user_id)
-    payload = apply_runtime_upload_task_status(payload)
+    batch_id = str(payload.get("batch_id") or "")
+    if batch_id:
+        payload, persisted = persist_runtime_upload_results_snapshot(user_id, batch_id)
+        if not persisted:
+            payload, _ = apply_runtime_upload_task_status(payload)
+    else:
+        payload, _ = apply_runtime_upload_task_status(payload)
     with _UPLOAD_RESULTS_MEMORY_LOCK:
         _UPLOAD_RESULTS_MEMORY[int(user_id)] = {
             "batch_id": payload.get("batch_id"),
@@ -6232,17 +6271,22 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
             "status": "probe_failed",
             "reason": "后台处理失败，请稍后重试",
         }
+    snapshot_persisted = False
     try:
         set_upload_task_status(task.batch_id, task.request_index, result_item)
-        update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
+        snapshot_payload = update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
+        snapshot_persisted = snapshot_payload is not None
+        if not snapshot_persisted:
+            snapshot_payload, snapshot_persisted = persist_runtime_upload_results_snapshot(task.user_id, task.batch_id)
         refresh_user_upload_results_memory(task.user_id)
         upload_log(
             f"[upload-worker] finished user_id={task.user_id} batch={task.batch_id} "
-            f"index={task.request_index} file={task.file_name} status={result_item['status']}"
+            f"index={task.request_index} file={task.file_name} status={result_item['status']} "
+            f"snapshot_persisted={snapshot_persisted}"
         )
     finally:
         clear_pending_upload_task(task)
-        clear_upload_task_status_if_done(task.batch_id)
+        clear_upload_task_status_if_done(task.batch_id, snapshot_persisted=snapshot_persisted)
 
 
 def _upload_task_loop() -> None:
