@@ -5184,7 +5184,7 @@ def update_user_upload_results_snapshot(
         batch_id=str(current.get("batch_id") or batch_id),
         created_at=str(current.get("created_at") or isoformat_now()),
         history=[],
-        queue_status=get_current_user_queue_status_snapshot(user_id),
+        queue_status=current.get("queue_status") if isinstance(current.get("queue_status"), dict) else None,
     )
     return set_user_upload_results_snapshot(user_id, payload)
 
@@ -5926,9 +5926,29 @@ def apply_runtime_upload_task_status(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def advance_upload_tasks_on_demand(*, max_tasks: int = 1) -> int:
+    processed = 0
+    limit = max(1, int(max_tasks))
+    while processed < limit:
+        try:
+            task = _UPLOAD_TASK_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            with _UPLOAD_TASK_STATE_LOCK:
+                global _UPLOAD_TASK_ACTIVE_COUNT
+                _UPLOAD_TASK_ACTIVE_COUNT += 1
+            _process_upload_task(task)
+            processed += 1
+        finally:
+            with _UPLOAD_TASK_STATE_LOCK:
+                _UPLOAD_TASK_ACTIVE_COUNT = max(0, _UPLOAD_TASK_ACTIVE_COUNT - 1)
+            _UPLOAD_TASK_QUEUE.task_done()
+    return processed
+
+
 def refresh_user_upload_results_memory(user_id: int) -> dict[str, Any]:
     payload = get_user_upload_results_snapshot(user_id)
-    payload["queue_status"] = get_current_user_queue_status_snapshot(user_id)
     payload = apply_runtime_upload_task_status(payload)
     with _UPLOAD_RESULTS_MEMORY_LOCK:
         _UPLOAD_RESULTS_MEMORY[int(user_id)] = {
@@ -6597,6 +6617,7 @@ def get_me_apikey_summary(request: Request) -> dict[str, int]:
 @app.get("/me/uploads/results")
 def get_me_upload_results(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
+    advance_upload_tasks_on_demand(max_tasks=1)
     return refresh_user_upload_results_memory(session["user_id"])
 
 
@@ -6905,18 +6926,19 @@ def upload_tokens_session(
             )
         )
 
-    queue_status_payload = get_current_user_queue_status_snapshot(session["user_id"])
     response_payload = build_upload_response(
         results,
         batch_id=batch_id,
         created_at=created_at,
         history=[],
-        queue_status=queue_status_payload,
+        queue_status=None,
     )
     set_user_upload_results_snapshot(session["user_id"], response_payload)
     refresh_user_upload_results_memory(session["user_id"])
     for task in queued_tasks:
         _UPLOAD_TASK_QUEUE.put(task)
+    if queued_tasks:
+        advance_upload_tasks_on_demand(max_tasks=1)
     success_count = sum(1 for item in results if item.get("status") == "accepted")
     upload_log(
         f"[upload-request] finished user_id={user['id']} total={len(results)} "

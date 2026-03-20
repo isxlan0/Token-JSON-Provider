@@ -853,10 +853,6 @@ function renderUploadResults() {
 function applyUploadResultsPayload(payload) {
   state.uploadResults = payload.items || [];
   state.uploadHistory = [];
-  if (payload?.queue_status) {
-    state.queueStatus = payload.queue_status;
-    renderQueueStatus();
-  }
   renderUploadResults();
   const summary = payload.summary || {};
   elements.uploadSummary.textContent =
