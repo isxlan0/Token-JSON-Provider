@@ -827,55 +827,32 @@ function renderUploadResults() {
     return;
   }
   list.innerHTML = "";
-  const history = state.uploadHistory || [];
-  if (!history.length) {
+  if (!state.uploadResults.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "上传完成后会在这里显示历史上传记录。";
+    empty.textContent = "上传完成后会在这里显示每个文件的校验结果。";
     list.appendChild(empty);
     return;
   }
-  history.forEach((batch) => {
-    const header = document.createElement("div");
-    header.className = "upload-result-item";
-    header.innerHTML = `
+  state.uploadResults.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "upload-result-item";
+    row.innerHTML = `
       <div class="upload-result-main">
-        <div class="upload-selected-name">上传记录 ${escapeHtml(batch.created_at || "-")}</div>
-        <div class="upload-selected-meta">
-          共 ${batch.summary?.total ?? 0} 个，成功 ${batch.summary?.accepted ?? 0} 个，
-          重复 ${batch.summary?.duplicates ?? 0} 个
-          ${batch.summary?.queued ? `，排队中 ${batch.summary.queued} 个` : ""}
-          ${batch.summary?.processing ? `，处理中 ${batch.summary.processing} 个` : ""}
-        </div>
+        <div class="upload-selected-name">${escapeHtml(item.file_name || "-")}</div>
+        <div class="upload-selected-meta">${escapeHtml(item.reason || "-")}</div>
       </div>
-      <div class="upload-result-status is-processing">
-        <span>批次</span>
+      <div class="upload-result-status is-${item.status}">
+        <span>${uploadStatusLabel(item.status)}</span>
       </div>
     `;
-    list.appendChild(header);
-    (batch.items || []).forEach((item) => {
-      const metaText = item.queue_position
-        ? `${item.reason || "-"}（队列第 ${item.queue_position} 个）`
-        : (item.reason || "-");
-      const row = document.createElement("div");
-      row.className = "upload-result-item";
-      row.innerHTML = `
-        <div class="upload-result-main">
-          <div class="upload-selected-name">${escapeHtml(item.file_name || "-")}</div>
-          <div class="upload-selected-meta">${escapeHtml(metaText)}</div>
-        </div>
-        <div class="upload-result-status is-${item.status}">
-          <span>${uploadStatusLabel(item.status)}</span>
-        </div>
-      `;
-      list.appendChild(row);
-    });
+    list.appendChild(row);
   });
 }
 
 function applyUploadResultsPayload(payload) {
   state.uploadResults = payload.items || [];
-  state.uploadHistory = payload.history || [];
+  state.uploadHistory = [];
   if (payload?.queue_status) {
     state.queueStatus = payload.queue_status;
     renderQueueStatus();

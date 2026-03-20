@@ -4503,21 +4503,12 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
     key = build_user_upload_results_cache_key(user_id)
     cached = _get_cached_snapshot(key)
     if cached is not None:
-        history = list(cached.get("history") or [])
-        if not history and cached.get("items"):
-            history = [
-                build_upload_history_entry(
-                    str(cached.get("batch_id") or "legacy"),
-                    list(cached.get("items") or []),
-                    created_at=str(cached.get("created_at") or isoformat_now()),
-                )
-            ]
         return {
             "batch_id": cached.get("batch_id"),
             "created_at": cached.get("created_at"),
             "summary": dict(cached.get("summary") or get_default_upload_results_snapshot()["summary"]),
             "items": list(cached.get("items") or []),
-            "history": history,
+            "history": [],
             "queue_status": dict(cached.get("queue_status") or {}) if isinstance(cached.get("queue_status"), dict) else None,
         }
     return get_default_upload_results_snapshot()
@@ -4525,21 +4516,12 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
 
 def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     key = build_user_upload_results_cache_key(user_id)
-    history = list(payload.get("history") or [])
-    if not history and payload.get("items"):
-        history = [
-            build_upload_history_entry(
-                str(payload.get("batch_id") or "latest"),
-                list(payload.get("items") or []),
-                created_at=str(payload.get("created_at") or isoformat_now()),
-            )
-        ]
     normalized = {
         "batch_id": payload.get("batch_id"),
         "created_at": payload.get("created_at"),
         "summary": dict(payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
         "items": list(payload.get("items") or []),
-        "history": history,
+        "history": [],
         "queue_status": dict(payload.get("queue_status") or {}) if isinstance(payload.get("queue_status"), dict) else None,
     }
     return _set_cached_snapshot(key, normalized, get_cache_upload_results_ttl())
@@ -5164,15 +5146,9 @@ def update_user_upload_results_snapshot(
     item_payload: dict[str, Any],
 ) -> dict[str, Any] | None:
     current = get_user_upload_results_snapshot(user_id)
-    history = list(current.get("history") or [])
-    batch_position = next(
-        (index for index, batch in enumerate(history) if batch.get("batch_id") == batch_id),
-        None,
-    )
-    if batch_position is None:
+    if str(current.get("batch_id") or "") != str(batch_id):
         return None
-    batch_entry = dict(history[batch_position])
-    items = list(batch_entry.get("items") or [])
+    items = list(current.get("items") or [])
     target_position = next(
         (
             index
@@ -5186,17 +5162,11 @@ def update_user_upload_results_snapshot(
     merged = dict(items[target_position])
     merged.update(item_payload)
     items[target_position] = merged
-    history[batch_position] = build_upload_history_entry(
-        batch_id,
-        items,
-        created_at=str(batch_entry.get("created_at") or isoformat_now()),
-    )
-    latest = history[0] if history else get_default_upload_results_snapshot()
     payload = build_upload_response(
-        list(latest.get("items") or []),
-        batch_id=latest.get("batch_id"),
-        created_at=latest.get("created_at"),
-        history=history,
+        items,
+        batch_id=str(current.get("batch_id") or batch_id),
+        created_at=str(current.get("created_at") or isoformat_now()),
+        history=[],
         queue_status=get_current_user_queue_status_snapshot(user_id),
     )
     return set_user_upload_results_snapshot(user_id, payload)
@@ -5885,61 +5855,41 @@ def clear_upload_task_status_if_done(batch_id: str) -> None:
 
 
 def apply_runtime_upload_task_status(payload: dict[str, Any]) -> dict[str, Any]:
-    history = list(payload.get("history") or [])
-    if not history:
+    items = list(payload.get("items") or [])
+    batch_id = str(payload.get("batch_id") or "")
+    if not items or not batch_id:
         return payload
     with _UPLOAD_TASK_STATUS_LOCK:
-        runtime = {
-            str(batch_id): {int(idx): dict(item) for idx, item in batch.items()}
-            for batch_id, batch in _UPLOAD_TASK_STATUS.items()
+        runtime_items = {
+            int(idx): dict(item)
+            for idx, item in (_UPLOAD_TASK_STATUS.get(batch_id) or {}).items()
         }
-    if not runtime:
+    if not runtime_items:
         return payload
 
-    updated_history: list[dict[str, Any]] = []
     changed = False
-    for batch in history:
-        batch_id = str(batch.get("batch_id") or "")
-        runtime_items = runtime.get(batch_id)
-        if not runtime_items:
-            updated_history.append(batch)
+    next_items: list[dict[str, Any]] = []
+    for item in items:
+        request_index = item.get("request_index")
+        if request_index is None:
+            next_items.append(item)
             continue
-        items = list(batch.get("items") or [])
-        next_items: list[dict[str, Any]] = []
-        batch_changed = False
-        for item in items:
-            request_index = item.get("request_index")
-            if request_index is None:
-                next_items.append(item)
-                continue
-            runtime_item = runtime_items.get(int(request_index))
-            if not runtime_item:
-                next_items.append(item)
-                continue
-            merged = dict(item)
-            merged.update(runtime_item)
-            next_items.append(merged)
-            if merged != item:
-                batch_changed = True
-        if batch_changed:
+        runtime_item = runtime_items.get(int(request_index))
+        if not runtime_item:
+            next_items.append(item)
+            continue
+        merged = dict(item)
+        merged.update(runtime_item)
+        next_items.append(merged)
+        if merged != item:
             changed = True
-            updated_history.append(
-                build_upload_history_entry(
-                    batch_id,
-                    next_items,
-                    created_at=str(batch.get("created_at") or isoformat_now()),
-                )
-            )
-        else:
-            updated_history.append(batch)
     if not changed:
         return payload
-    latest = updated_history[0] if updated_history else get_default_upload_results_snapshot()
     return build_upload_response(
-        list(latest.get("items") or []),
-        batch_id=latest.get("batch_id"),
-        created_at=latest.get("created_at"),
-        history=updated_history,
+        next_items,
+        batch_id=batch_id,
+        created_at=str(payload.get("created_at") or isoformat_now()),
+        history=[],
         queue_status=payload.get("queue_status") if isinstance(payload.get("queue_status"), dict) else None,
     )
 
@@ -6908,22 +6858,11 @@ def upload_tokens_session(
         )
 
     queue_status_payload = get_current_user_queue_status_snapshot(session["user_id"])
-    previous_snapshot = get_user_upload_results_snapshot(session["user_id"])
-    history = list(previous_snapshot.get("history") or [])
-    history.insert(
-        0,
-        build_upload_history_entry(
-            batch_id,
-            results,
-            created_at=created_at,
-        ),
-    )
-    history = history[:20]
     response_payload = build_upload_response(
         results,
         batch_id=batch_id,
         created_at=created_at,
-        history=history,
+        history=[],
         queue_status=queue_status_payload,
     )
     set_user_upload_results_snapshot(session["user_id"], response_payload)
