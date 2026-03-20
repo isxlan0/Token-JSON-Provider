@@ -34,6 +34,7 @@ const state = {
 };
 
 const elements = {
+  loadingScreen: document.getElementById("loading-screen"),
   loginScreen: document.getElementById("login-screen"),
   appScreen: document.getElementById("app-screen"),
   loginBtn: document.getElementById("linuxdo-login-btn"),
@@ -117,9 +118,13 @@ const elements = {
 };
 
 function showScreen(name) {
+  const loadingVisible = name === "loading";
   const loginVisible = name === "login";
   const appVisible = name === "app";
   const bannedVisible = name === "banned";
+  if (elements.loadingScreen) {
+    elements.loadingScreen.classList.toggle("hidden", !loadingVisible);
+  }
   elements.loginScreen.classList.toggle("hidden", !loginVisible);
   elements.appScreen.classList.toggle("hidden", !appVisible);
   if (elements.bannedScreen) {
@@ -724,7 +729,7 @@ function renderUploadPolicy() {
   }
   elements.uploadPolicy.textContent =
     `上传限制：单次 ${policy.max_files_per_request} 个 / 单文件 ${formatBytes(policy.max_file_size_bytes)} / ` +
-    `每小时成功 ${policy.max_success_per_hour} 个 / 最低信任 ${policy.min_trust_level}`;
+    `每小时最多上传： ${policy.max_success_per_hour} 个 / 最低信任 ${policy.min_trust_level}`;
 }
 
 function renderUploadSelected() {
@@ -1308,6 +1313,7 @@ async function init() {
   renderUploadSelected();
   renderUploadResults();
   setUploadSubmitting(false);
+  showScreen("loading");
   elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
   const url = new URL(window.location.href);
   const authError = url.searchParams.get("auth_error");

@@ -17,7 +17,21 @@
 
 <body class="light-theme">
 
-  <section id="login-screen" class="screen login-screen">
+  <section id="loading-screen" class="screen login-screen">
+    <div class="card login-card loading-card">
+      <div class="brand-logo">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+        </svg>
+      </div>
+      <div class="loading-spinner" aria-hidden="true"></div>
+      <h1>正在加载</h1>
+      <p>正在确认 LinuxDo 登录状态并加载数据面板。</p>
+    </div>
+  </section>
+
+  <section id="login-screen" class="screen login-screen hidden">
     <div class="card login-card">
       <div class="brand-logo">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
