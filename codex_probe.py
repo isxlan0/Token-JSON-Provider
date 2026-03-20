@@ -15,6 +15,10 @@ CODEX_CLIENT_VERSION = "0.101.0"
 CODEX_USER_AGENT = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 
 
+def _probe_log(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] [probe] {message}", flush=True)
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     status: str
@@ -63,10 +67,16 @@ def _apply_codex_headers(request: urllib.request.Request, access_token: str, acc
 def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> ProbeResult:
     access_token, account_id = _extract_credentials(token_content)
     if not access_token:
+        _probe_log(f"[probe-request] missing_access_token account_id={account_id or '-'}")
         return ProbeResult(status="non_401_error", detail="missing_access_token")
 
+    _probe_log(
+        f"[probe-request] start account_id={account_id or '-'} timeout_sec={float(timeout_sec):.1f}"
+    )
     body = {
         "model": "gpt-5",
+        "stream": False,
+        "store": False,
         "instructions": "",
         "input": [
             {
@@ -75,9 +85,11 @@ def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> 
                 "content": [{"type": "input_text", "text": "ping"}],
             }
         ],
+        "parallel_tool_calls": True,
+        "include": ["reasoning.encrypted_content"],
     }
     req = urllib.request.Request(
-        f"{API_BASE_URL}/responses/compact",
+        f"{API_BASE_URL}/responses",
         data=json.dumps(body).encode("utf-8"),
         method="POST",
     )
@@ -85,17 +97,34 @@ def probe_token(token_content: dict[str, Any], *, timeout_sec: float = 20.0) -> 
     try:
         with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_sec))) as resp:
             resp.read()
-        return ProbeResult(status="ok", http_status=200)
+        result = ProbeResult(status="ok", http_status=200)
+        _probe_log(f"[probe-request] success account_id={account_id or '-'} http_status=200")
+        return result
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read().decode("utf-8", errors="replace")
         except Exception:
             detail = ""
         if exc.code == 401:
-            return ProbeResult(status="banned_401", http_status=401, detail=detail)
-        return ProbeResult(status="non_401_error", http_status=exc.code, detail=detail)
+            result = ProbeResult(status="banned_401", http_status=401, detail=detail)
+            _probe_log(
+                f"[probe-request] http_error account_id={account_id or '-'} "
+                f"status=banned_401 http_status=401 detail={detail or '-'}"
+            )
+            return result
+        result = ProbeResult(status="non_401_error", http_status=exc.code, detail=detail)
+        _probe_log(
+            f"[probe-request] http_error account_id={account_id or '-'} "
+            f"status=non_401_error http_status={exc.code} detail={detail or '-'}"
+        )
+        return result
     except Exception as exc:
-        return ProbeResult(status="non_401_error", detail=str(exc))
+        result = ProbeResult(status="non_401_error", detail=str(exc))
+        _probe_log(
+            f"[probe-request] exception account_id={account_id or '-'} "
+            f"status=non_401_error detail={exc}"
+        )
+        return result
 
 
 class CodexProbeQueue:
@@ -115,6 +144,7 @@ class CodexProbeQueue:
             self._stop.clear()
             self._thread = threading.Thread(target=self._worker_loop, name="codex-probe-worker", daemon=True)
             self._thread.start()
+            _probe_log("[probe-worker] started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -124,17 +154,32 @@ class CodexProbeQueue:
             self._thread = None
         if thread is not None:
             thread.join(timeout=5)
+            _probe_log("[probe-worker] stopped")
 
     def submit(self, token_content: dict[str, Any], *, wait_timeout_sec: float | None = None) -> ProbeResult:
         self.start()
         response_queue: queue.Queue[ProbeResult] = queue.Queue(maxsize=1)
+        access_token, account_id = _extract_credentials(token_content)
         self._tasks.put(_ProbeTask(token_content=token_content, response_queue=response_queue))
         timeout = self._timeout_sec + self._delay_sec + 5.0
         if wait_timeout_sec is not None:
             timeout = max(timeout, float(wait_timeout_sec))
+        _probe_log(
+            f"[probe-submit] queued account_id={account_id or '-'} "
+            f"queue_size={self._tasks.qsize()} wait_timeout_sec={timeout:.1f}"
+        )
         try:
-            return response_queue.get(timeout=timeout)
+            result = response_queue.get(timeout=timeout)
+            _probe_log(
+                f"[probe-submit] completed account_id={account_id or '-'} "
+                f"status={result.status} http_status={result.http_status} detail={result.detail or '-'}"
+            )
+            return result
         except queue.Empty:
+            _probe_log(
+                f"[probe-submit] timeout account_id={account_id or '-'} "
+                f"queue_size={self._tasks.qsize()} wait_timeout_sec={timeout:.1f}"
+            )
             return ProbeResult(status="non_401_error", detail="probe_queue_timeout")
 
     def _worker_loop(self) -> None:
@@ -142,12 +187,23 @@ class CodexProbeQueue:
             task = self._tasks.get()
             if task is None:
                 continue
+            _, account_id = _extract_credentials(task.token_content)
+            _probe_log(
+                f"[probe-worker] picked account_id={account_id or '-'} queue_size={self._tasks.qsize()}"
+            )
             wait_for = self._delay_sec - (time.monotonic() - self._last_probe_monotonic)
             if wait_for > 0:
+                _probe_log(
+                    f"[probe-worker] throttling account_id={account_id or '-'} wait_for={wait_for:.2f}s"
+                )
                 time.sleep(wait_for)
             result = probe_token(task.token_content, timeout_sec=self._timeout_sec)
             self._last_probe_monotonic = time.monotonic()
             try:
                 task.response_queue.put_nowait(result)
+                _probe_log(
+                    f"[probe-worker] delivered account_id={account_id or '-'} "
+                    f"status={result.status} http_status={result.http_status}"
+                )
             except queue.Full:
-                pass
+                _probe_log(f"[probe-worker] response_queue_full account_id={account_id or '-'}")

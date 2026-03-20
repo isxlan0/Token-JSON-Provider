@@ -5828,8 +5828,30 @@ def upload_tokens_session(
         if probe_result.is_banned:
             results.append({"request_index": request_index, "file_name": original_name, "status": "banned_401", "reason": "账号已失效或被上游封禁"})
             continue
+        if probe_result.detail == "probe_queue_timeout":
+            results.append(
+                {
+                    "request_index": request_index,
+                    "file_name": original_name,
+                    "status": "probe_timeout",
+                    "reason": "账号探活超时，请稍后重试",
+                }
+            )
+            continue
         if probe_result.status != "ok":
-            results.append({"request_index": request_index, "file_name": original_name, "status": "probe_failed", "reason": "账号探活失败"})
+            reason = "账号探活失败"
+            if probe_result.http_status is not None:
+                reason = f"账号探活请求异常（HTTP {probe_result.http_status}）"
+            elif probe_result.detail:
+                reason = f"账号探活请求异常（{probe_result.detail}）"
+            results.append(
+                {
+                    "request_index": request_index,
+                    "file_name": original_name,
+                    "status": "probe_failed",
+                    "reason": reason,
+                }
+            )
             continue
 
         uploaded_at_ts = now_ts()
