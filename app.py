@@ -409,7 +409,7 @@ class AppCache:
     def backend_name(self) -> str:
         return self._backend_name
 
-    def configure(self) -> None:
+    def configure(self, *, emit_log: bool = False) -> None:
         mode = env_value(CACHE_BACKEND_ENV, "auto").strip().lower() or "auto"
         prefix = env_value(REDIS_PREFIX_ENV, "token_index:")
         redis_url = env_value(REDIS_URL_ENV, "")
@@ -417,6 +417,7 @@ class AppCache:
         redis_password = env_value(REDIS_PASSWORD_ENV, "")
         backend_name = "memory"
         backend: CacheBackend = MemoryCacheBackend()
+        log_message = "[cache] using in-memory cache backend"
 
         if mode in {"auto", "redis"} and redis_url:
             try:
@@ -427,13 +428,27 @@ class AppCache:
                     password=redis_password,
                 )
                 backend_name = "redis"
-            except Exception:
+                log_message = (
+                    f"[cache] Redis connected successfully: backend=redis url={redis_url} "
+                    f"prefix={prefix} username={'<set>' if redis_username else '<empty>'}"
+                )
+            except Exception as exc:
+                log_message = (
+                    f"[cache] Redis connection failed: backend={mode} url={redis_url} "
+                    f"reason={exc}. Falling back to in-memory cache."
+                )
                 if mode == "redis":
                     backend_name = "memory"
+        elif mode == "redis":
+            log_message = "[cache] Redis backend requested but TOKEN_REDIS_URL is empty. Falling back to in-memory cache."
+        elif mode == "memory":
+            log_message = "[cache] using in-memory cache backend (forced by TOKEN_CACHE_BACKEND=memory)"
 
         with self._lock:
             self._backend = backend
             self._backend_name = backend_name
+        if emit_log:
+            print(log_message, flush=True)
 
     def get_json(self, key: str) -> Any | None:
         with self._lock:
@@ -3425,7 +3440,7 @@ _TOKEN_IMPORT_INTERVAL_SEC = 60.0
 _API_KEY_CACHE_LOCK = threading.RLock()
 _API_KEY_CACHE_BY_HASH: dict[str, dict[str, Any]] = {}
 _APP_CACHE = AppCache()
-_APP_CACHE.configure()
+_APP_CACHE.configure(emit_log=False)
 _DASHBOARD_CACHE = DashboardMemoryCache()
 
 
@@ -3490,7 +3505,7 @@ def _token_import_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    _APP_CACHE.configure()
+    _APP_CACHE.configure(emit_log=True)
     db.init_db()
     sync_tokens_with_retry(db, TOKEN_DIR)
     try_fulfill_queue(db)
