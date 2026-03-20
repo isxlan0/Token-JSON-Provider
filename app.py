@@ -3305,7 +3305,7 @@ class TokenDb:
                 return _fetch(target_conn)
         return _fetch(conn)
 
-    def ensure_inventory_policy(self, *, conn=None) -> dict[str, Any]:
+    def ensure_inventory_policy(self, *, conn=None, refresh_existing_scope: bool = True) -> dict[str, Any]:
         def _ensure(target_conn):
             policy = get_inventory_policy(self, conn=target_conn, force=True)
             status = policy["status"]
@@ -3373,10 +3373,11 @@ class TokenDb:
                 _POLICY_STATE["status"] = status
                 _POLICY_STATE["max_claims"] = max_claims
             elif runtime_state:
-                now = now_ts()
-                _apply_non_healthy_scope(now)
                 _POLICY_STATE["status"] = runtime_state["status"]
                 _POLICY_STATE["max_claims"] = int(runtime_state["max_claims"])
+                if refresh_existing_scope:
+                    now = now_ts()
+                    _apply_non_healthy_scope(now)
             return policy
 
         if conn is None:
@@ -3548,7 +3549,7 @@ class TokenDb:
         queued_created = False
         queued_result: dict[str, Any] | None = None
         with self.connect() as conn:
-            self.ensure_inventory_policy(conn=conn)
+            self.ensure_inventory_policy(conn=conn, refresh_existing_scope=False)
             batch_limit = get_claim_batch_limit(self, conn=conn)
             requested = min(requested, batch_limit)
             used_row = conn.execute(
