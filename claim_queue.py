@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import time
 from typing import Any
 
@@ -190,48 +191,54 @@ def fulfill_queue(
             if allowed <= 0:
                 continue
 
-            token_rows = conn.execute(
-                """
-                SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
-                FROM tokens
-                WHERE is_active = 1 AND is_available = 1 AND claim_count < max_claims
-                ORDER BY
-                    CASE WHEN claim_count > 0 THEN 0 ELSE 1 END ASC,
-                    created_at_ts ASC,
-                    id ASC
-                LIMIT ?
-                """,
-                (allowed,),
-            ).fetchall()
+            token_rows = db.list_claimable_tokens_for_user(conn, user_id, allowed)
 
             if not token_rows:
-                break
+                continue
 
+            granted = 0
             for token in token_rows:
                 token_id = int(token["id"])
                 new_count = int(token["claim_count"]) + 1
                 new_available = 1 if new_count < int(token["max_claims"]) else 0
-                conn.execute(
-                    """
-                    UPDATE tokens
-                    SET claim_count = ?,
-                        is_available = ?,
-                        updated_at_ts = ?
-                    WHERE id = ?
-                    """,
-                    (new_count, new_available, now, token_id),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO token_claims (
-                        token_id, user_id, api_key_id, claimed_at_ts, is_hidden, request_id
-                    ) VALUES (?, ?, ?, ?, 0, ?)
-                    """,
-                    (token_id, user_id, api_key_id, now, row["request_id"]),
-                )
+                savepoint = f"queue_claim_{queue_id}_{token_id}"
+                try:
+                    conn.execute(f"SAVEPOINT {savepoint}")
+                    conn.execute(
+                        """
+                        UPDATE tokens
+                        SET claim_count = ?,
+                            is_available = ?,
+                            updated_at_ts = ?
+                        WHERE id = ?
+                        """,
+                        (new_count, new_available, now, token_id),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO token_claims (
+                            token_id, user_id, api_key_id, claimed_at_ts, is_hidden, request_id
+                        ) VALUES (?, ?, ?, ?, 0, ?)
+                        """,
+                        (token_id, user_id, api_key_id, now, row["request_id"]),
+                    )
+                    claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    conn.execute(
+                        """
+                        INSERT INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (user_id, token_id, claim_id, now),
+                    )
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except sqlite3.IntegrityError:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    continue
                 fulfilled += 1
+                granted += 1
 
-            remaining_after = remaining - len(token_rows)
+            remaining_after = remaining - granted
             if remaining_after <= 0:
                 conn.execute(
                     "DELETE FROM claim_queue WHERE id = ?",

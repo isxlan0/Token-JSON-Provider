@@ -249,6 +249,10 @@ class AdminBanPayload(BaseModel):
     expires_at: str | None = None
 
 
+class TokenCleanupPayload(BaseModel):
+    mode: str = "files_only"
+
+
 class LinuxDOUser(BaseModel):
     id: int
     username: str
@@ -577,10 +581,26 @@ class TokenDb:
                     api_key_id INTEGER,
                     claimed_at_ts INTEGER NOT NULL,
                     is_hidden INTEGER NOT NULL DEFAULT 0,
+                    claim_file_name TEXT,
+                    claim_file_path TEXT,
+                    claim_encoding TEXT,
+                    claim_content_json TEXT,
                     request_id TEXT NOT NULL,
                     FOREIGN KEY(token_id) REFERENCES tokens(id),
                     FOREIGN KEY(user_id) REFERENCES users(id),
                     FOREIGN KEY(api_key_id) REFERENCES api_keys(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS user_token_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    token_id INTEGER NOT NULL,
+                    first_claim_id INTEGER NOT NULL,
+                    created_at_ts INTEGER NOT NULL,
+                    UNIQUE(user_id, token_id),
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    FOREIGN KEY(token_id) REFERENCES tokens(id),
+                    FOREIGN KEY(first_claim_id) REFERENCES token_claims(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS claim_queue (
@@ -619,6 +639,8 @@ class TokenDb:
                     ON token_claims(user_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
                     ON token_claims(api_key_id, claimed_at_ts);
+                CREATE INDEX IF NOT EXISTS idx_user_token_claims_user
+                    ON user_token_claims(user_id, token_id);
                 CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
                     ON claim_queue(status, enqueued_at_ts, id);
                 CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
@@ -631,6 +653,14 @@ class TokenDb:
             }
             if "is_hidden" not in claims_columns:
                 conn.execute("ALTER TABLE token_claims ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0")
+            if "claim_file_name" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN claim_file_name TEXT")
+            if "claim_file_path" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN claim_file_path TEXT")
+            if "claim_encoding" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN claim_encoding TEXT")
+            if "claim_content_json" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN claim_content_json TEXT")
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(api_keys)").fetchall()
@@ -649,6 +679,62 @@ class TokenDb:
                 conn.execute("ALTER TABLE tokens ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
             if "cleaned_at_ts" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN cleaned_at_ts INTEGER")
+            conn.execute(
+                """
+                UPDATE token_claims
+                SET claim_file_name = COALESCE(
+                        claim_file_name,
+                        (SELECT tokens.file_name FROM tokens WHERE tokens.id = token_claims.token_id)
+                    ),
+                    claim_file_path = COALESCE(
+                        claim_file_path,
+                        (SELECT tokens.file_path FROM tokens WHERE tokens.id = token_claims.token_id)
+                    ),
+                    claim_encoding = COALESCE(
+                        claim_encoding,
+                        (SELECT tokens.encoding FROM tokens WHERE tokens.id = token_claims.token_id)
+                    ),
+                    claim_content_json = COALESCE(
+                        claim_content_json,
+                        (SELECT tokens.content_json FROM tokens WHERE tokens.id = token_claims.token_id)
+                    )
+                WHERE claim_file_name IS NULL
+                   OR claim_file_path IS NULL
+                   OR claim_encoding IS NULL
+                   OR claim_content_json IS NULL
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
+                SELECT claims.user_id,
+                       claims.token_id,
+                       claims.id,
+                       claims.claimed_at_ts
+                FROM token_claims AS claims
+                JOIN (
+                    SELECT user_id, token_id, MIN(id) AS first_claim_id
+                    FROM token_claims
+                    GROUP BY user_id, token_id
+                ) AS firsts
+                  ON firsts.user_id = claims.user_id
+                 AND firsts.token_id = claims.token_id
+                 AND firsts.first_claim_id = claims.id
+                """
+            )
+            conn.execute(
+                """
+                UPDATE token_claims
+                SET is_hidden = 1
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM user_token_claims
+                    WHERE user_token_claims.user_id = token_claims.user_id
+                      AND user_token_claims.token_id = token_claims.token_id
+                      AND user_token_claims.first_claim_id <> token_claims.id
+                )
+                """
+            )
 
     def _get_runtime_policy_state(self, conn: sqlite3.Connection) -> dict[str, Any] | None:
         row = conn.execute(
@@ -1253,9 +1339,10 @@ class TokenDb:
             ).fetchone()
             recent_claim_rows = conn.execute(
                 """
-                SELECT token_claims.claimed_at_ts, tokens.file_name
+                SELECT token_claims.claimed_at_ts,
+                       COALESCE(token_claims.claim_file_name, tokens.file_name) as file_name
                 FROM token_claims
-                JOIN tokens ON tokens.id = token_claims.token_id
+                LEFT JOIN tokens ON tokens.id = token_claims.token_id
                 WHERE token_claims.user_id = ?
                 ORDER BY token_claims.claimed_at_ts DESC, token_claims.id DESC
                 LIMIT 20
@@ -1411,6 +1498,20 @@ class TokenDb:
         }
 
     def cleanup_exhausted_tokens(self, token_dir: Path) -> dict[str, Any]:
+        return self.cleanup_exhausted_tokens_with_mode(token_dir, mode="files_and_db")
+
+    def vacuum_database(self, *, timeout_s: float = 60.0) -> None:
+        with self._lock:
+            with self.connect(timeout=timeout_s) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            with self.connect(timeout=timeout_s) as conn:
+                conn.execute("VACUUM")
+
+    def cleanup_exhausted_tokens_with_mode(self, token_dir: Path, *, mode: str) -> dict[str, Any]:
+        normalized_mode = (mode or "").strip().lower()
+        if normalized_mode not in {"files_only", "files_and_db"}:
+            raise ValueError("Invalid cleanup mode.")
+        compact_db_content = normalized_mode == "files_and_db"
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -1445,6 +1546,7 @@ class TokenDb:
         with self._lock, self.connect(timeout=3.0) as conn:
             if cleaned_ids:
                 placeholders = ",".join("?" for _ in cleaned_ids)
+                content_sql = "content_json = '{}'," if compact_db_content else ""
                 conn.execute(
                     f"""
                     UPDATE tokens
@@ -1452,7 +1554,7 @@ class TokenDb:
                         is_cleaned = 1,
                         is_enabled = 0,
                         is_available = 0,
-                        content_json = '{{}}',
+                        {content_sql}
                         cleaned_at_ts = ?,
                         updated_at_ts = ?,
                         last_seen_at_ts = ?
@@ -1460,29 +1562,36 @@ class TokenDb:
                     """,
                     (now, now, now, *cleaned_ids),
                 )
-            compacted_cursor = conn.execute(
-                """
-                UPDATE tokens
-                SET content_json = '{}',
-                    updated_at_ts = CASE
-                        WHEN is_cleaned = 1 AND content_json != '{}' THEN ?
-                        ELSE updated_at_ts
-                    END
-                WHERE is_cleaned = 1 AND content_json != '{}'
-                """,
-                (now,),
-            )
-            compacted_content = int(compacted_cursor.rowcount or 0)
+            if compact_db_content:
+                compacted_cursor = conn.execute(
+                    """
+                    UPDATE tokens
+                    SET content_json = '{}',
+                        updated_at_ts = CASE
+                            WHEN is_cleaned = 1 AND content_json != '{}' THEN ?
+                            ELSE updated_at_ts
+                        END
+                    WHERE is_cleaned = 1 AND content_json != '{}'
+                    """,
+                    (now,),
+                )
+                compacted_content = int(compacted_cursor.rowcount or 0)
             self.ensure_inventory_policy(conn=conn)
         if cleaned_ids or compacted_content:
             _refresh_dashboard_memory()
+        vacuumed = False
+        if compact_db_content and compacted_content > 0:
+            self.vacuum_database()
+            vacuumed = True
 
         return {
+            "mode": normalized_mode,
             "matched": len(rows),
             "cleaned": len(cleaned_ids),
             "deleted_files": deleted_files,
             "missing_files": missing_files,
             "compacted_content": compacted_content,
+            "vacuumed": vacuumed,
             "failed": failed,
         }
 
@@ -1925,6 +2034,55 @@ class TokenDb:
         total = int(row["cnt"]) if row else 0
         return {"total": total}
 
+    def count_claimable_tokens_for_user(self, conn: sqlite3.Connection, user_id: int) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) as cnt
+            FROM tokens
+            WHERE is_active = 1
+              AND is_enabled = 1
+              AND is_available = 1
+              AND claim_count < max_claims
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM user_token_claims
+                  WHERE user_token_claims.user_id = ?
+                    AND user_token_claims.token_id = tokens.id
+              )
+            """,
+            (user_id,),
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def list_claimable_tokens_for_user(
+        self,
+        conn: sqlite3.Connection,
+        user_id: int,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
+            FROM tokens
+            WHERE is_active = 1
+              AND is_enabled = 1
+              AND is_available = 1
+              AND claim_count < max_claims
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM user_token_claims
+                  WHERE user_token_claims.user_id = ?
+                    AND user_token_claims.token_id = tokens.id
+              )
+            ORDER BY
+                CASE WHEN claim_count > 0 THEN 0 ELSE 1 END ASC,
+                created_at_ts ASC,
+                id ASC
+            LIMIT ?
+            """,
+            (user_id, max(0, int(limit))),
+        ).fetchall()
+
     def claim_tokens(
         self,
         user_id: int,
@@ -1996,14 +2154,7 @@ class TokenDb:
                     "quota": {"used": used, "limit": limit, "remaining": remaining},
                 }
             else:
-                available_row = conn.execute(
-                    """
-                    SELECT COUNT(*) as cnt
-                    FROM tokens
-                    WHERE is_active = 1 AND is_enabled = 1 AND is_available = 1 AND claim_count < max_claims
-                    """
-                ).fetchone()
-                available = int(available_row["cnt"]) if available_row else 0
+                available = self.count_claimable_tokens_for_user(conn, user_id)
                 if available < target:
                     queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
                     result = {
@@ -2018,19 +2169,7 @@ class TokenDb:
                         "quota": {"used": used, "limit": limit, "remaining": remaining},
                     }
                 else:
-                    rows = conn.execute(
-                        """
-                        SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims
-                        FROM tokens
-                        WHERE is_active = 1 AND is_enabled = 1 AND is_available = 1 AND claim_count < max_claims
-                        ORDER BY
-                            CASE WHEN claim_count > 0 THEN 0 ELSE 1 END ASC,
-                            created_at_ts ASC,
-                            id ASC
-                        LIMIT ?
-                        """,
-                        (target,),
-                    ).fetchall()
+                    rows = self.list_claimable_tokens_for_user(conn, user_id, target)
 
                     if not rows:
                         queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
@@ -2051,25 +2190,53 @@ class TokenDb:
                             token_id = int(row["id"])
                             new_count = int(row["claim_count"]) + 1
                             new_available = 1 if new_count < int(row["max_claims"]) else 0
-                            conn.execute(
-                                """
-                                UPDATE tokens
-                                SET claim_count = ?,
-                                    is_available = ?,
-                                    updated_at_ts = ?
-                                WHERE id = ?
-                                """,
-                                (new_count, new_available, now, token_id),
-                            )
-                            conn.execute(
-                                """
-                                INSERT INTO token_claims (
-                                    token_id, user_id, api_key_id, claimed_at_ts, is_hidden, request_id
-                                ) VALUES (?, ?, ?, ?, 0, ?)
-                                """,
-                                (token_id, user_id, api_key_id, now, request_id),
-                            )
-                            claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                            savepoint = f"claim_token_{token_id}"
+                            claim_id: int | None = None
+                            try:
+                                conn.execute(f"SAVEPOINT {savepoint}")
+                                conn.execute(
+                                    """
+                                    UPDATE tokens
+                                    SET claim_count = ?,
+                                        is_available = ?,
+                                        updated_at_ts = ?
+                                    WHERE id = ?
+                                    """,
+                                    (new_count, new_available, now, token_id),
+                                )
+                                conn.execute(
+                                    """
+                                    INSERT INTO token_claims (
+                                        token_id, user_id, api_key_id, claimed_at_ts, is_hidden,
+                                        claim_file_name, claim_file_path, claim_encoding, claim_content_json,
+                                        request_id
+                                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        token_id,
+                                        user_id,
+                                        api_key_id,
+                                        now,
+                                        row["file_name"],
+                                        row["file_path"],
+                                        row["encoding"],
+                                        row["content_json"],
+                                        request_id,
+                                    ),
+                                )
+                                claim_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                                conn.execute(
+                                    """
+                                    INSERT INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
+                                    VALUES (?, ?, ?, ?)
+                                    """,
+                                    (user_id, token_id, claim_id, now),
+                                )
+                                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                            except sqlite3.IntegrityError:
+                                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                                continue
 
                             items.append(
                                 {
@@ -2102,10 +2269,14 @@ class TokenDb:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT tokens.id, tokens.file_name, tokens.file_path, tokens.encoding, tokens.content_json
-                FROM tokens
-                JOIN token_claims ON token_claims.token_id = tokens.id
-                WHERE tokens.id = ? AND token_claims.user_id = ? AND token_claims.is_hidden = 0
+                SELECT token_claims.token_id as token_id,
+                       COALESCE(token_claims.claim_file_name, tokens.file_name) as file_name,
+                       COALESCE(token_claims.claim_file_path, tokens.file_path) as file_path,
+                       COALESCE(token_claims.claim_encoding, tokens.encoding) as encoding,
+                       COALESCE(token_claims.claim_content_json, tokens.content_json) as content_json
+                FROM token_claims
+                LEFT JOIN tokens ON tokens.id = token_claims.token_id
+                WHERE token_claims.token_id = ? AND token_claims.user_id = ? AND token_claims.is_hidden = 0
                 LIMIT 1
                 """,
                 (token_id, user_id),
@@ -2113,7 +2284,7 @@ class TokenDb:
         if not row:
             return None
         return {
-            "token_id": int(row["id"]),
+            "token_id": int(row["token_id"]),
             "file_name": row["file_name"],
             "file_path": row["file_path"],
             "encoding": row["encoding"],
@@ -2127,13 +2298,13 @@ class TokenDb:
                 SELECT token_claims.id as claim_id,
                        token_claims.claimed_at_ts,
                        token_claims.request_id,
-                       tokens.id as token_id,
-                       tokens.file_name,
-                       tokens.file_path,
-                       tokens.encoding,
-                       tokens.content_json
+                       token_claims.token_id as token_id,
+                       COALESCE(token_claims.claim_file_name, tokens.file_name) as file_name,
+                       COALESCE(token_claims.claim_file_path, tokens.file_path) as file_path,
+                       COALESCE(token_claims.claim_encoding, tokens.encoding) as encoding,
+                       COALESCE(token_claims.claim_content_json, tokens.content_json) as content_json
                 FROM token_claims
-                JOIN tokens ON tokens.id = token_claims.token_id
+                LEFT JOIN tokens ON tokens.id = token_claims.token_id
                 WHERE token_claims.user_id = ? AND token_claims.is_hidden = 0
                 ORDER BY token_claims.claimed_at_ts DESC, token_claims.id DESC
                 """,
@@ -2190,15 +2361,20 @@ class TokenDb:
             total_queued = int(total_row["cnt"]) if total_row else 0
             available_row = conn.execute(
                 """
-                SELECT COALESCE(SUM(
-                    CASE
-                        WHEN claim_count < max_claims THEN max_claims - claim_count
-                        ELSE 0
-                    END
-                ), 0) as cnt
+                SELECT COUNT(*) as cnt
                 FROM tokens
                 WHERE is_active = 1 AND is_enabled = 1
+                  AND is_available = 1
+                  AND claim_count < max_claims
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM user_token_claims
+                      WHERE user_token_claims.user_id = ?
+                        AND user_token_claims.token_id = tokens.id
+                  )
                 """
+                ,
+                (user_id,),
             ).fetchone()
             available = int(available_row["cnt"]) if available_row else 0
         return {
@@ -2233,12 +2409,12 @@ class TokenDb:
             rows = conn.execute(
                 """
                 SELECT token_claims.id as claim_id,
-                       tokens.file_name,
-                       tokens.file_path,
-                       tokens.encoding,
-                       tokens.content_json
+                       COALESCE(token_claims.claim_file_name, tokens.file_name) as file_name,
+                       COALESCE(token_claims.claim_file_path, tokens.file_path) as file_path,
+                       COALESCE(token_claims.claim_encoding, tokens.encoding) as encoding,
+                       COALESCE(token_claims.claim_content_json, tokens.content_json) as content_json
                 FROM token_claims
-                JOIN tokens ON tokens.id = token_claims.token_id
+                LEFT JOIN tokens ON tokens.id = token_claims.token_id
                 WHERE token_claims.user_id = ? AND token_claims.is_hidden = 0
                 ORDER BY token_claims.claimed_at_ts DESC, token_claims.id DESC
                 """,
@@ -2261,17 +2437,17 @@ class TokenDb:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT tokens.id as token_id,
-                       tokens.file_name,
-                       tokens.file_path,
-                       tokens.encoding,
-                       tokens.content_json,
+                SELECT token_claims.token_id as token_id,
+                       COALESCE(token_claims.claim_file_name, tokens.file_name) as file_name,
+                       COALESCE(token_claims.claim_file_path, tokens.file_path) as file_path,
+                       COALESCE(token_claims.claim_encoding, tokens.encoding) as encoding,
+                       COALESCE(token_claims.claim_content_json, tokens.content_json) as content_json,
                        MAX(token_claims.claimed_at_ts) as last_claimed_ts
                 FROM token_claims
-                JOIN tokens ON tokens.id = token_claims.token_id
+                LEFT JOIN tokens ON tokens.id = token_claims.token_id
                 WHERE token_claims.user_id = ? AND token_claims.is_hidden = 0
-                GROUP BY tokens.id, tokens.file_name, tokens.file_path, tokens.encoding, tokens.content_json
-                ORDER BY last_claimed_ts DESC, tokens.id DESC
+                GROUP BY token_claims.token_id, file_name, file_path, encoding, content_json
+                ORDER BY last_claimed_ts DESC, token_claims.token_id DESC
                 """,
                 (user_id,),
             ).fetchall()
@@ -3177,11 +3353,18 @@ def admin_deactivate_token(request: Request, token_id: int) -> dict[str, Any]:
 
 
 @app.post("/admin/tokens/cleanup-exhausted")
-def admin_cleanup_exhausted_tokens(request: Request) -> dict[str, Any]:
+def admin_cleanup_exhausted_tokens(
+    request: Request,
+    payload: TokenCleanupPayload | None = Body(default=None),
+) -> dict[str, Any]:
     require_admin_user(request)
+    mode = (payload.mode if payload else "files_only").strip().lower()
+    if mode not in {"files_only", "files_and_db"}:
+        error_json = json.dumps({"detail": "Invalid cleanup mode."}, ensure_ascii=False).encode("utf-8")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
     try:
         result = run_db_write_with_retry(
-            lambda: db.cleanup_exhausted_tokens(TOKEN_DIR),
+            lambda: db.cleanup_exhausted_tokens_with_mode(TOKEN_DIR, mode=mode),
             retries=2,
             delay_sec=0.2,
         )

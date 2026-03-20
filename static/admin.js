@@ -49,7 +49,8 @@ const elements = {
   tokenFilter: document.getElementById("admin-token-filter"),
   tokenLimit: document.getElementById("admin-token-limit"),
   tokenRefresh: document.getElementById("admin-token-refresh"),
-  tokenCleanup: document.getElementById("admin-token-cleanup"),
+  tokenCleanupFiles: document.getElementById("admin-token-cleanup-files"),
+  tokenCleanupDb: document.getElementById("admin-token-cleanup-db"),
   tokenList: document.getElementById("admin-token-list"),
   tokenPager: document.getElementById("admin-token-pager"),
   policyPanel: document.getElementById("admin-policy-panel"),
@@ -486,15 +487,29 @@ async function loadPolicy() {
   renderPolicy();
 }
 
-async function cleanupExhaustedTokens() {
-  if (!window.confirm("这会删除 token 目录中所有已领完账号的文件，并在数据库里标记为已清理，同时压缩历史已清理账号的内容。是否继续？")) {
+async function cleanupExhaustedTokens(mode) {
+  const filesOnly = mode === "files_only";
+  const confirmText = filesOnly
+    ? "这会删除 token 目录中所有已领完账号的文件，并在数据库里标记为已删除。历史已领取记录仍可查看，但不会再分发给新用户。是否继续？"
+    : "这会删除 token 目录中所有已领完账号的文件，清空数据库中的账号内容并压缩数据库。历史已领取记录仍可查看。是否继续？";
+  if (!window.confirm(confirmText)) {
     return;
   }
-  const restoreButton = setButtonPending(elements.tokenCleanup, "清理中...");
-  showNotice("正在清理已领完账号...");
+  const targetButton = filesOnly ? elements.tokenCleanupFiles : elements.tokenCleanupDb;
+  const restoreButton = setButtonPending(targetButton, "清理中...");
+  showNotice(filesOnly ? "正在删除文件并标记已删除..." : "正在删除文件、清理数据库并压缩...");
   try {
-    const result = await fetchJson("/admin/tokens/cleanup-exhausted", { method: "POST" });
-    showNotice(`清理完成：处理 ${result.cleaned || 0} 个账号，删除文件 ${result.deleted_files || 0} 个，压缩历史内容 ${result.compacted_content || 0} 个`);
+    const result = await fetchJson("/admin/tokens/cleanup-exhausted", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    const vacuumText = result.vacuumed ? "，已压缩数据库" : "";
+    showNotice(
+      filesOnly
+        ? `清理完成：处理 ${result.cleaned || 0} 个账号，删除文件 ${result.deleted_files || 0} 个${vacuumText}`
+        : `清理完成：处理 ${result.cleaned || 0} 个账号，删除文件 ${result.deleted_files || 0} 个，清空数据库内容 ${result.compacted_content || 0} 个${vacuumText}`
+    );
     await Promise.all([loadTokens(), loadPolicy()]);
   } catch (error) {
     showNotice(error.message, "error");
@@ -581,7 +596,8 @@ function bindEvents() {
   elements.userRefresh?.addEventListener("click", () => loadUsers(true));
   elements.banRefresh?.addEventListener("click", () => loadBans(true));
   elements.tokenRefresh?.addEventListener("click", () => loadTokens(true));
-  elements.tokenCleanup?.addEventListener("click", cleanupExhaustedTokens);
+  elements.tokenCleanupFiles?.addEventListener("click", () => cleanupExhaustedTokens("files_only"));
+  elements.tokenCleanupDb?.addEventListener("click", () => cleanupExhaustedTokens("files_and_db"));
   elements.userSearch?.addEventListener("keydown", (event) => event.key === "Enter" && loadUsers(true));
   elements.banSearch?.addEventListener("keydown", (event) => event.key === "Enter" && loadBans(true));
   elements.tokenSearch?.addEventListener("keydown", (event) => event.key === "Enter" && loadTokens(true));

@@ -153,7 +153,8 @@
               <option value="50" selected>每页 50</option>
               <option value="100">每页 100</option>
             </select>
-            <button id="admin-token-cleanup" class="btn btn-outline" type="button">删除历史已领取账号</button>
+            <button id="admin-token-cleanup-files" class="btn btn-outline" type="button">仅删文件并标记已删除</button>
+            <button id="admin-token-cleanup-db" class="btn btn-outline" type="button">删文件并清数据库后压缩</button>
             <button id="admin-token-refresh" class="btn btn-outline" type="button">刷新</button>
           </div>
           <div id="admin-token-list" class="admin-list token-list"></div>
@@ -167,7 +168,7 @@
     </main>
   </section>
 
-  <script src="/assets/admin.js?v=20260318b" defer></script>
+  <script src="/assets/admin.js?v=20260320a" defer></script>
 </body>
 
 </html>
