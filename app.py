@@ -49,12 +49,16 @@ STATIC_DIR = BASE_DIR / "static"
 ENV_FILE = BASE_DIR / ".env"
 
 
+def _format_runtime_log(tag: str, message: str) -> str:
+    return f"[{time.strftime('%H:%M:%S')}] [{tag}] {message}"
+
+
 def startup_log(message: str) -> None:
-    print(f"[startup] {message}", flush=True)
+    print(_format_runtime_log("startup", message), flush=True)
 
 
 def token_import_log(message: str) -> None:
-    print(f"[token-import] {message}", flush=True)
+    print(_format_runtime_log("token-import", message), flush=True)
 
 
 def count_token_files(token_dir: Path) -> int | None:
@@ -4533,7 +4537,7 @@ _TOKEN_IMPORT_QUEUE: queue.Queue[tuple[str, int, str]] = queue.Queue()
 _TOKEN_IMPORT_PENDING_LOCK = threading.RLock()
 _TOKEN_IMPORT_PENDING_FILES: set[str] = set()
 _TOKEN_IMPORT_INTERNAL_WRITES: dict[str, float] = {}
-_TOKEN_IMPORT_RETRY_DELAY_SEC = 0.5
+_TOKEN_IMPORT_RETRY_DELAY_SEC = 0.2
 _TOKEN_IMPORT_MAX_RETRIES = 8
 _TOKEN_IMPORT_INTERNAL_WRITE_TTL_SEC = 30.0
 _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC = 30.0
@@ -4663,27 +4667,11 @@ def _clear_token_import_queue() -> None:
             _TOKEN_IMPORT_QUEUE.task_done()
 
 
-def _wait_for_token_file_ready(path: Path) -> bool:
-    stable_size: int | None = None
-    stable_hits = 0
-    for _ in range(8):
-        if _TOKEN_IMPORT_STOP.is_set():
-            return False
-        try:
-            stat = path.stat()
-            size = int(stat.st_size)
-        except OSError:
-            time.sleep(_TOKEN_IMPORT_RETRY_DELAY_SEC)
-            continue
-        if size == stable_size:
-            stable_hits += 1
-        else:
-            stable_size = size
-            stable_hits = 1
-        if stable_hits >= 2:
-            return True
-        time.sleep(_TOKEN_IMPORT_RETRY_DELAY_SEC)
-    return path.exists()
+def _is_token_file_present(path: Path) -> bool:
+    try:
+        return path.exists() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _startup_reconcile_token_files() -> dict[str, int]:
@@ -4739,7 +4727,7 @@ def _poll_token_directory_changes(previous_stats: dict[str, tuple[int, int]]) ->
 def _drain_token_import_batch(
     first_task: tuple[str, int, str],
     *,
-    max_batch_size: int = 128,
+    max_batch_size: int = 1024,
 ) -> list[tuple[str, int, str]]:
     tasks = [first_task]
     while len(tasks) < max_batch_size:
@@ -4755,22 +4743,27 @@ def _handle_token_import_results(
     results: list[dict[str, Any]],
 ) -> bool:
     imported_any = False
+    summary = {"imported": 0, "updated": 0, "deactivated": 0, "skipped": 0, "ignored": 0, "failed": 0}
     for (file_name, attempt, reason), result in zip(tasks, results):
         status = str(result.get("status", "unknown"))
         if status in {"imported", "updated"}:
             imported_any = True
+            summary[status] += 1
             token_import_log(f"imported file={file_name} reason={reason}")
             _release_token_import(file_name)
             continue
         if status == "deactivated":
+            summary["deactivated"] += 1
             token_import_log(f"deactivated file={file_name} reason={result.get('reason', reason)}")
             _release_token_import(file_name)
             continue
         if status == "skipped":
+            summary["skipped"] += 1
             token_import_log(f"skipped file={file_name} reason={result.get('reason', 'unknown')}")
             _release_token_import(file_name)
             continue
         if status == "ignored":
+            summary["ignored"] += 1
             _release_token_import(file_name)
             continue
 
@@ -4786,8 +4779,15 @@ def _handle_token_import_results(
                 attempt=attempt + 1,
             )
             continue
+        summary["failed"] += 1
         token_import_log(f"failed file={file_name} reason={result.get('reason', 'unknown')} attempts={attempt + 1}")
         _release_token_import(file_name)
+    token_import_log(
+        "batch result "
+        f"size={len(tasks)} imported={summary['imported']} updated={summary['updated']} "
+        f"deactivated={summary['deactivated']} skipped={summary['skipped']} "
+        f"failed={summary['failed']}"
+    )
     return imported_any
 
 
@@ -4797,7 +4797,7 @@ def _process_token_import_batch(tasks: list[tuple[str, int, str]]) -> None:
 
     for file_name, attempt, reason in tasks:
         path = TOKEN_DIR / file_name
-        if _wait_for_token_file_ready(path):
+        if _is_token_file_present(path):
             ready_tasks.append((file_name, attempt, reason))
             ready_paths.append(path)
             continue
