@@ -4,6 +4,8 @@ import base64
 import binascii
 from contextlib import asynccontextmanager
 import hashlib
+import heapq
+import itertools
 import json
 import io
 import os
@@ -59,6 +61,10 @@ def startup_log(message: str) -> None:
 
 def token_import_log(message: str) -> None:
     print(_format_runtime_log("token-import", message), flush=True)
+
+
+def upload_log(message: str) -> None:
+    print(_format_runtime_log("upload", message), flush=True)
 
 
 def count_token_files(token_dir: Path) -> int | None:
@@ -3974,8 +3980,10 @@ def get_queue_total_snapshot(db_handle: "TokenDb") -> int:
 
 
 def refresh_queue_total_snapshot(db_handle: "TokenDb") -> int:
+    before = _DASHBOARD_CACHE.get_system_status()["queue"].get("total", 0)
     total = get_queue_total_snapshot(db_handle)
     _DASHBOARD_CACHE.set_queue_total(total)
+    token_import_log(f"[queue-refresh] total={before}->{total}")
     return total
 
 
@@ -4534,8 +4542,12 @@ _QUEUE_PUMP_INTERVAL_SEC = 20.0
 _TOKEN_IMPORT_THREAD: threading.Thread | None = None
 _TOKEN_IMPORT_STOP = threading.Event()
 _TOKEN_IMPORT_QUEUE: queue.Queue[tuple[str, int, str]] = queue.Queue()
+_TOKEN_IMPORT_DELAYED_LOCK = threading.RLock()
+_TOKEN_IMPORT_DELAYED_QUEUE: list[tuple[float, int, str, int, str]] = []
+_TOKEN_IMPORT_DELAYED_SEQUENCE = itertools.count()
 _TOKEN_IMPORT_PENDING_LOCK = threading.RLock()
 _TOKEN_IMPORT_PENDING_FILES: set[str] = set()
+_TOKEN_IMPORT_DIRTY_FILES: set[str] = set()
 _TOKEN_IMPORT_INTERNAL_WRITES: dict[str, float] = {}
 _TOKEN_IMPORT_RETRY_DELAY_SEC = 0.2
 _TOKEN_IMPORT_MAX_RETRIES = 8
@@ -4550,9 +4562,16 @@ _DASHBOARD_CACHE = DashboardMemoryCache()
 
 
 def _refresh_dashboard_memory() -> None:
+    before = _DASHBOARD_CACHE.get_system_status()
     _DASHBOARD_CACHE.refresh_from_db(db)
+    after = _DASHBOARD_CACHE.get_system_status()
     _QUEUE_STATUS_CACHE.clear()
     invalidate_dashboard_cache()
+    token_import_log(
+        "[dashboard-refresh] "
+        f"queue={before['queue'].get('total', 0)}->{after['queue'].get('total', 0)} "
+        f"updated_at={before['index'].get('updated_at')}->{after['index'].get('updated_at')}"
+    )
 
 
 def try_fulfill_queue(db_handle: TokenDb) -> None:
@@ -4611,6 +4630,28 @@ def _cleanup_internal_token_writes(now: float | None = None) -> None:
         _TOKEN_IMPORT_INTERNAL_WRITES.pop(file_name, None)
 
 
+def _get_token_import_state_counts() -> dict[str, int]:
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        pending = len(_TOKEN_IMPORT_PENDING_FILES)
+        dirty = len(_TOKEN_IMPORT_DIRTY_FILES)
+    with _TOKEN_IMPORT_DELAYED_LOCK:
+        delayed = len(_TOKEN_IMPORT_DELAYED_QUEUE)
+    return {
+        "ready": _TOKEN_IMPORT_QUEUE.qsize(),
+        "pending": pending,
+        "dirty": dirty,
+        "delayed": delayed,
+    }
+
+
+def _log_token_import_state(prefix: str) -> None:
+    counts = _get_token_import_state_counts()
+    token_import_log(
+        f"[token-state] {prefix} ready={counts['ready']} pending={counts['pending']} "
+        f"dirty={counts['dirty']} delayed={counts['delayed']}"
+    )
+
+
 def _mark_internal_token_write(file_name: str) -> None:
     with _TOKEN_IMPORT_PENDING_LOCK:
         _cleanup_internal_token_writes()
@@ -4639,32 +4680,108 @@ def _enqueue_token_import(
             if file_name in _TOKEN_IMPORT_INTERNAL_WRITES:
                 return False
         if file_name in _TOKEN_IMPORT_PENDING_FILES:
+            if attempt == 0:
+                _TOKEN_IMPORT_DIRTY_FILES.add(file_name)
+                if emit_log:
+                    _log_token_import_state(f"marked dirty file={file_name} reason={reason}")
             return False
         _TOKEN_IMPORT_PENDING_FILES.add(file_name)
+        _TOKEN_IMPORT_DIRTY_FILES.discard(file_name)
     _TOKEN_IMPORT_QUEUE.put((file_name, attempt, reason))
     if emit_log:
-        token_import_log(f"queued file={file_name} reason={reason} attempt={attempt}")
+        _log_token_import_state(f"queued file={file_name} reason={reason} attempt={attempt}")
     return True
 
 
+def _compute_token_import_retry_delay(attempt: int) -> float:
+    capped_attempt = max(0, min(attempt, 6))
+    return _TOKEN_IMPORT_RETRY_DELAY_SEC * (2**capped_attempt)
+
+
+def _schedule_delayed_token_import(
+    file_name: str,
+    *,
+    reason: str,
+    attempt: int,
+    delay_sec: float,
+) -> None:
+    ready_at = time.monotonic() + max(0.0, delay_sec)
+    with _TOKEN_IMPORT_DELAYED_LOCK:
+        heapq.heappush(
+            _TOKEN_IMPORT_DELAYED_QUEUE,
+            (ready_at, next(_TOKEN_IMPORT_DELAYED_SEQUENCE), file_name, attempt, reason),
+        )
+    _log_token_import_state(
+        f"scheduled retry file={file_name} reason={reason} attempt={attempt} delay={delay_sec:.2f}s"
+    )
+
+
+def _promote_ready_delayed_token_imports(now: float | None = None) -> int:
+    promoted: list[tuple[str, int, str]] = []
+    moment = time.monotonic() if now is None else now
+    with _TOKEN_IMPORT_DELAYED_LOCK:
+        while _TOKEN_IMPORT_DELAYED_QUEUE and _TOKEN_IMPORT_DELAYED_QUEUE[0][0] <= moment:
+            _, _, file_name, attempt, reason = heapq.heappop(_TOKEN_IMPORT_DELAYED_QUEUE)
+            promoted.append((file_name, attempt, reason))
+    for task in promoted:
+        _TOKEN_IMPORT_QUEUE.put(task)
+    if promoted:
+        _log_token_import_state(f"promoted delayed retries count={len(promoted)}")
+    return len(promoted)
+
+
+def _next_delayed_token_import_delay(now: float | None = None) -> float | None:
+    moment = time.monotonic() if now is None else now
+    with _TOKEN_IMPORT_DELAYED_LOCK:
+        if not _TOKEN_IMPORT_DELAYED_QUEUE:
+            return None
+        return max(0.0, _TOKEN_IMPORT_DELAYED_QUEUE[0][0] - moment)
+
+
 def _requeue_token_import(file_name: str, *, reason: str, attempt: int) -> None:
-    _TOKEN_IMPORT_QUEUE.put((file_name, attempt, reason))
-    token_import_log(f"requeued file={file_name} reason={reason} attempt={attempt}")
+    delay_sec = _compute_token_import_retry_delay(attempt)
+    _schedule_delayed_token_import(file_name, reason=reason, attempt=attempt, delay_sec=delay_sec)
+
+
+def _finalize_token_import(file_name: str, *, rerun_reason: str) -> None:
+    should_rerun = False
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        _TOKEN_IMPORT_PENDING_FILES.discard(file_name)
+        if file_name in _TOKEN_IMPORT_DIRTY_FILES:
+            _TOKEN_IMPORT_DIRTY_FILES.discard(file_name)
+            should_rerun = True
+    if should_rerun and not _TOKEN_IMPORT_STOP.is_set():
+        _enqueue_token_import(file_name, reason=rerun_reason)
+        _log_token_import_state(f"rerun requested file={file_name} reason={rerun_reason}")
+        return
+    _log_token_import_state(f"released file={file_name} rerun={int(should_rerun)}")
 
 
 def _release_token_import(file_name: str) -> None:
-    with _TOKEN_IMPORT_PENDING_LOCK:
-        _TOKEN_IMPORT_PENDING_FILES.discard(file_name)
+    _finalize_token_import(file_name, rerun_reason="dirty_rerun")
+
+
+def _clear_delayed_token_imports() -> int:
+    with _TOKEN_IMPORT_DELAYED_LOCK:
+        cleared = len(_TOKEN_IMPORT_DELAYED_QUEUE)
+        _TOKEN_IMPORT_DELAYED_QUEUE.clear()
+    if cleared:
+        _log_token_import_state(f"cleared delayed retries count={cleared}")
+    return cleared
 
 
 def _clear_token_import_queue() -> None:
+    cleared = 0
     while True:
         try:
             _TOKEN_IMPORT_QUEUE.get_nowait()
         except queue.Empty:
-            return
+            break
         else:
+            cleared += 1
             _TOKEN_IMPORT_QUEUE.task_done()
+    if cleared:
+        _log_token_import_state(f"cleared ready queue count={cleared}")
 
 
 def _is_token_file_present(path: Path) -> bool:
@@ -4700,6 +4817,9 @@ def _startup_reconcile_token_files() -> dict[str, int]:
         if should_queue and _enqueue_token_import(file_name, reason="startup_reconcile", emit_log=False):
             queued += 1
     deactivated = db.deactivate_missing_token_files(set(file_stats))
+    _log_token_import_state(
+        f"startup reconcile queued={queued} total={len(file_stats)} deactivated={deactivated}"
+    )
     return {"queued": queued, "total": len(file_stats), "deactivated": deactivated}
 
 
@@ -4716,10 +4836,19 @@ def _poll_token_directory_changes(previous_stats: dict[str, tuple[int, int]]) ->
         if db.deactivate_token_file(file_name, timeout=3.0):
             token_import_log(f"deactivated file={file_name} reason=poll_deleted")
 
+    changed_count = 0
     for file_name, stat_pair in current_stats.items():
         previous_pair = previous_stats.get(file_name)
         if previous_pair != stat_pair:
             _enqueue_token_import(file_name, reason="poll_changed", emit_log=False)
+            changed_count += 1
+
+    token_import_log(
+        "[token-scan] fallback scan finished "
+        f"previous={len(previous_stats)} current={len(current_stats)} "
+        f"changed={changed_count} removed={len(removed_names)}"
+    )
+    _log_token_import_state("fallback scan state")
 
     return current_stats
 
@@ -4788,6 +4917,7 @@ def _handle_token_import_results(
         f"deactivated={summary['deactivated']} skipped={summary['skipped']} "
         f"failed={summary['failed']}"
     )
+    _log_token_import_state("batch result state")
     return imported_any
 
 
@@ -4918,25 +5048,34 @@ def _token_import_loop() -> None:
     )
     observer = _start_token_watchdog()
     _TOKEN_WATCHDOG_OBSERVER = observer
-    fallback_snapshot: dict[str, tuple[int, int]] = {}
-    if observer is None:
-        fallback_snapshot = list_token_json_stats(TOKEN_DIR) or {}
+    fallback_snapshot: dict[str, tuple[int, int]] = list_token_json_stats(TOKEN_DIR) or {}
     next_fallback_scan_at = time.time() + _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC
     try:
         while not _TOKEN_IMPORT_STOP.is_set():
+            _promote_ready_delayed_token_imports()
             try:
-                first_task = _TOKEN_IMPORT_QUEUE.get(timeout=0.5)
+                fallback_wait = max(0.0, next_fallback_scan_at - time.time())
+                delayed_wait = _next_delayed_token_import_delay()
+                wait_timeout = 0.5
+                if delayed_wait is not None:
+                    wait_timeout = min(wait_timeout, delayed_wait)
+                wait_timeout = min(wait_timeout, fallback_wait)
+                first_task = _TOKEN_IMPORT_QUEUE.get(timeout=wait_timeout)
             except queue.Empty:
-                if observer is None and time.time() >= next_fallback_scan_at:
+                if time.time() >= next_fallback_scan_at:
                     fallback_snapshot = _poll_token_directory_changes(fallback_snapshot)
                     next_fallback_scan_at = time.time() + _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC
                 continue
             batch_tasks = _drain_token_import_batch(first_task)
+            _log_token_import_state(f"processing dequeued batch size={len(batch_tasks)}")
             try:
                 _process_token_import_batch(batch_tasks)
             finally:
                 for _ in batch_tasks:
                     _TOKEN_IMPORT_QUEUE.task_done()
+            if time.time() >= next_fallback_scan_at:
+                fallback_snapshot = _poll_token_directory_changes(fallback_snapshot)
+                next_fallback_scan_at = time.time() + _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC
     finally:
         if observer is not None:
             observer.stop()
@@ -4981,8 +5120,10 @@ async def lifespan(_: FastAPI):
     _QUEUE_PUMP_STOP.clear()
     _TOKEN_IMPORT_STOP.clear()
     _clear_token_import_queue()
+    _clear_delayed_token_imports()
     with _TOKEN_IMPORT_PENDING_LOCK:
         _TOKEN_IMPORT_PENDING_FILES.clear()
+        _TOKEN_IMPORT_DIRTY_FILES.clear()
         _TOKEN_IMPORT_INTERNAL_WRITES.clear()
     global _QUEUE_PUMP_THREAD
     global _TOKEN_IMPORT_THREAD
@@ -5012,8 +5153,10 @@ async def lifespan(_: FastAPI):
             _TOKEN_IMPORT_THREAD.join(timeout=5)
             _TOKEN_IMPORT_THREAD = None
         _clear_token_import_queue()
+        _clear_delayed_token_imports()
         with _TOKEN_IMPORT_PENDING_LOCK:
             _TOKEN_IMPORT_PENDING_FILES.clear()
+            _TOKEN_IMPORT_DIRTY_FILES.clear()
             _TOKEN_IMPORT_INTERNAL_WRITES.clear()
 
 
@@ -5531,11 +5674,20 @@ def upload_tokens_session(
     max_file_size = get_upload_max_file_size_bytes()
     hourly_limit = get_upload_max_success_per_hour()
     files = payload.files if payload else []
+    upload_log(
+        f"[upload-request] user_id={user['id']} username={user['username']} "
+        f"files={len(files)} max_files={max_files} max_size={max_file_size}"
+    )
 
     if not files:
+        upload_log(f"[upload-request] rejected user_id={user['id']} reason=no_files")
         error_json = json.dumps({"detail": "请至少上传一个 JSON 文件。"}, ensure_ascii=False).encode("utf-8")
         return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
     if len(files) > max_files:
+        upload_log(
+            f"[upload-request] rejected user_id={user['id']} reason=too_many_files "
+            f"files={len(files)} max_files={max_files}"
+        )
         error_json = json.dumps(
             {"detail": f"单次最多上传 {max_files} 个文件。"},
             ensure_ascii=False,
@@ -5546,27 +5698,52 @@ def upload_tokens_session(
         uploaded_count = db.count_recent_successful_uploads(user["id"])
     except sqlite3.OperationalError as exc:
         if "database is locked" in str(exc).lower():
+            upload_log(f"[upload-request] db_busy_on_count user_id={user['id']}")
             return make_db_busy_response()
         raise
     remaining_success = max(0, hourly_limit - uploaded_count)
+    upload_log(
+        f"[upload-request] quota user_id={user['id']} uploaded_last_hour={uploaded_count} "
+        f"remaining={remaining_success} hourly_limit={hourly_limit}"
+    )
     if remaining_success <= 0:
+        upload_log(f"[upload-request] rate_limited user_id={user['id']} remaining=0")
         raise RateLimitError("当前小时内可成功上传的账号数量已用完")
 
     results: list[dict[str, Any]] = []
     for request_index, upload in enumerate(files):
         original_name = os.path.basename(upload.name or "upload.json")
+        upload_log(
+            f"[upload-file] start user_id={user['id']} index={request_index} file={original_name}"
+        )
         if not original_name.lower().endswith(".json"):
+            upload_log(
+                f"[upload-file] reject user_id={user['id']} index={request_index} "
+                f"file={original_name} reason=invalid_extension"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_file", "reason": "仅支持上传 .json 文件"})
             continue
         try:
             raw = base64.b64decode(upload.content_base64 or "", validate=True)
         except (ValueError, TypeError, binascii.Error):
+            upload_log(
+                f"[upload-file] reject user_id={user['id']} index={request_index} "
+                f"file={original_name} reason=invalid_base64"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_file", "reason": "文件内容编码无效"})
             continue
         if not raw:
+            upload_log(
+                f"[upload-file] reject user_id={user['id']} index={request_index} "
+                f"file={original_name} reason=empty_file"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_json", "reason": "文件为空"})
             continue
         if len(raw) > max_file_size:
+            upload_log(
+                f"[upload-file] reject user_id={user['id']} index={request_index} "
+                f"file={original_name} reason=file_too_large size={len(raw)} max_size={max_file_size}"
+            )
             results.append(
                 {
                     "request_index": request_index,
@@ -5579,13 +5756,25 @@ def upload_tokens_session(
         try:
             _, normalized, content_json = load_uploaded_json(raw)
         except json.JSONDecodeError:
+            upload_log(
+                f"[upload-file] reject user_id={user['id']} index={request_index} "
+                f"file={original_name} reason=json_decode_error"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_json", "reason": "JSON 解析失败"})
             continue
         except UploadValidationError as exc:
+            upload_log(
+                f"[upload-file] reject user_id={user['id']} index={request_index} "
+                f"file={original_name} reason=validation_error detail={exc}"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "missing_fields", "reason": str(exc)})
             continue
 
         access_token_hash = hash_token_value(normalized["access_token"])
+        upload_log(
+            f"[upload-validate] parsed user_id={user['id']} index={request_index} "
+            f"file={original_name} account_id={normalized['account_id']}"
+        )
         try:
             conflict = db.get_uploaded_token_conflict(
                 account_id=normalized["account_id"],
@@ -5593,10 +5782,18 @@ def upload_tokens_session(
             )
         except sqlite3.OperationalError as exc:
             if "database is locked" in str(exc).lower():
+                upload_log(
+                    f"[upload-validate] db_busy user_id={user['id']} index={request_index} "
+                    f"file={original_name} account_id={normalized['account_id']}"
+                )
                 append_db_busy_results(results, files, request_index)
                 break
             raise
         if conflict:
+            upload_log(
+                f"[upload-validate] duplicate user_id={user['id']} index={request_index} "
+                f"file={original_name} account_id={normalized['account_id']} existing_token_id={conflict.get('id')}"
+            )
             results.append(
                 {
                     "request_index": request_index,
@@ -5608,12 +5805,25 @@ def upload_tokens_session(
             )
             continue
         if remaining_success <= 0:
+            upload_log(
+                f"[upload-validate] rate_limited user_id={user['id']} index={request_index} "
+                f"file={original_name} account_id={normalized['account_id']}"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "rate_limited", "reason": "当前小时上传额度不足"})
             continue
 
+        upload_log(
+            f"[upload-probe] submit user_id={user['id']} index={request_index} "
+            f"file={original_name} account_id={normalized['account_id']}"
+        )
         probe_result = _CODEX_PROBE.submit(
             normalized,
             wait_timeout_sec=get_codex_probe_timeout_sec() + get_codex_probe_delay_sec() + 5.0,
+        )
+        upload_log(
+            f"[upload-probe] result user_id={user['id']} index={request_index} file={original_name} "
+            f"account_id={normalized['account_id']} status={probe_result.status} "
+            f"http_status={probe_result.http_status} detail={probe_result.detail or '-'}"
         )
         if probe_result.is_banned:
             results.append({"request_index": request_index, "file_name": original_name, "status": "banned_401", "reason": "账号已失效或被上游封禁"})
@@ -5628,6 +5838,10 @@ def upload_tokens_session(
             uploaded_at_ts=uploaded_at_ts,
         )
         file_path_obj, relative_path = write_uploaded_token_file(target_name, content_json)
+        upload_log(
+            f"[upload-store] file_written user_id={user['id']} index={request_index} "
+            f"file={original_name} target={target_name} account_id={normalized['account_id']}"
+        )
         try:
             created = run_db_write_with_retry(
                 lambda: db.create_uploaded_token(
@@ -5644,6 +5858,10 @@ def upload_tokens_session(
             )
         except UploadValidationError:
             file_path_obj.unlink(missing_ok=True)
+            upload_log(
+                f"[upload-store] duplicate_after_probe user_id={user['id']} index={request_index} "
+                f"file={original_name} account_id={normalized['account_id']}"
+            )
             results.append(
                 {
                     "request_index": request_index,
@@ -5657,19 +5875,36 @@ def upload_tokens_session(
         except RateLimitError:
             file_path_obj.unlink(missing_ok=True)
             remaining_success = 0
+            upload_log(
+                f"[upload-store] rate_limited_after_probe user_id={user['id']} index={request_index} "
+                f"file={original_name} account_id={normalized['account_id']}"
+            )
             results.append({"request_index": request_index, "file_name": original_name, "status": "rate_limited", "reason": "当前小时上传额度不足"})
             continue
         except sqlite3.OperationalError as exc:
             file_path_obj.unlink(missing_ok=True)
             if "database is locked" in str(exc).lower():
+                upload_log(
+                    f"[upload-store] db_busy user_id={user['id']} index={request_index} "
+                    f"file={original_name} account_id={normalized['account_id']}"
+                )
                 append_db_busy_results(results, files, request_index)
                 break
             raise
         except Exception:
             file_path_obj.unlink(missing_ok=True)
+            upload_log(
+                f"[upload-store] unexpected_error user_id={user['id']} index={request_index} "
+                f"file={original_name} account_id={normalized['account_id']}"
+            )
             raise
 
         remaining_success -= 1
+        upload_log(
+            f"[upload-store] accepted user_id={user['id']} index={request_index} "
+            f"file={original_name} account_id={created['account_id']} token_id={created['token_id']} "
+            f"remaining_success={remaining_success}"
+        )
         results.append(
             {
                 "request_index": request_index,
@@ -5682,6 +5917,10 @@ def upload_tokens_session(
         )
 
     invalidate_user_cache(session["user_id"])
+    success_count = sum(1 for item in results if item.get("status") == "accepted")
+    upload_log(
+        f"[upload-request] finished user_id={user['id']} total={len(results)} accepted={success_count}"
+    )
     return build_upload_response(results)
 
 
