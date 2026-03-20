@@ -1997,13 +1997,25 @@ class TokenDb:
         now = now_ts()
         results: list[dict[str, Any]] = []
         changed = False
-        with self._lock, self.connect(timeout=timeout) as conn:
-            for path in paths:
-                result = self._sync_token_file_in_conn(path, conn=conn, now=now)
-                results.append(result)
-                if result.get("status") != "skipped":
-                    changed = True
-            self.ensure_inventory_policy(conn=conn)
+        total = len(paths)
+        chunk_size = max(1, min(_TOKEN_IMPORT_DB_BATCH_SIZE, total))
+        for chunk_start in range(0, total, chunk_size):
+            chunk = paths[chunk_start : chunk_start + chunk_size]
+            chunk_begin = time.perf_counter()
+            token_import_log(
+                f"db batch start offset={chunk_start} size={len(chunk)} total={total}"
+            )
+            with self._lock, self.connect(timeout=timeout) as conn:
+                for path in chunk:
+                    result = self._sync_token_file_in_conn(path, conn=conn, now=now)
+                    results.append(result)
+                    if result.get("status") != "skipped":
+                        changed = True
+                self.ensure_inventory_policy(conn=conn)
+            token_import_log(
+                f"db batch finished offset={chunk_start} size={len(chunk)} "
+                f"elapsed={time.perf_counter() - chunk_begin:.3f}s"
+            )
         if changed:
             _refresh_dashboard_memory()
             invalidate_all_runtime_cache(include_admin=True)
@@ -5244,6 +5256,9 @@ _UPLOAD_TASK_STATE_LOCK = threading.RLock()
 _UPLOAD_TASK_ACTIVE_COUNT = 0
 _UPLOAD_TASK_STATUS_LOCK = threading.RLock()
 _UPLOAD_TASK_STATUS: dict[str, dict[int, dict[str, Any]]] = {}
+_UPLOAD_TASK_REGISTRY_LOCK = threading.RLock()
+_UPLOAD_TASK_PENDING_BY_ACCOUNT: dict[str, dict[str, Any]] = {}
+_UPLOAD_TASK_PENDING_BY_TOKEN_HASH: dict[str, dict[str, Any]] = {}
 _UPLOAD_RESULTS_MEMORY_LOCK = threading.RLock()
 _UPLOAD_RESULTS_MEMORY: dict[int, dict[str, Any]] = {}
 _HIDE_CLAIMS_THREAD: threading.Thread | None = None
@@ -5251,6 +5266,7 @@ _HIDE_CLAIMS_STOP = threading.Event()
 _HIDE_CLAIMS_QUEUE: queue.Queue[HideClaimsTask] = queue.Queue()
 _TOKEN_IMPORT_DELAYED_LOCK = threading.RLock()
 _TOKEN_IMPORT_DELAYED_QUEUE: list[tuple[float, int, str, int, str]] = []
+_TOKEN_IMPORT_DB_BATCH_SIZE = 25
 _TOKEN_IMPORT_DELAYED_SEQUENCE = itertools.count()
 _TOKEN_IMPORT_PENDING_LOCK = threading.RLock()
 _TOKEN_IMPORT_PENDING_FILES: set[str] = set()
@@ -5843,6 +5859,9 @@ def _clear_upload_task_queue() -> None:
         upload_log(f"[upload-worker] cleared queued tasks count={cleared}")
     with _UPLOAD_TASK_STATUS_LOCK:
         _UPLOAD_TASK_STATUS.clear()
+    with _UPLOAD_TASK_REGISTRY_LOCK:
+        _UPLOAD_TASK_PENDING_BY_ACCOUNT.clear()
+        _UPLOAD_TASK_PENDING_BY_TOKEN_HASH.clear()
     with _UPLOAD_RESULTS_MEMORY_LOCK:
         _UPLOAD_RESULTS_MEMORY.clear()
 
@@ -5865,6 +5884,102 @@ def get_upload_task_queue_position(offset: int = 0) -> int:
     with _UPLOAD_TASK_STATE_LOCK:
         active = _UPLOAD_TASK_ACTIVE_COUNT
     return max(1, int(active) + _UPLOAD_TASK_QUEUE.qsize() + int(offset) + 1)
+
+
+def _build_pending_upload_task_payload(
+    task: QueuedUploadTask,
+    *,
+    status: str,
+    queue_position: int | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "batch_id": task.batch_id,
+        "request_index": int(task.request_index),
+        "file_name": task.file_name,
+        "user_id": int(task.user_id),
+        "account_id": task.account_id,
+        "access_token_hash": task.access_token_hash,
+        "status": status,
+    }
+    if queue_position is not None:
+        payload["queue_position"] = max(1, int(queue_position))
+    return payload
+
+
+def register_pending_upload_task(
+    task: QueuedUploadTask,
+    *,
+    status: str,
+    queue_position: int | None = None,
+) -> None:
+    payload = _build_pending_upload_task_payload(
+        task,
+        status=status,
+        queue_position=queue_position,
+    )
+    with _UPLOAD_TASK_REGISTRY_LOCK:
+        _UPLOAD_TASK_PENDING_BY_ACCOUNT[task.account_id] = dict(payload)
+        _UPLOAD_TASK_PENDING_BY_TOKEN_HASH[task.access_token_hash] = dict(payload)
+
+
+def update_pending_upload_task(
+    task: QueuedUploadTask,
+    *,
+    status: str,
+    queue_position: int | None = None,
+) -> None:
+    with _UPLOAD_TASK_REGISTRY_LOCK:
+        account_payload = dict(_UPLOAD_TASK_PENDING_BY_ACCOUNT.get(task.account_id) or {})
+        token_payload = dict(_UPLOAD_TASK_PENDING_BY_TOKEN_HASH.get(task.access_token_hash) or {})
+        payload = account_payload or token_payload or _build_pending_upload_task_payload(task, status=status)
+        payload.update(
+            {
+                "batch_id": task.batch_id,
+                "request_index": int(task.request_index),
+                "file_name": task.file_name,
+                "user_id": int(task.user_id),
+                "account_id": task.account_id,
+                "access_token_hash": task.access_token_hash,
+                "status": status,
+            }
+        )
+        if queue_position is not None:
+            payload["queue_position"] = max(1, int(queue_position))
+        _UPLOAD_TASK_PENDING_BY_ACCOUNT[task.account_id] = dict(payload)
+        _UPLOAD_TASK_PENDING_BY_TOKEN_HASH[task.access_token_hash] = dict(payload)
+
+
+def clear_pending_upload_task(task: QueuedUploadTask) -> None:
+    with _UPLOAD_TASK_REGISTRY_LOCK:
+        account_payload = _UPLOAD_TASK_PENDING_BY_ACCOUNT.get(task.account_id)
+        if (
+            account_payload
+            and str(account_payload.get("batch_id") or "") == str(task.batch_id)
+            and int(account_payload.get("request_index") or -1) == int(task.request_index)
+        ):
+            _UPLOAD_TASK_PENDING_BY_ACCOUNT.pop(task.account_id, None)
+        token_payload = _UPLOAD_TASK_PENDING_BY_TOKEN_HASH.get(task.access_token_hash)
+        if (
+            token_payload
+            and str(token_payload.get("batch_id") or "") == str(task.batch_id)
+            and int(token_payload.get("request_index") or -1) == int(task.request_index)
+        ):
+            _UPLOAD_TASK_PENDING_BY_TOKEN_HASH.pop(task.access_token_hash, None)
+
+
+def find_pending_upload_task(
+    *,
+    account_id: str,
+    access_token_hash: str,
+) -> dict[str, Any] | None:
+    with _UPLOAD_TASK_REGISTRY_LOCK:
+        by_account = _UPLOAD_TASK_PENDING_BY_ACCOUNT.get(account_id)
+        if by_account and by_account.get("status") in {"queued", "processing"}:
+            return dict(by_account)
+        by_token_hash = _UPLOAD_TASK_PENDING_BY_TOKEN_HASH.get(access_token_hash)
+        if by_token_hash and by_token_hash.get("status") in {"queued", "processing"}:
+            return dict(by_token_hash)
+    return None
 
 
 def set_upload_task_status(batch_id: str, request_index: int, item_payload: dict[str, Any]) -> None:
@@ -5963,6 +6078,7 @@ def refresh_user_upload_results_memory(user_id: int) -> dict[str, Any]:
 
 
 def _process_upload_task(task: QueuedUploadTask) -> None:
+    update_pending_upload_task(task, status="processing")
     set_upload_task_status(
         task.batch_id,
         task.request_index,
@@ -6042,8 +6158,16 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
                         account_id=task.account_id,
                         uploaded_at_ts=uploaded_at_ts,
                     )
+                    upload_log(
+                        f"[upload-worker] writing_file user_id={task.user_id} batch={task.batch_id} "
+                        f"index={task.request_index} file={target_name}"
+                    )
                     file_path_obj, relative_path = write_uploaded_token_file(target_name, task.content_json)
                     try:
+                        upload_log(
+                            f"[upload-worker] create_token begin user_id={task.user_id} batch={task.batch_id} "
+                            f"index={task.request_index} file={task.file_name}"
+                        )
                         created = run_db_write_with_retry(
                             lambda: db.create_uploaded_token(
                                 file_name=target_name,
@@ -6060,6 +6184,10 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
                             ),
                             retries=2,
                             delay_sec=0.2,
+                        )
+                        upload_log(
+                            f"[upload-worker] create_token finished user_id={task.user_id} batch={task.batch_id} "
+                            f"index={task.request_index} token_id={created['token_id']}"
                         )
                     except UploadValidationError:
                         file_path_obj.unlink(missing_ok=True)
@@ -6104,14 +6232,17 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
             "status": "probe_failed",
             "reason": "后台处理失败，请稍后重试",
         }
-    set_upload_task_status(task.batch_id, task.request_index, result_item)
-    update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
-    refresh_user_upload_results_memory(task.user_id)
-    upload_log(
-        f"[upload-worker] finished user_id={task.user_id} batch={task.batch_id} "
-        f"index={task.request_index} file={task.file_name} status={result_item['status']}"
-    )
-    clear_upload_task_status_if_done(task.batch_id)
+    try:
+        set_upload_task_status(task.batch_id, task.request_index, result_item)
+        update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
+        refresh_user_upload_results_memory(task.user_id)
+        upload_log(
+            f"[upload-worker] finished user_id={task.user_id} batch={task.batch_id} "
+            f"index={task.request_index} file={task.file_name} status={result_item['status']}"
+        )
+    finally:
+        clear_pending_upload_task(task)
+        clear_upload_task_status_if_done(task.batch_id)
 
 
 def _upload_task_loop() -> None:
@@ -6617,7 +6748,6 @@ def get_me_apikey_summary(request: Request) -> dict[str, int]:
 @app.get("/me/uploads/results")
 def get_me_upload_results(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
-    advance_upload_tasks_on_demand(max_tasks=1)
     return refresh_user_upload_results_memory(session["user_id"])
 
 
@@ -6882,6 +7012,32 @@ def upload_tokens_session(
             continue
 
         access_token_hash = hash_token_value(normalized["access_token"])
+        pending_task = find_pending_upload_task(
+            account_id=normalized["account_id"],
+            access_token_hash=access_token_hash,
+        )
+        if pending_task is not None:
+            pending_status = str(pending_task.get("status") or "queued")
+            pending_queue_position = pending_task.get("queue_position")
+            pending_reason = "账号正在处理中，请稍候刷新结果。"
+            if pending_status == "queued":
+                pending_reason = "账号已在上传队列中，请勿重复提交。"
+            upload_log(
+                f"[upload-queue] deduplicated user_id={user['id']} index={request_index} "
+                f"file={original_name} account_id={normalized['account_id']} "
+                f"status={pending_status} batch={pending_task.get('batch_id')}"
+            )
+            dedupe_item = {
+                "request_index": request_index,
+                "file_name": original_name,
+                "status": pending_status,
+                "reason": pending_reason,
+                "account_id": normalized["account_id"],
+            }
+            if pending_queue_position is not None:
+                dedupe_item["queue_position"] = max(1, int(pending_queue_position))
+            results.append(dedupe_item)
+            continue
         queue_position = get_upload_task_queue_position(len(queued_tasks))
         upload_log(
             f"[upload-queue] queued user_id={user['id']} index={request_index} "
@@ -6909,22 +7065,22 @@ def upload_tokens_session(
                 "queue_position": queue_position,
             },
         )
-        queued_tasks.append(
-            QueuedUploadTask(
-                batch_id=batch_id,
-                user_id=int(user["id"]),
-                provider_username=str(user["username"]),
-                provider_name=str(user["name"] or user["username"]),
-                hourly_limit=hourly_limit,
-                request_index=request_index,
-                file_name=original_name,
-                content_json=content_json,
-                account_id=normalized["account_id"],
-                access_token=normalized["access_token"],
-                refresh_token=normalized["refresh_token"],
-                access_token_hash=access_token_hash,
-            )
+        task = QueuedUploadTask(
+            batch_id=batch_id,
+            user_id=int(user["id"]),
+            provider_username=str(user["username"]),
+            provider_name=str(user["name"] or user["username"]),
+            hourly_limit=hourly_limit,
+            request_index=request_index,
+            file_name=original_name,
+            content_json=content_json,
+            account_id=normalized["account_id"],
+            access_token=normalized["access_token"],
+            refresh_token=normalized["refresh_token"],
+            access_token_hash=access_token_hash,
         )
+        register_pending_upload_task(task, status="queued", queue_position=queue_position)
+        queued_tasks.append(task)
 
     response_payload = build_upload_response(
         results,
@@ -6937,8 +7093,6 @@ def upload_tokens_session(
     refresh_user_upload_results_memory(session["user_id"])
     for task in queued_tasks:
         _UPLOAD_TASK_QUEUE.put(task)
-    if queued_tasks:
-        advance_upload_tasks_on_demand(max_tasks=1)
     success_count = sum(1 for item in results if item.get("status") == "accepted")
     upload_log(
         f"[upload-request] finished user_id={user['id']} total={len(results)} "
