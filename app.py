@@ -3451,6 +3451,68 @@ class TokenDb:
             )
         return items
 
+    def get_contributor_leaderboard(self, limit: int) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT provider_user_id as user_id,
+                       COALESCE(provider_name, provider_username) as name,
+                       provider_username as username,
+                       COUNT(*) as cnt
+                FROM tokens
+                WHERE provider_user_id IS NOT NULL
+                  AND provider_user_id != ''
+                GROUP BY provider_user_id, provider_username, provider_name
+                ORDER BY cnt DESC, provider_username ASC, provider_user_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            items.append(
+                {
+                    "user_id": row["user_id"],
+                    "username": row["username"],
+                    "name": row["name"] or row["username"],
+                    "count": int(row["cnt"] or 0),
+                }
+            )
+        return items
+
+    def list_recent_contributors(self, limit: int) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT provider_user_id as user_id,
+                       COALESCE(provider_name, provider_username) as name,
+                       provider_username as username,
+                       COUNT(*) as cnt,
+                       MAX(uploaded_at_ts) as uploaded_at_ts
+                FROM tokens
+                WHERE provider_user_id IS NOT NULL
+                  AND provider_user_id != ''
+                GROUP BY provider_user_id, provider_username, provider_name
+                ORDER BY uploaded_at_ts DESC, provider_username ASC, provider_user_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            items.append(
+                {
+                    "user_id": row["user_id"],
+                    "username": row["username"],
+                    "name": row["name"] or row["username"],
+                    "count": int(row["cnt"] or 0),
+                    "uploaded_at": isoformat_from_ts(int(row["uploaded_at_ts"])) if row["uploaded_at_ts"] else None,
+                }
+            )
+        return items
+
     def get_claim_trends(self, window_sec: int, bucket_sec: int) -> list[dict[str, Any]]:
         window_sec = max(1, int(window_sec))
         bucket_sec = max(60, int(bucket_sec))
@@ -4136,6 +4198,11 @@ def build_user_profile_cache_key(user_id: int, *, is_admin: bool) -> str:
     return build_snapshot_cache_key("user-profile", user_id, int(bool(is_admin)), f"v{version}")
 
 
+def build_user_upload_results_cache_key(user_id: int) -> str:
+    version = get_cache_scope_version("user-upload-results", user_id)
+    return build_snapshot_cache_key("user-upload-results", user_id, f"v{version}")
+
+
 def invalidate_user_profile_cache(user_id: int) -> None:
     bump_cache_scope("user-basic", user_id)
     bump_cache_scope("user-profile", user_id)
@@ -4386,6 +4453,40 @@ def set_user_api_key_summary_snapshot(user_id: int, payload: dict[str, Any]) -> 
     }
     _set_cached_snapshot(key, normalized, get_cache_me_ttl())
     return normalized
+
+
+def get_default_upload_results_snapshot() -> dict[str, Any]:
+    return {
+        "summary": {
+            "total": 0,
+            "accepted": 0,
+            "duplicates": 0,
+            "invalid": 0,
+            "rejected": 0,
+            "db_busy": 0,
+        },
+        "items": [],
+    }
+
+
+def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
+    key = build_user_upload_results_cache_key(user_id)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return {
+            "summary": dict(cached.get("summary") or get_default_upload_results_snapshot()["summary"]),
+            "items": list(cached.get("items") or []),
+        }
+    return get_default_upload_results_snapshot()
+
+
+def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    key = build_user_upload_results_cache_key(user_id)
+    normalized = {
+        "summary": dict(payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
+        "items": list(payload.get("items") or []),
+    }
+    return _set_cached_snapshot(key, normalized, get_cache_me_ttl())
 
 
 def get_cached_user_queue_snapshot(user_id: int) -> dict[str, Any] | None:
@@ -5999,15 +6100,21 @@ def get_me_apikey_summary(request: Request) -> dict[str, int]:
     return get_user_api_key_summary_snapshot(session["user_id"])
 
 
+@app.get("/me/uploads/results")
+def get_me_upload_results(request: Request) -> dict[str, Any]:
+    session = require_session_user(request)
+    return get_user_upload_results_snapshot(session["user_id"])
+
+
 @app.get("/dashboard/leaderboard")
 def get_dashboard_leaderboard(
     request: Request,
     window: str | None = Query(default="24h"),
-    limit: int = Query(default=50, ge=1, le=50),
+    limit: int = Query(default=10, ge=1, le=10),
 ) -> dict[str, Any]:
     require_session_user(request)
     window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
-    limit = min(limit, 50)
+    limit = min(limit, 10)
     key = build_dashboard_cache_key("dashboard-leaderboard", window_sec, limit)
     return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_leaderboard(window_sec, limit))
 
@@ -6018,16 +6125,20 @@ def get_dashboard_summary(
     window: str | None = Query(default="7d"),
     bucket: str | None = Query(default="1h"),
     leaderboard_window: str | None = Query(default="24h"),
-    leaderboard_limit: int = Query(default=50, ge=1, le=50),
-    recent_limit: int = Query(default=50, ge=1, le=50),
+    leaderboard_limit: int = Query(default=10, ge=1, le=10),
+    recent_limit: int = Query(default=10, ge=1, le=10),
+    contributor_limit: int = Query(default=10, ge=1, le=10),
+    recent_contributor_limit: int = Query(default=10, ge=1, le=10),
 ) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
     leaderboard_window_sec = parse_window_to_seconds(
         leaderboard_window, 24 * 3600, max_seconds=7 * 24 * 3600
     )
-    leaderboard_limit = min(leaderboard_limit, 50)
-    recent_limit = min(recent_limit, 50)
+    leaderboard_limit = min(leaderboard_limit, 10)
+    recent_limit = min(recent_limit, 10)
+    contributor_limit = min(contributor_limit, 10)
+    recent_contributor_limit = min(recent_contributor_limit, 10)
     window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
     bucket_sec = parse_bucket_seconds(bucket, 3600)
     key = build_dashboard_cache_key(
@@ -6037,6 +6148,8 @@ def get_dashboard_summary(
         leaderboard_window_sec,
         leaderboard_limit,
         recent_limit,
+        contributor_limit,
+        recent_contributor_limit,
         user_id=user_id,
     )
     def _load_summary() -> dict[str, Any]:
@@ -6051,12 +6164,20 @@ def get_dashboard_summary(
         }
         leaderboard = _DASHBOARD_CACHE.get_leaderboard(leaderboard_window_sec, leaderboard_limit)
         recent = _DASHBOARD_CACHE.get_recent(recent_limit)
+        contributors = {
+            "items": db.get_contributor_leaderboard(contributor_limit),
+        }
+        recent_contributors = {
+            "items": db.list_recent_contributors(recent_contributor_limit),
+        }
         trends = _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec)
         system = _DASHBOARD_CACHE.get_system_status()
         return {
             "stats": stats,
             "leaderboard": leaderboard,
             "recent": recent,
+            "contributors": contributors,
+            "recent_contributors": recent_contributors,
             "trends": trends,
             "system": system,
         }
@@ -6066,7 +6187,7 @@ def get_dashboard_summary(
 @app.get("/dashboard/recent-claims")
 def get_dashboard_recent_claims(
     request: Request,
-    limit: int = Query(default=20, ge=1, le=50),
+    limit: int = Query(default=10, ge=1, le=10),
 ) -> dict[str, Any]:
     require_session_user(request)
     key = build_dashboard_cache_key("dashboard-recent", limit)
@@ -6410,12 +6531,14 @@ def upload_tokens_session(
             }
         )
 
+    response_payload = build_upload_response(results)
+    set_user_upload_results_snapshot(session["user_id"], response_payload)
     invalidate_user_cache(session["user_id"])
     success_count = sum(1 for item in results if item.get("status") == "accepted")
     upload_log(
         f"[upload-request] finished user_id={user['id']} total={len(results)} accepted={success_count}"
     )
-    return build_upload_response(results)
+    return response_payload
 
 
 @app.get("/me/claims")

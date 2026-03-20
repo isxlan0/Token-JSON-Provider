@@ -17,6 +17,8 @@ const state = {
   queueSticky: false,
   leaderboard: [],
   recentClaims: [],
+  contributorLeaderboard: [],
+  recentContributors: [],
   trends: [],
   trendsMeta: null,
   systemStatus: null,
@@ -79,6 +81,8 @@ const elements = {
   systemStatusIndex: document.getElementById("system-status-index"),
   leaderboardList: document.getElementById("leaderboard-list"),
   recentClaimsList: document.getElementById("recent-claims-list"),
+  contributorLeaderboardList: document.getElementById("contributor-leaderboard-list"),
+  recentContributorsList: document.getElementById("recent-contributors-list"),
   inventoryStatus: document.getElementById("inventory-status"),
   inventoryUnclaimed: document.getElementById("inventory-unclaimed"),
   inventoryAvailableDetail: document.getElementById("inventory-available-detail"),
@@ -371,17 +375,15 @@ function formatDateTime(value) {
   return date.toLocaleString();
 }
 
-function renderLeaderboard() {
-  const list = elements.leaderboardList;
+function renderRankedList(list, items, emptyText) {
   if (!list) {
     return;
   }
   list.innerHTML = "";
-  const items = state.leaderboard || [];
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No leaderboard data.";
+    empty.textContent = emptyText;
     list.appendChild(empty);
     return;
   }
@@ -397,17 +399,15 @@ function renderLeaderboard() {
   });
 }
 
-function renderRecentClaims() {
-  const list = elements.recentClaimsList;
+function renderTimedList(list, items, emptyText, timeField) {
   if (!list) {
     return;
   }
   list.innerHTML = "";
-  const items = state.recentClaims || [];
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No recent claims.";
+    empty.textContent = emptyText;
     list.appendChild(empty);
     return;
   }
@@ -417,10 +417,35 @@ function renderRecentClaims() {
     row.innerHTML = `
       <div class=\"leaderboard-rank\">#${index + 1}</div>
       <div class=\"leaderboard-name\">${item.name || item.username || "-"} (@${item.username || "-"})</div>
-      <div class=\"leaderboard-count mono\">个数: ${item.count ?? 0} 时间: ${formatDateTime(item.claimed_at)}</div>
+      <div class=\"leaderboard-count mono\">个数: ${item.count ?? 0} 时间: ${formatDateTime(item[timeField])}</div>
     `;
     list.appendChild(row);
   });
+}
+
+function renderLeaderboard() {
+  renderRankedList(elements.leaderboardList, state.leaderboard || [], "No leaderboard data.");
+}
+
+function renderRecentClaims() {
+  renderTimedList(elements.recentClaimsList, state.recentClaims || [], "No recent claims.", "claimed_at");
+}
+
+function renderContributorLeaderboard() {
+  renderRankedList(
+    elements.contributorLeaderboardList,
+    state.contributorLeaderboard || [],
+    "No contributor data."
+  );
+}
+
+function renderRecentContributors() {
+  renderTimedList(
+    elements.recentContributorsList,
+    state.recentContributors || [],
+    "No recent contributors.",
+    "uploaded_at"
+  );
 }
 
 function renderSystemStatus() {
@@ -556,11 +581,13 @@ function renderTrends() {
 async function loadDashboardSummary() {
   try {
     const summary = await fetchJson(
-      "/dashboard/summary?window=7d&bucket=1h&leaderboard_window=24h&leaderboard_limit=50&recent_limit=50"
+      "/dashboard/summary?window=7d&bucket=1h&leaderboard_window=24h&leaderboard_limit=10&recent_limit=10&contributor_limit=10&recent_contributor_limit=10"
     );
     state.stats = summary.stats || null;
     state.leaderboard = summary.leaderboard?.items || [];
     state.recentClaims = summary.recent?.items || [];
+    state.contributorLeaderboard = summary.contributors?.items || [];
+    state.recentContributors = summary.recent_contributors?.items || [];
     state.trends = summary.trends?.series || [];
     state.trendsMeta = summary.trends
       ? { window: summary.trends.window, bucket: summary.trends.bucket }
@@ -572,6 +599,8 @@ async function loadDashboardSummary() {
   renderStats();
   renderLeaderboard();
   renderRecentClaims();
+  renderContributorLeaderboard();
+  renderRecentContributors();
   renderSystemStatus();
   renderTrends();
 }
@@ -809,6 +838,25 @@ function renderUploadResults() {
   });
 }
 
+function applyUploadResultsPayload(payload) {
+  state.uploadResults = payload.items || [];
+  renderUploadResults();
+  const summary = payload.summary || {};
+  elements.uploadSummary.textContent =
+    `本次共处理 ${summary.total ?? 0} 个文件，成功 ${summary.accepted ?? 0} 个，重复 ${summary.duplicates ?? 0} 个` +
+    `${summary.db_busy ? `，数据库繁忙 ${summary.db_busy} 个` : ""}。`;
+  if ((summary.total ?? 0) > 0) {
+    elements.uploadSummary.classList.remove("hidden");
+  } else {
+    elements.uploadSummary.classList.add("hidden");
+  }
+}
+
+async function loadUploadResultsSnapshot() {
+  const payload = await fetchJson("/me/uploads/results");
+  applyUploadResultsPayload(payload || {});
+}
+
 function setUploadSubmitting(submitting) {
   state.isUploading = submitting;
   if (!elements.uploadSubmitBtn) {
@@ -863,13 +911,7 @@ async function uploadTokens() {
       },
       body: JSON.stringify({ files }),
     });
-    state.uploadResults = payload.items || [];
-    renderUploadResults();
-    const summary = payload.summary || {};
-    elements.uploadSummary.textContent =
-      `本次共处理 ${summary.total ?? 0} 个文件，成功 ${summary.accepted ?? 0} 个，重复 ${summary.duplicates ?? 0} 个` +
-      `${summary.db_busy ? `，数据库繁忙 ${summary.db_busy} 个` : ""}。`;
-    elements.uploadSummary.classList.remove("hidden");
+    applyUploadResultsPayload(payload || {});
     const retryIndexes = new Set(
       state.uploadResults
         .filter((item) => item.status === "db_busy" && Number.isInteger(item.request_index))
@@ -1342,6 +1384,7 @@ async function init() {
         loadDashboardSummary(),
         loadClaims(),
         loadQueueStatus(),
+        loadUploadResultsSnapshot(),
       ]);
       startAutoRefresh();
     }

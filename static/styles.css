@@ -1512,7 +1512,8 @@ body {
   grid-template-columns: repeat(2, minmax(300px, 1fr));
   grid-template-areas:
     "trends trends"
-    "leaderboard recent";
+    "leaderboard recent"
+    "contributors recent-contributors";
 }
 
 .dashboard-grid.layout-dashboard .panel-leaderboard {
@@ -1521,6 +1522,14 @@ body {
 
 .dashboard-grid.layout-dashboard .panel-recent {
   grid-area: recent;
+}
+
+.dashboard-grid.layout-dashboard .panel-contributors {
+  grid-area: contributors;
+}
+
+.dashboard-grid.layout-dashboard .panel-recent-contributors {
+  grid-area: recent-contributors;
 }
 
 .dashboard-grid.layout-dashboard .panel-trends {
@@ -1537,6 +1546,8 @@ body {
     grid-template-areas:
       "leaderboard"
       "recent"
+      "contributors"
+      "recent-contributors"
       "trends";
   }
 }
