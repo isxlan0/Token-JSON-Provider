@@ -120,9 +120,9 @@ def enqueue_claim(
     if conn is None:
         with db._lock, db.connect() as target_conn:
             target_conn.execute("BEGIN IMMEDIATE")
-            queue_id, ahead, requested_val, remaining_val, enqueued_ts, req_id, _ = _enqueue(target_conn)
+            queue_id, ahead, requested_val, remaining_val, enqueued_ts, req_id, existing = _enqueue(target_conn)
     else:
-        queue_id, ahead, requested_val, remaining_val, enqueued_ts, req_id, _ = _enqueue(conn)
+        queue_id, ahead, requested_val, remaining_val, enqueued_ts, req_id, existing = _enqueue(conn)
 
     return {
         "queue_id": queue_id,
@@ -131,6 +131,7 @@ def enqueue_claim(
         "requested": requested_val,
         "remaining": remaining_val,
         "enqueued_at_ts": enqueued_ts,
+        "existing": bool(existing),
     }
 
 
@@ -140,10 +141,12 @@ def fulfill_queue(
     hourly_limit: int,
     apikey_rate_limit: int,
     max_batch: int | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     now = _now_ts()
     fulfilled = 0
     updated = 0
+    queue_removed = 0
+    claim_events: dict[tuple[int, str], dict[str, Any]] = {}
 
     with db._lock, db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -162,7 +165,7 @@ def fulfill_queue(
         ).fetchall()
 
         if not queue_rows:
-            return {"fulfilled": 0, "updated": 0}
+            return {"fulfilled": 0, "updated": 0, "queue_removed": 0, "events": []}
 
         for row in queue_rows:
             if max_batch is not None and fulfilled >= max_batch:
@@ -199,6 +202,7 @@ def fulfill_queue(
             granted = 0
             for token in token_rows:
                 token_id = int(token["id"])
+                first_claim = int(token["claim_count"]) <= 0
                 new_count = int(token["claim_count"]) + 1
                 new_available = 1 if new_count < int(token["max_claims"]) else 0
                 savepoint = f"queue_claim_{queue_id}_{token_id}"
@@ -237,6 +241,22 @@ def fulfill_queue(
                     continue
                 fulfilled += 1
                 granted += 1
+                event_key = (user_id, str(row["request_id"]))
+                event = claim_events.setdefault(
+                    event_key,
+                    {
+                        "user_id": user_id,
+                        "request_id": str(row["request_id"]),
+                        "claimed_at_ts": now,
+                        "token_ids": [],
+                        "first_claim_count": 0,
+                        "granted": 0,
+                    },
+                )
+                event["token_ids"].append(token_id)
+                event["granted"] += 1
+                if first_claim:
+                    event["first_claim_count"] += 1
 
             remaining_after = remaining - granted
             if remaining_after <= 0:
@@ -244,6 +264,7 @@ def fulfill_queue(
                     "DELETE FROM claim_queue WHERE id = ?",
                     (queue_id,),
                 )
+                queue_removed += 1
             else:
                 conn.execute(
                     """
@@ -255,4 +276,9 @@ def fulfill_queue(
                 )
             updated += 1
 
-    return {"fulfilled": fulfilled, "updated": updated}
+    return {
+        "fulfilled": fulfilled,
+        "updated": updated,
+        "queue_removed": queue_removed,
+        "events": list(claim_events.values()),
+    }

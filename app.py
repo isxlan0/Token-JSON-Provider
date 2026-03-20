@@ -14,10 +14,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import Body, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -25,6 +26,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 import claim_queue
+
+try:
+    import redis
+except Exception:
+    redis = None
 
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = BASE_DIR / "token"
@@ -55,6 +61,17 @@ TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE_ENV = "TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE"
 APIKEY_MAX_PER_USER_ENV = "TOKEN_APIKEY_MAX_PER_USER"
 APIKEY_RATE_PER_MIN_ENV = "TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE"
 PROVIDER_BASE_URL_ENV = "TOKEN_PROVIDER_BASE_URL"
+CACHE_BACKEND_ENV = "TOKEN_CACHE_BACKEND"
+REDIS_URL_ENV = "TOKEN_REDIS_URL"
+REDIS_USERNAME_ENV = "TOKEN_REDIS_USERNAME"
+REDIS_PASSWORD_ENV = "TOKEN_REDIS_PASSWORD"
+REDIS_PREFIX_ENV = "TOKEN_REDIS_PREFIX"
+CACHE_DEFAULT_TTL_ENV = "TOKEN_CACHE_DEFAULT_TTL_SEC"
+CACHE_ME_TTL_ENV = "TOKEN_CACHE_ME_TTL_SEC"
+CACHE_CLAIMS_TTL_ENV = "TOKEN_CACHE_CLAIMS_TTL_SEC"
+CACHE_ADMIN_TTL_ENV = "TOKEN_CACHE_ADMIN_TTL_SEC"
+CACHE_QUEUE_TTL_ENV = "TOKEN_CACHE_QUEUE_TTL_SEC"
+CACHE_DASHBOARD_TTL_ENV = "TOKEN_CACHE_DASHBOARD_TTL_SEC"
 SESSION_COOKIE_NAME = "token_atlas_session"
 SESSION_AUTH_KEY = "auth"
 SESSION_OAUTH_STATE_KEY = "linuxdo_oauth_state"
@@ -275,6 +292,172 @@ class BannedUserError(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(payload.get("detail") or "User is banned")
         self.payload = payload
+
+
+class CacheBackend(ABC):
+    @abstractmethod
+    def get_text(self, key: str) -> str | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_text(self, key: str, value: str, ttl_sec: int | None = None) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete(self, key: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def incr(self, key: str) -> int:
+        raise NotImplementedError
+
+    def get_json(self, key: str) -> Any | None:
+        raw = self.get_text(key)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            self.delete(key)
+            return None
+
+    def set_json(self, key: str, value: Any, ttl_sec: int | None = None) -> None:
+        self.set_text(key, json.dumps(value, ensure_ascii=False), ttl_sec=ttl_sec)
+
+
+class MemoryCacheBackend(CacheBackend):
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._entries: dict[str, tuple[float | None, str]] = {}
+
+    def get_text(self, key: str) -> str | None:
+        now = time.time()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            expires_at, value = entry
+            if expires_at is not None and expires_at <= now:
+                self._entries.pop(key, None)
+                return None
+            return value
+
+    def set_text(self, key: str, value: str, ttl_sec: int | None = None) -> None:
+        expires_at = None if ttl_sec is None else time.time() + max(1, int(ttl_sec))
+        with self._lock:
+            self._entries[key] = (expires_at, value)
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def incr(self, key: str) -> int:
+        with self._lock:
+            current_raw = self._entries.get(key)
+            current = 0
+            if current_raw is not None:
+                try:
+                    current = int(current_raw[1])
+                except ValueError:
+                    current = 0
+            current += 1
+            self._entries[key] = (None, str(current))
+            return current
+
+
+class RedisCacheBackend(CacheBackend):
+    def __init__(self, url: str, prefix: str, *, username: str = "", password: str = "") -> None:
+        if redis is None:
+            raise RuntimeError("redis package is not installed")
+        self._prefix = prefix
+        client_kwargs: dict[str, Any] = {"decode_responses": True}
+        if username:
+            client_kwargs["username"] = username
+        if password:
+            client_kwargs["password"] = password
+        self._client = redis.Redis.from_url(url, **client_kwargs)
+        self._client.ping()
+
+    def _full_key(self, key: str) -> str:
+        return f"{self._prefix}{key}"
+
+    def get_text(self, key: str) -> str | None:
+        value = self._client.get(self._full_key(key))
+        return str(value) if value is not None else None
+
+    def set_text(self, key: str, value: str, ttl_sec: int | None = None) -> None:
+        full_key = self._full_key(key)
+        if ttl_sec is None:
+            self._client.set(full_key, value)
+            return
+        self._client.setex(full_key, max(1, int(ttl_sec)), value)
+
+    def delete(self, key: str) -> None:
+        self._client.delete(self._full_key(key))
+
+    def incr(self, key: str) -> int:
+        return int(self._client.incr(self._full_key(key)))
+
+
+class AppCache:
+    def __init__(self) -> None:
+        self._backend_name = "memory"
+        self._backend: CacheBackend = MemoryCacheBackend()
+        self._lock = threading.RLock()
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
+
+    def configure(self) -> None:
+        mode = env_value(CACHE_BACKEND_ENV, "auto").strip().lower() or "auto"
+        prefix = env_value(REDIS_PREFIX_ENV, "token_index:")
+        redis_url = env_value(REDIS_URL_ENV, "")
+        redis_username = env_value(REDIS_USERNAME_ENV, "")
+        redis_password = env_value(REDIS_PASSWORD_ENV, "")
+        backend_name = "memory"
+        backend: CacheBackend = MemoryCacheBackend()
+
+        if mode in {"auto", "redis"} and redis_url:
+            try:
+                backend = RedisCacheBackend(
+                    redis_url,
+                    prefix,
+                    username=redis_username,
+                    password=redis_password,
+                )
+                backend_name = "redis"
+            except Exception:
+                if mode == "redis":
+                    backend_name = "memory"
+
+        with self._lock:
+            self._backend = backend
+            self._backend_name = backend_name
+
+    def get_json(self, key: str) -> Any | None:
+        with self._lock:
+            return self._backend.get_json(key)
+
+    def set_json(self, key: str, value: Any, ttl_sec: int | None = None) -> None:
+        with self._lock:
+            self._backend.set_json(key, value, ttl_sec=ttl_sec)
+
+    def get_text(self, key: str) -> str | None:
+        with self._lock:
+            return self._backend.get_text(key)
+
+    def set_text(self, key: str, value: str, ttl_sec: int | None = None) -> None:
+        with self._lock:
+            self._backend.set_text(key, value, ttl_sec=ttl_sec)
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._backend.delete(key)
+
+    def incr(self, key: str) -> int:
+        with self._lock:
+            return self._backend.incr(key)
 
 
 class DashboardMemoryCache:
@@ -512,6 +695,51 @@ class DashboardMemoryCache:
         self._trends_cache = {}
         self._stats_cache = {}
 
+    def record_claim(
+        self,
+        *,
+        user: dict[str, Any],
+        request_id: str,
+        claimed_at_ts: int,
+        token_ids: list[int],
+        first_claim_count: int,
+        granted: int,
+    ) -> None:
+        if granted <= 0:
+            return
+        user_id = int(user["id"])
+        event = {
+            "request_id": request_id,
+            "user_id": user_id,
+            "public_user_id": user["linuxdo_user_id"],
+            "username": user["linuxdo_username"],
+            "name": user["linuxdo_name"] or user["linuxdo_username"],
+            "claimed_at_ts": claimed_at_ts,
+            "count": granted,
+        }
+        cutoff = now_ts() - _CLAIM_EVENT_WINDOW_SEC
+        with self._lock:
+            self._claim_events = [item for item in self._claim_events if int(item["claimed_at_ts"]) >= cutoff]
+            self._claim_events.append(event)
+            self._total_claims += granted
+            self._inventory["available"] = max(0, int(self._inventory["available"]) - granted)
+            self._inventory["unclaimed"] = max(0, int(self._inventory["unclaimed"]) - first_claim_count)
+            self._user_total_claims[user_id] = self._user_total_claims.get(user_id, 0) + granted
+            claimed_tokens = self._user_unique_tokens.setdefault(user_id, set())
+            for token_id in token_ids:
+                claimed_tokens.add(int(token_id))
+                self._token_claimers.setdefault(int(token_id), set()).add(user_id)
+            self._invalidate_derived_locked()
+
+    def set_queue_total(self, total: int) -> None:
+        with self._lock:
+            self._queue = {"total": max(0, int(total))}
+
+    def adjust_queue_total(self, delta: int) -> None:
+        with self._lock:
+            current = int(self._queue.get("total", 0))
+            self._queue = {"total": max(0, current + int(delta))}
+
 
 class TokenDb:
     def __init__(self, path: Path) -> None:
@@ -639,12 +867,22 @@ class TokenDb:
                     ON token_claims(user_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_token_claims_api_time
                     ON token_claims(api_key_id, claimed_at_ts);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_user_hidden_time
+                    ON token_claims(user_id, is_hidden, claimed_at_ts DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_user_token_hidden_time
+                    ON token_claims(user_id, token_id, is_hidden, claimed_at_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_token_claims_request_user_time
+                    ON token_claims(request_id, user_id, claimed_at_ts);
                 CREATE INDEX IF NOT EXISTS idx_user_token_claims_user
                     ON user_token_claims(user_id, token_id);
                 CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
                     ON claim_queue(status, enqueued_at_ts, id);
+                CREATE INDEX IF NOT EXISTS idx_api_keys_user_status
+                    ON api_keys(user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
                     ON user_bans(linuxdo_user_id, banned_at_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_user_bans_active_lookup
+                    ON user_bans(linuxdo_user_id, unbanned_at_ts, expires_at_ts, id DESC);
                 """
             )
             claims_columns = {
@@ -882,6 +1120,7 @@ class TokenDb:
                 )
             self.ensure_inventory_policy(conn=conn)
         _refresh_dashboard_memory()
+        invalidate_all_runtime_cache(include_admin=True)
 
     def sync_new_tokens(self, token_dir: Path) -> dict[str, int]:
         now = now_ts()
@@ -960,6 +1199,7 @@ class TokenDb:
 
         if imported:
             _refresh_dashboard_memory()
+            invalidate_all_runtime_cache(include_admin=True)
         return {"imported": imported, "skipped": skipped, "errors": errors}
 
     def upsert_user(self, user: LinuxDOUser) -> dict[str, Any]:
@@ -1012,7 +1252,7 @@ class TokenDb:
             "name": user.name or user.username,
             "trust_level": user.trust_level,
         }
-        _refresh_dashboard_memory()
+        invalidate_all_runtime_cache(user_id=user_id, include_admin=True)
         return result
 
     def get_user(self, user_id: int) -> dict[str, Any] | None:
@@ -1183,6 +1423,10 @@ class TokenDb:
                 """,
                 (int(cursor.lastrowid),),
             ).fetchone()
+        target_user = self.get_user_by_linuxdo_id(linuxdo_user_id)
+        if target_user:
+            invalidate_user_cache(int(target_user["id"]))
+        invalidate_admin_cache()
         return self._format_ban_row(row) if row else {}
 
     def unban_user(self, linuxdo_user_id: str, *, unbanned_by_user_id: int, timeout_s: float = 30.0) -> bool:
@@ -1199,7 +1443,13 @@ class TokenDb:
                 """,
                 (now, unbanned_by_user_id, str(linuxdo_user_id), now),
             )
-        return int(result.rowcount or 0) > 0
+        changed = int(result.rowcount or 0) > 0
+        if changed:
+            target_user = self.get_user_by_linuxdo_id(linuxdo_user_id)
+            if target_user:
+                invalidate_user_cache(int(target_user["id"]))
+            invalidate_admin_cache()
+        return changed
 
     def list_users_for_admin(
         self,
@@ -1478,6 +1728,7 @@ class TokenDb:
             ).fetchone()
             self.ensure_inventory_policy(conn=conn)
         _refresh_dashboard_memory()
+        invalidate_all_runtime_cache(include_admin=True)
         if not row:
             return None
         return {
@@ -1579,6 +1830,7 @@ class TokenDb:
             self.ensure_inventory_policy(conn=conn)
         if cleaned_ids or compacted_content:
             _refresh_dashboard_memory()
+            invalidate_all_runtime_cache(include_admin=True)
         vacuumed = False
         if compact_db_content and compacted_content > 0:
             self.vacuum_database()
@@ -1700,6 +1952,13 @@ class TokenDb:
                 "user_id": user_id,
                 "status": "active",
             }
+        _APP_CACHE.set_json(
+            build_cache_key("apikey-resolve", key_hash),
+            {"api_key_id": api_key_id, "user_id": user_id, "status": "active"},
+            ttl_sec=get_cache_me_ttl(),
+        )
+        invalidate_user_cache(user_id)
+        invalidate_admin_cache()
         return created
 
     def revoke_api_key(self, user_id: int, api_key_id: int) -> None:
@@ -1720,9 +1979,19 @@ class TokenDb:
         if row:
             with _API_KEY_CACHE_LOCK:
                 _API_KEY_CACHE_BY_HASH.pop(str(row["key_hash"]), None)
+            _APP_CACHE.delete(build_cache_key("apikey-resolve", str(row["key_hash"])))
+        invalidate_user_cache(user_id)
+        invalidate_admin_cache()
 
     def resolve_api_key(self, api_key: str) -> dict[str, Any] | None:
         key_hash = hash_api_key(api_key)
+        cache_key = build_cache_key("apikey-resolve", key_hash)
+        cached_payload = _APP_CACHE.get_json(cache_key)
+        if isinstance(cached_payload, dict) and cached_payload.get("status") == "active":
+            return {
+                "api_key_id": int(cached_payload["api_key_id"]),
+                "user_id": int(cached_payload["user_id"]),
+            }
         with _API_KEY_CACHE_LOCK:
             cached = _API_KEY_CACHE_BY_HASH.get(key_hash)
 
@@ -1743,6 +2012,7 @@ class TokenDb:
         record = {"api_key_id": int(row["api_key_id"]), "user_id": int(row["user_id"])}
         with _API_KEY_CACHE_LOCK:
             _API_KEY_CACHE_BY_HASH[key_hash] = {**record, "status": "active"}
+        _APP_CACHE.set_json(cache_key, {**record, "status": "active"}, ttl_sec=get_cache_me_ttl())
         return record
 
     def get_quota_usage(self, user_id: int) -> dict[str, int]:
@@ -2098,6 +2368,9 @@ class TokenDb:
         cutoff = now - 3600
         request_id = secrets.token_hex(8)
         result: dict[str, Any] | None = None
+        granted_token_ids: list[int] = []
+        first_claim_count = 0
+        queued_created = False
 
         with self._lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2142,6 +2415,7 @@ class TokenDb:
 
             if claim_queue.has_pending_queue(self, conn=conn):
                 queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                queued_created = not bool(queued.get("existing"))
                 result = {
                     "request_id": queued["request_id"],
                     "items": [],
@@ -2157,6 +2431,7 @@ class TokenDb:
                 available = self.count_claimable_tokens_for_user(conn, user_id)
                 if available < target:
                     queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                    queued_created = not bool(queued.get("existing"))
                     result = {
                         "request_id": queued["request_id"],
                         "items": [],
@@ -2173,6 +2448,7 @@ class TokenDb:
 
                     if not rows:
                         queued = claim_queue.enqueue_claim(self, user_id, api_key_id, target, conn=conn)
+                        queued_created = not bool(queued.get("existing"))
                         result = {
                             "request_id": queued["request_id"],
                             "items": [],
@@ -2188,6 +2464,7 @@ class TokenDb:
                         items: list[dict[str, Any]] = []
                         for row in rows:
                             token_id = int(row["id"])
+                            first_claim = int(row["claim_count"]) <= 0
                             new_count = int(row["claim_count"]) + 1
                             new_available = 1 if new_count < int(row["max_claims"]) else 0
                             savepoint = f"claim_token_{token_id}"
@@ -2238,6 +2515,9 @@ class TokenDb:
                                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                                 continue
 
+                            if first_claim:
+                                first_claim_count += 1
+                            granted_token_ids.append(token_id)
                             items.append(
                                 {
                                     "claim_id": claim_id,
@@ -2262,7 +2542,20 @@ class TokenDb:
 
         if result is None:
             raise RuntimeError("claim_tokens completed without a result")
-        _refresh_dashboard_memory()
+        if queued_created:
+            _DASHBOARD_CACHE.adjust_queue_total(1)
+        if result.get("granted"):
+            user = self.get_user(user_id)
+            if user:
+                _DASHBOARD_CACHE.record_claim(
+                    user=user,
+                    request_id=str(result["request_id"]),
+                    claimed_at_ts=now,
+                    token_ids=granted_token_ids,
+                    first_claim_count=first_claim_count,
+                    granted=int(result["granted"]),
+                )
+        invalidate_all_runtime_cache(user_id=user_id, include_admin=True)
         return result
 
     def get_claimed_token(self, token_id: int, user_id: int) -> dict[str, Any] | None:
@@ -2402,7 +2695,10 @@ class TokenDb:
                 """,
                 (user_id, *claim_ids),
             )
-            return int(cursor.rowcount or 0)
+            changed = int(cursor.rowcount or 0)
+        if changed:
+            invalidate_user_cache(user_id)
+        return changed
 
     def list_claim_files(self, user_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -2548,6 +2844,127 @@ def get_db_path() -> Path:
     if raw:
         return Path(raw)
     return BASE_DIR / "token_atlas.db"
+
+
+def get_cache_default_ttl() -> int:
+    return max(1, env_int(CACHE_DEFAULT_TTL_ENV, 15))
+
+
+def get_cache_me_ttl() -> int:
+    return max(1, env_int(CACHE_ME_TTL_ENV, 10))
+
+
+def get_cache_claims_ttl() -> int:
+    return max(1, env_int(CACHE_CLAIMS_TTL_ENV, 15))
+
+
+def get_cache_admin_ttl() -> int:
+    return max(1, env_int(CACHE_ADMIN_TTL_ENV, 20))
+
+
+def get_cache_queue_ttl() -> int:
+    return max(1, env_int(CACHE_QUEUE_TTL_ENV, 5))
+
+
+def get_cache_dashboard_ttl() -> int:
+    return max(1, env_int(CACHE_DASHBOARD_TTL_ENV, 10))
+
+
+def _cache_version_key(scope: str, *parts: Any) -> str:
+    clean_parts = [str(part).strip() for part in parts if str(part).strip()]
+    suffix = ":".join(clean_parts)
+    if not suffix:
+        return f"ns:{scope}"
+    return f"ns:{scope}:{suffix}"
+
+
+def get_cache_scope_version(scope: str, *parts: Any) -> int:
+    key = _cache_version_key(scope, *parts)
+    raw = _APP_CACHE.get_text(key)
+    if raw is None:
+        _APP_CACHE.set_text(key, "1")
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        _APP_CACHE.set_text(key, "1")
+        return 1
+    return max(1, value)
+
+
+def bump_cache_scope(scope: str, *parts: Any) -> int:
+    return max(1, _APP_CACHE.incr(_cache_version_key(scope, *parts)))
+
+
+def build_cache_key(prefix: str, *parts: Any) -> str:
+    values = [prefix]
+    for part in parts:
+        values.append(str(part))
+    return ":".join(values)
+
+
+def cache_json(key: str, ttl_sec: int, loader: Callable[[], Any]) -> Any:
+    cached = _APP_CACHE.get_json(key)
+    if cached is not None:
+        return cached
+    payload = loader()
+    _APP_CACHE.set_json(key, payload, ttl_sec=ttl_sec)
+    return payload
+
+
+def invalidate_user_cache(user_id: int) -> None:
+    bump_cache_scope("user", user_id)
+    _QUEUE_STATUS_CACHE.pop(int(user_id), None)
+
+
+def invalidate_dashboard_cache(*, user_id: int | None = None) -> None:
+    bump_cache_scope("dashboard")
+    if user_id is not None:
+        bump_cache_scope("dashboard-user", user_id)
+
+
+def invalidate_admin_cache() -> None:
+    bump_cache_scope("admin")
+
+
+def invalidate_all_runtime_cache(*, user_id: int | None = None, include_admin: bool = False) -> None:
+    if user_id is not None:
+        invalidate_user_cache(user_id)
+    invalidate_dashboard_cache(user_id=user_id)
+    if include_admin:
+        invalidate_admin_cache()
+
+
+def build_user_cache_key(prefix: str, user_id: int, *parts: Any) -> str:
+    version = get_cache_scope_version("user", user_id)
+    return build_cache_key(prefix, user_id, f"v{version}", *parts)
+
+
+def build_dashboard_cache_key(prefix: str, *parts: Any, user_id: int | None = None) -> str:
+    dashboard_version = get_cache_scope_version("dashboard")
+    if user_id is None:
+        return build_cache_key(prefix, f"v{dashboard_version}", *parts)
+    user_version = get_cache_scope_version("dashboard-user", user_id)
+    return build_cache_key(prefix, user_id, f"v{dashboard_version}", f"uv{user_version}", *parts)
+
+
+def build_admin_cache_key(prefix: str, *parts: Any) -> str:
+    version = get_cache_scope_version("admin")
+    return build_cache_key(prefix, f"v{version}", *parts)
+
+
+def get_queue_total_snapshot(db_handle: "TokenDb") -> int:
+    with db_handle.connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM claim_queue WHERE status = 'queued' AND remaining > 0"
+        ).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def refresh_queue_total_snapshot(db_handle: "TokenDb") -> int:
+    total = get_queue_total_snapshot(db_handle)
+    _DASHBOARD_CACHE.set_queue_total(total)
+    return total
 
 
 
@@ -2945,7 +3362,8 @@ def verify_api_key(
 
 
 def build_claimed_documents(user_id: int) -> list[TokenDocument]:
-    items = db.list_claimed_tokens(user_id)
+    key = build_user_cache_key("me-claimed-docs", user_id)
+    items = cache_json(key, get_cache_claims_ttl(), lambda: db.list_claimed_tokens(user_id))
     documents: list[TokenDocument] = []
 
     for index, item in enumerate(items):
@@ -3006,12 +3424,15 @@ _TOKEN_IMPORT_STOP = threading.Event()
 _TOKEN_IMPORT_INTERVAL_SEC = 60.0
 _API_KEY_CACHE_LOCK = threading.RLock()
 _API_KEY_CACHE_BY_HASH: dict[str, dict[str, Any]] = {}
+_APP_CACHE = AppCache()
+_APP_CACHE.configure()
 _DASHBOARD_CACHE = DashboardMemoryCache()
 
 
 def _refresh_dashboard_memory() -> None:
     _DASHBOARD_CACHE.refresh_from_db(db)
     _QUEUE_STATUS_CACHE.clear()
+    invalidate_dashboard_cache()
 
 
 def try_fulfill_queue(db_handle: TokenDb) -> None:
@@ -3027,11 +3448,24 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
         apikey_rate_limit=get_apikey_rate_per_minute(),
     )
     if result.get("fulfilled") or result.get("updated"):
-        _refresh_dashboard_memory()
+        for event in result.get("events", []):
+            user = db_handle.get_user(int(event["user_id"]))
+            if user:
+                _DASHBOARD_CACHE.record_claim(
+                    user=user,
+                    request_id=str(event["request_id"]),
+                    claimed_at_ts=int(event["claimed_at_ts"]),
+                    token_ids=[int(token_id) for token_id in event.get("token_ids", [])],
+                    first_claim_count=int(event.get("first_claim_count", 0)),
+                    granted=int(event.get("granted", 0)),
+                )
+            invalidate_all_runtime_cache(user_id=int(event["user_id"]), include_admin=True)
+        refresh_queue_total_snapshot(db_handle)
+        invalidate_dashboard_cache()
 
 
-def _cache_fresh(ts: float) -> bool:
-    return time.time() - ts < _CACHE_TTL_SEC
+def _cache_fresh(ts: float, ttl_sec: float | None = None) -> bool:
+    return time.time() - ts < (ttl_sec if ttl_sec is not None else _CACHE_TTL_SEC)
 
 
 def _queue_pump_loop() -> None:
@@ -3056,10 +3490,12 @@ def _token_import_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    _APP_CACHE.configure()
     db.init_db()
     sync_tokens_with_retry(db, TOKEN_DIR)
     try_fulfill_queue(db)
     _refresh_dashboard_memory()
+    refresh_queue_total_snapshot(db)
 
     _QUEUE_PUMP_STOP.clear()
     _TOKEN_IMPORT_STOP.clear()
@@ -3188,9 +3624,7 @@ def get_auth_status(request: Request) -> dict[str, Any]:
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/admin/me")
-def get_admin_me(request: Request) -> dict[str, Any]:
-    context = require_admin_user(request)
+def _build_admin_me_payload(context: dict[str, Any]) -> dict[str, Any]:
     policy = get_inventory_policy(db)
     return {
         "user": context["user"],
@@ -3207,6 +3641,17 @@ def get_admin_me(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/admin/me")
+def get_admin_me(request: Request) -> dict[str, Any]:
+    context = require_admin_user(request)
+    key = build_admin_cache_key("admin-me", context["user_id"])
+    return cache_json(
+        key,
+        get_cache_admin_ttl(),
+        lambda: _build_admin_me_payload(context),
+    )
+
+
 @app.get("/admin/users")
 def admin_list_users(
     request: Request,
@@ -3216,13 +3661,19 @@ def admin_list_users(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     require_admin_user(request)
-    return db.list_users_for_admin(search=search, ban_status=ban_status, limit=limit, offset=offset)
+    key = build_admin_cache_key("admin-users", search.strip().lower(), ban_status, limit, offset)
+    return cache_json(
+        key,
+        get_cache_admin_ttl(),
+        lambda: db.list_users_for_admin(search=search, ban_status=ban_status, limit=limit, offset=offset),
+    )
 
 
 @app.get("/admin/users/{linuxdo_user_id}")
 def admin_get_user_detail(request: Request, linuxdo_user_id: str) -> dict[str, Any]:
     require_admin_user(request)
-    detail = db.get_admin_user_detail(linuxdo_user_id)
+    key = build_admin_cache_key("admin-user-detail", linuxdo_user_id)
+    detail = cache_json(key, get_cache_admin_ttl(), lambda: db.get_admin_user_detail(linuxdo_user_id))
     if not detail:
         error_json = json.dumps({"detail": "User not found."}, ensure_ascii=False).encode("utf-8")
         return Response(status_code=status.HTTP_404_NOT_FOUND, content=error_json, media_type="application/json")
@@ -3299,7 +3750,12 @@ def admin_list_bans(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     require_admin_user(request)
-    return db.list_bans(status_filter=status_filter, search=search, limit=limit, offset=offset)
+    key = build_admin_cache_key("admin-bans", status_filter, search.strip().lower(), limit, offset)
+    return cache_json(
+        key,
+        get_cache_admin_ttl(),
+        lambda: db.list_bans(status_filter=status_filter, search=search, limit=limit, offset=offset),
+    )
 
 
 @app.get("/admin/tokens")
@@ -3311,7 +3767,12 @@ def admin_list_tokens(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     require_admin_user(request)
-    return db.list_tokens_for_admin(search=search, status_filter=status_filter, limit=limit, offset=offset)
+    key = build_admin_cache_key("admin-tokens", search.strip().lower(), status_filter, limit, offset)
+    return cache_json(
+        key,
+        get_cache_admin_ttl(),
+        lambda: db.list_tokens_for_admin(search=search, status_filter=status_filter, limit=limit, offset=offset),
+    )
 
 
 @app.post("/admin/tokens/{token_id}/activate")
@@ -3394,28 +3855,31 @@ def admin_get_policy(request: Request) -> dict[str, Any]:
 def get_me(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    user = db.get_user(user_id)
-    if not user:
-        raise PermissionError
-    quota = db.get_quota_usage(user_id)
-    totals = db.get_user_claim_totals(user_id)
-    api_keys = db.list_api_keys(user_id)
-    return {
-        "user": {
-            "id": user["linuxdo_user_id"],
-            "username": user["linuxdo_username"],
-            "name": user["linuxdo_name"] or user["linuxdo_username"],
-            "trust_level": user["trust_level"],
-            "is_admin": session["is_admin"],
-            "is_banned": False,
-        },
-        "quota": quota,
-        "claims": totals,
-        "api_keys": {
-            "limit": get_apikey_max_per_user(),
-            "active": len([key for key in api_keys if key["status"] == "active"]),
-        },
-    }
+    key = build_user_cache_key("me", user_id, int(session["is_admin"]))
+    def _load_me() -> dict[str, Any]:
+        user = db.get_user(user_id)
+        if not user:
+            raise PermissionError
+        quota = db.get_quota_usage(user_id)
+        totals = db.get_user_claim_totals(user_id)
+        api_keys = db.list_api_keys(user_id)
+        return {
+            "user": {
+                "id": user["linuxdo_user_id"],
+                "username": user["linuxdo_username"],
+                "name": user["linuxdo_name"] or user["linuxdo_username"],
+                "trust_level": user["trust_level"],
+                "is_admin": session["is_admin"],
+                "is_banned": False,
+            },
+            "quota": quota,
+            "claims": totals,
+            "api_keys": {
+                "limit": get_apikey_max_per_user(),
+                "active": len([key for key in api_keys if key["status"] == "active"]),
+            },
+        }
+    return cache_json(key, get_cache_me_ttl(), _load_me)
 
 
 @app.get("/dashboard/leaderboard")
@@ -3427,7 +3891,8 @@ def get_dashboard_leaderboard(
     require_session_user(request)
     window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
     limit = min(limit, 50)
-    return _DASHBOARD_CACHE.get_leaderboard(window_sec, limit)
+    key = build_dashboard_cache_key("dashboard-leaderboard", window_sec, limit)
+    return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_leaderboard(window_sec, limit))
 
 
 @app.get("/dashboard/summary")
@@ -3441,37 +3906,44 @@ def get_dashboard_summary(
 ) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    full_stats = _DASHBOARD_CACHE.get_stats(user_id)
-    stats = {
-        "total_tokens": full_stats["total_tokens"],
-        "available_tokens": full_stats["available_tokens"],
-        "claimed_total": full_stats["claimed_total"],
-        "claimed_unique": full_stats["claimed_unique"],
-        "others_claimed_total": full_stats["others_claimed_total"],
-        "others_claimed_unique": full_stats["others_claimed_unique"],
-    }
-
     leaderboard_window_sec = parse_window_to_seconds(
         leaderboard_window, 24 * 3600, max_seconds=7 * 24 * 3600
     )
     leaderboard_limit = min(leaderboard_limit, 50)
-    leaderboard = _DASHBOARD_CACHE.get_leaderboard(leaderboard_window_sec, leaderboard_limit)
-
     recent_limit = min(recent_limit, 50)
-    recent = _DASHBOARD_CACHE.get_recent(recent_limit)
-
     window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
     bucket_sec = parse_bucket_seconds(bucket, 3600)
-    trends = _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec)
-    system = _DASHBOARD_CACHE.get_system_status()
-
-    return {
-        "stats": stats,
-        "leaderboard": leaderboard,
-        "recent": recent,
-        "trends": trends,
-        "system": system,
-    }
+    key = build_dashboard_cache_key(
+        "dashboard-summary",
+        window_sec,
+        bucket_sec,
+        leaderboard_window_sec,
+        leaderboard_limit,
+        recent_limit,
+        user_id=user_id,
+    )
+    def _load_summary() -> dict[str, Any]:
+        full_stats = _DASHBOARD_CACHE.get_stats(user_id)
+        stats = {
+            "total_tokens": full_stats["total_tokens"],
+            "available_tokens": full_stats["available_tokens"],
+            "claimed_total": full_stats["claimed_total"],
+            "claimed_unique": full_stats["claimed_unique"],
+            "others_claimed_total": full_stats["others_claimed_total"],
+            "others_claimed_unique": full_stats["others_claimed_unique"],
+        }
+        leaderboard = _DASHBOARD_CACHE.get_leaderboard(leaderboard_window_sec, leaderboard_limit)
+        recent = _DASHBOARD_CACHE.get_recent(recent_limit)
+        trends = _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec)
+        system = _DASHBOARD_CACHE.get_system_status()
+        return {
+            "stats": stats,
+            "leaderboard": leaderboard,
+            "recent": recent,
+            "trends": trends,
+            "system": system,
+        }
+    return cache_json(key, get_cache_dashboard_ttl(), _load_summary)
 
 
 @app.get("/dashboard/recent-claims")
@@ -3480,7 +3952,8 @@ def get_dashboard_recent_claims(
     limit: int = Query(default=20, ge=1, le=50),
 ) -> dict[str, Any]:
     require_session_user(request)
-    return _DASHBOARD_CACHE.get_recent(limit)
+    key = build_dashboard_cache_key("dashboard-recent", limit)
+    return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_recent(limit))
 
 
 @app.get("/dashboard/trends")
@@ -3492,36 +3965,45 @@ def get_dashboard_trends(
     require_session_user(request)
     window_sec = parse_window_to_seconds(window, 7 * 24 * 3600, max_seconds=14 * 24 * 3600)
     bucket_sec = parse_bucket_seconds(bucket, 3600)
-    return _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec)
+    key = build_dashboard_cache_key("dashboard-trends", window_sec, bucket_sec)
+    return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_trends(window_sec, bucket_sec))
 
 
 @app.get("/dashboard/system-status")
 def get_dashboard_system_status(request: Request) -> dict[str, Any]:
     require_session_user(request)
-    return _DASHBOARD_CACHE.get_system_status()
+    key = build_dashboard_cache_key("dashboard-system")
+    return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_system_status())
 
 
 @app.get("/dashboard/stats")
 def get_dashboard_stats(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    stats = _DASHBOARD_CACHE.get_stats(user_id)
-    return {
-        "total_tokens": stats["total_tokens"],
-        "available_tokens": stats["available_tokens"],
-        "claimed_total": stats["claimed_total"],
-        "claimed_unique": stats["claimed_unique"],
-        "others_claimed_total": stats["others_claimed_total"],
-        "others_claimed_unique": stats["others_claimed_unique"],
-    }
+    key = build_dashboard_cache_key("dashboard-stats", user_id=user_id)
+    def _load_stats() -> dict[str, Any]:
+        stats = _DASHBOARD_CACHE.get_stats(user_id)
+        return {
+            "total_tokens": stats["total_tokens"],
+            "available_tokens": stats["available_tokens"],
+            "claimed_total": stats["claimed_total"],
+            "claimed_unique": stats["claimed_unique"],
+            "others_claimed_total": stats["others_claimed_total"],
+            "others_claimed_unique": stats["others_claimed_unique"],
+        }
+    return cache_json(key, get_cache_dashboard_ttl(), _load_stats)
 
 
 @app.get("/me/api-keys")
 def list_api_keys(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    keys = db.list_api_keys(user_id)
-    return {"items": keys, "limit": get_apikey_max_per_user()}
+    key = build_user_cache_key("me-api-keys", user_id)
+    return cache_json(
+        key,
+        get_cache_me_ttl(),
+        lambda: {"items": db.list_api_keys(user_id), "limit": get_apikey_max_per_user()},
+    )
 
 
 @app.post("/me/api-keys")
@@ -3545,26 +4027,36 @@ def revoke_api_key(request: Request, api_key_id: int) -> Response:
 def list_claims(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    items = db.list_claims(user_id)
-    for item in items:
-        item["download_url"] = build_download_url(request, item["token_id"])
-    return {"items": items}
+    key = build_user_cache_key("me-claims", user_id)
+    def _load_claims() -> dict[str, Any]:
+        items = db.list_claims(user_id)
+        for item in items:
+            item["download_url"] = build_download_url(request, item["token_id"])
+        return {"items": items}
+    return cache_json(key, get_cache_claims_ttl(), _load_claims)
 
 
 @app.get("/me/queue-status")
 def get_queue_status(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
+    key = build_user_cache_key("me-queue-status", user_id)
+    cached_payload = _APP_CACHE.get_json(key)
+    if cached_payload is not None:
+        return cached_payload
     cached = _QUEUE_STATUS_CACHE.get(user_id)
-    if cached and _cache_fresh(cached[0]):
+    if cached and _cache_fresh(cached[0], ttl_sec=float(get_cache_queue_ttl())):
+        _APP_CACHE.set_json(key, cached[1], ttl_sec=get_cache_queue_ttl())
         return cached[1]
     status = db.get_queue_status(user_id)
     if not status:
         payload = {"queued": False}
         _QUEUE_STATUS_CACHE[user_id] = (time.time(), payload)
+        _APP_CACHE.set_json(key, payload, ttl_sec=get_cache_queue_ttl())
         return payload
     payload = {"queued": True, **status}
     _QUEUE_STATUS_CACHE[user_id] = (time.time(), payload)
+    _APP_CACHE.set_json(key, payload, ttl_sec=get_cache_queue_ttl())
     return payload
 
 
@@ -3581,7 +4073,8 @@ def hide_claims(request: Request, payload: ClaimHidePayload) -> dict[str, Any]:
 def download_claims_archive(request: Request) -> StreamingResponse:
     session = require_session_user(request)
     user_id = session["user_id"]
-    items = db.list_claim_files(user_id)
+    key = build_user_cache_key("me-claim-files", user_id)
+    items = cache_json(key, get_cache_claims_ttl(), lambda: db.list_claim_files(user_id))
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         for item in items:
@@ -3636,7 +4129,8 @@ def download_claimed_token(
     if not user_id:
         raise PermissionError
 
-    token = db.get_claimed_token(token_id, user_id)
+    key = build_user_cache_key("claimed-token", user_id, token_id)
+    token = cache_json(key, get_cache_claims_ttl(), lambda: db.get_claimed_token(token_id, user_id))
     if not token:
         raise PermissionError
 

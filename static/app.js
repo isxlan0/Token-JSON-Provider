@@ -18,6 +18,7 @@ const state = {
   lastClaimTotal: null,
   claimsInitialized: false,
   skipNextClaimModal: false,
+  refreshCounter: 0,
 };
 
 const elements = {
@@ -726,7 +727,9 @@ async function loadDashboard() {
   renderUser();
   renderQuota();
   renderMyClaims();
+}
 
+async function loadApiKeys() {
   const keys = await fetchJson("/me/api-keys");
   state.apiKeys = keys.items || [];
   renderApiKeys(keys.limit || 0);
@@ -747,13 +750,13 @@ async function createApiKey() {
   elements.apiKeyCreated.textContent = `已创建 Key：${displayKey}`;
   elements.apiKeyCreated.classList.remove("hidden");
   await loadDashboard();
+  await loadApiKeys();
   await loadDashboardSummary();
 }
 
 async function revokeApiKey(keyId) {
   await fetchJson(`/me/api-keys/${keyId}/revoke`, { method: "POST" });
-  state.apiKeys = (state.apiKeys || []).filter((key) => key.id !== keyId);
-  renderApiKeys(state.apiKeys.length || 0);
+  await loadApiKeys();
 }
 
 async function claimTokens() {
@@ -844,10 +847,14 @@ async function refreshAll() {
   }
   state.refreshing = true;
   try {
-    await loadDashboard();
+    state.refreshCounter += 1;
+    const shouldRunHeavyRefresh = state.refreshCounter % 4 === 0;
     await loadDashboardSummary();
-    await loadClaims();
     await loadQueueStatus();
+    if (shouldRunHeavyRefresh) {
+      await loadDashboard();
+      await loadClaims();
+    }
   } catch (error) {
     if (!handleAccessError(error)) {
       // ignore refresh errors
@@ -948,6 +955,7 @@ async function init() {
       showScreen("app");
       switchTab("data");
       await loadDashboard();
+      await loadApiKeys();
       await loadDashboardSummary();
       await loadClaims();
       await loadQueueStatus();
