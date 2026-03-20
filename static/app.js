@@ -2,7 +2,12 @@ const state = {
   user: null,
   quota: null,
   stats: null,
-  apiKeys: [],
+  apiKeysState: {
+    items: [],
+    limit: 0,
+    active: 0,
+    loaded: false,
+  },
   claimResults: [],
   claimSelected: new Set(),
   claimMultiMode: false,
@@ -25,6 +30,7 @@ const state = {
   uploadQueue: [],
   uploadResults: [],
   isUploading: false,
+  activeTab: "data",
 };
 
 const elements = {
@@ -122,6 +128,7 @@ function showScreen(name) {
 }
 
 function switchTab(name) {
+  state.activeTab = name;
   const views = [
     { key: "data", tab: elements.tabData, view: elements.viewData },
     { key: "keys", tab: elements.tabKeys, view: elements.viewKeys },
@@ -153,6 +160,13 @@ function switchTab(name) {
 
   if (name === "claim" || name === "upload") {
     refreshAll();
+  }
+  if (name === "keys") {
+    ensureApiKeysLoaded().catch((error) => {
+      if (!handleAccessError(error)) {
+        console.error("加载 API Keys 失败", error);
+      }
+    });
   }
 }
 
@@ -630,10 +644,11 @@ function setClaimQueued(queued) {
   syncClaimButtonState();
 }
 
-function renderApiKeys(limit) {
+function renderApiKeys() {
   elements.apiKeyList.innerHTML = "";
-  const keys = (state.apiKeys || []).filter((key) => key.status === "active");
-  elements.apiKeyLimit.textContent = `可用 API Key：${keys.length} / ${limit}`;
+  const payload = state.apiKeysState || { items: [], limit: 0, active: 0, loaded: false };
+  const keys = (payload.items || []).filter((key) => key.status === "active");
+  elements.apiKeyLimit.textContent = `可用 API Key：${payload.active || keys.length} / ${payload.limit || 0}`;
   if (!keys.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -676,6 +691,26 @@ function renderApiKeys(limit) {
     });
     elements.apiKeyList.appendChild(item);
   });
+}
+
+function applyApiKeySummary(summary) {
+  state.apiKeysState = {
+    ...state.apiKeysState,
+    limit: summary?.limit || 0,
+    active: summary?.active || 0,
+  };
+}
+
+function applyApiKeysPayload(payload) {
+  state.apiKeysState = {
+    items: payload?.items || [],
+    limit: payload?.limit || 0,
+    active: payload?.active || 0,
+    loaded: true,
+  };
+  if (state.activeTab === "keys") {
+    renderApiKeys();
+  }
 }
 
 function renderUploadPolicy() {
@@ -837,7 +872,6 @@ async function uploadTokens() {
     );
     state.uploadQueue = state.uploadQueue.filter((_, index) => retryIndexes.has(index));
     renderUploadSelected();
-    await loadDashboard();
     await loadDashboardSummary();
   } catch (error) {
     elements.uploadError.textContent = error.message;
@@ -966,40 +1000,63 @@ async function loadDashboard() {
   state.quota = me.quota;
   state.claims = me.claims;
   state.uploadPolicy = me.uploads || null;
+  applyApiKeySummary(me.api_keys || {});
   renderUser();
   renderQuota();
   renderMyClaims();
   renderUploadPolicy();
 }
 
+async function loadQuotaSummary() {
+  const quota = await fetchJson("/me/quota");
+  state.quota = quota;
+  renderQuota();
+}
+
+async function loadClaimSummary() {
+  const claims = await fetchJson("/me/claims-summary");
+  state.claims = claims;
+  renderMyClaims();
+}
+
+async function loadApiKeySummary() {
+  const summary = await fetchJson("/me/api-key-summary");
+  applyApiKeySummary(summary || {});
+}
+
 async function loadApiKeys() {
   const keys = await fetchJson("/me/api-keys");
-  state.apiKeys = keys.items || [];
-  renderApiKeys(keys.limit || 0);
+  applyApiKeysPayload(keys);
+}
+
+async function ensureApiKeysLoaded(force = false) {
+  if (!force && state.apiKeysState.loaded) {
+    renderApiKeys();
+    return;
+  }
+  await loadApiKeys();
 }
 
 async function createApiKey() {
   elements.apiKeyCreated.classList.add("hidden");
   const name = elements.apiKeyName.value.trim();
   const payload = name ? { name } : {};
-  const created = await fetchJson("/me/api-keys", {
+  const apiKeys = await fetchJson("/me/api-keys", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
   elements.apiKeyName.value = "";
 
-  const displayKey = created.token || "-";
+  applyApiKeysPayload(apiKeys);
+  const displayKey = apiKeys?.items?.[0]?.token || "-";
   elements.apiKeyCreated.textContent = `已创建 Key：${displayKey}`;
   elements.apiKeyCreated.classList.remove("hidden");
-  await loadDashboard();
-  await loadApiKeys();
-  await loadDashboardSummary();
 }
 
 async function revokeApiKey(keyId) {
-  await fetchJson(`/me/api-keys/${keyId}/revoke`, { method: "POST" });
-  await loadApiKeys();
+  const apiKeys = await fetchJson(`/me/api-keys/${keyId}/revoke`, { method: "POST" });
+  applyApiKeysPayload(apiKeys);
 }
 
 async function claimTokens() {
@@ -1030,6 +1087,23 @@ async function claimTokens() {
       state.skipNextClaimModal = true;
     }
     await loadClaims();
+    state.quota = result.quota || state.quota;
+    renderQuota();
+    if (result.granted && result.granted > 0) {
+      state.claims = {
+        ...(state.claims || {}),
+        total: (state.claims?.total || 0) + result.granted,
+      };
+      renderMyClaims();
+      if (state.stats) {
+        state.stats = {
+          ...state.stats,
+          available_tokens: Math.max(0, (state.stats.available_tokens || 0) - result.granted),
+          claimed_total: (state.stats.claimed_total || 0) + result.granted,
+        };
+        renderStats();
+      }
+    }
     if (result.queued) {
       setClaimQueued(true);
       state.queueStatus = {
@@ -1050,8 +1124,6 @@ async function claimTokens() {
       }
     }
     renderClaimResults();
-    await loadDashboard();
-    await loadDashboardSummary();
     await loadQueueStatus();
   } catch (error) {
     setClaimQueued(false);
@@ -1104,11 +1176,13 @@ async function refreshAll() {
   state.refreshing = true;
   try {
     state.refreshCounter += 1;
-    const shouldRunHeavyRefresh = state.refreshCounter % 4 === 0;
+    const shouldRefreshClaims = state.refreshCounter % 4 === 0;
     await loadDashboardSummary();
     await loadQueueStatus();
-    if (shouldRunHeavyRefresh) {
-      await loadDashboard();
+    await loadQuotaSummary();
+    await loadApiKeySummary();
+    if (shouldRefreshClaims) {
+      await loadClaimSummary();
       await loadClaims();
     }
   } catch (error) {
@@ -1257,11 +1331,12 @@ async function init() {
     } else {
       showScreen("app");
       switchTab("data");
-      await loadDashboard();
-      await loadApiKeys();
-      await loadDashboardSummary();
-      await loadClaims();
-      await loadQueueStatus();
+      await Promise.all([
+        loadDashboard(),
+        loadDashboardSummary(),
+        loadClaims(),
+        loadQueueStatus(),
+      ]);
       startAutoRefresh();
     }
   } catch (error) {

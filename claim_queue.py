@@ -65,29 +65,19 @@ def enqueue_claim(
     def _enqueue(target_conn):
         existing = target_conn.execute(
             """
-            SELECT id, requested, remaining, enqueued_at_ts, request_id
+            SELECT id, requested, remaining, queue_rank, enqueued_at_ts, request_id
             FROM claim_queue
             WHERE user_id = ? AND status = 'queued' AND remaining > 0
-            ORDER BY enqueued_at_ts ASC, id ASC
+            ORDER BY queue_rank ASC, id ASC
             LIMIT 1
             """,
             (user_id,),
         ).fetchone()
         if existing:
-            queue_id = int(existing["id"])
-            row = target_conn.execute(
-                """
-                SELECT COUNT(*) as cnt
-                FROM claim_queue
-                WHERE status = 'queued'
-                  AND (enqueued_at_ts < ? OR (enqueued_at_ts = ? AND id < ?))
-                """,
-                (int(existing["enqueued_at_ts"]), int(existing["enqueued_at_ts"]), queue_id),
-            ).fetchone()
-            ahead = int(row["cnt"]) if row else 0
+            queue_rank = max(1, int(existing["queue_rank"]))
             return (
-                queue_id,
-                ahead,
+                int(existing["id"]),
+                queue_rank,
                 int(existing["requested"]),
                 int(existing["remaining"]),
                 int(existing["enqueued_at_ts"]),
@@ -95,37 +85,39 @@ def enqueue_claim(
                 True,
             )
 
+        runtime_row = target_conn.execute(
+            "SELECT total_queued FROM queue_runtime WHERE id = 1"
+        ).fetchone()
+        total_queued = int(runtime_row["total_queued"]) if runtime_row else 0
+        queue_rank = total_queued + 1
         cursor = target_conn.execute(
             """
             INSERT INTO claim_queue (
-                user_id, api_key_id, requested, remaining, enqueued_at_ts, request_id, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'queued')
+                user_id, api_key_id, requested, remaining, queue_rank, enqueued_at_ts, request_id, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')
             """,
-            (user_id, api_key_id, requested, requested, now, request_id),
+            (user_id, api_key_id, requested, requested, queue_rank, now, request_id),
         )
-        queue_id = int(cursor.lastrowid)
-        row = target_conn.execute(
+        target_conn.execute(
             """
-            SELECT COUNT(*) as cnt
-            FROM claim_queue
-            WHERE status = 'queued'
-              AND (enqueued_at_ts < ? OR (enqueued_at_ts = ? AND id < ?))
+            UPDATE queue_runtime
+            SET total_queued = ?, updated_at_ts = ?
+            WHERE id = 1
             """,
-            (now, now, queue_id),
-        ).fetchone()
-        ahead = int(row["cnt"]) if row else 0
-        return queue_id, ahead, requested, requested, now, request_id, False
+            (queue_rank, now),
+        )
+        return int(cursor.lastrowid), queue_rank, requested, requested, now, request_id, False
 
     if conn is None:
         with db._lock, db.connect() as target_conn:
             target_conn.execute("BEGIN IMMEDIATE")
-            queue_id, ahead, requested_val, remaining_val, enqueued_ts, req_id, existing = _enqueue(target_conn)
+            queue_id, queue_rank, requested_val, remaining_val, enqueued_ts, req_id, existing = _enqueue(target_conn)
     else:
-        queue_id, ahead, requested_val, remaining_val, enqueued_ts, req_id, existing = _enqueue(conn)
+        queue_id, queue_rank, requested_val, remaining_val, enqueued_ts, req_id, existing = _enqueue(conn)
 
     return {
         "queue_id": queue_id,
-        "position": ahead + 1,
+        "position": max(1, int(queue_rank)),
         "request_id": req_id,
         "requested": requested_val,
         "remaining": remaining_val,
@@ -153,10 +145,10 @@ def fulfill_queue(
             pass
         queue_rows = conn.execute(
             """
-            SELECT id, user_id, api_key_id, remaining, request_id
+            SELECT id, user_id, api_key_id, remaining, request_id, queue_rank, requested, enqueued_at_ts
             FROM claim_queue
             WHERE status = 'queued' AND remaining > 0
-            ORDER BY enqueued_at_ts ASC, id ASC
+            ORDER BY queue_rank ASC, id ASC
             """
         ).fetchall()
 
@@ -210,6 +202,10 @@ def fulfill_queue(
                     "user_id": user_id,
                     "request_id": str(row["request_id"]),
                     "claimed_at_ts": now,
+                    "queue_id": queue_id,
+                    "queue_position": max(1, int(row["queue_rank"])),
+                    "queue_requested": int(row["requested"]),
+                    "queue_enqueued_at_ts": int(row["enqueued_at_ts"]),
                     "token_ids": [],
                     "first_claim_count": 0,
                     "granted": 0,
@@ -223,6 +219,8 @@ def fulfill_queue(
         if granted <= 0:
             continue
         queue_state = db.consume_queue_grant(queue_id, granted)
+        event["queue_removed"] = bool(queue_state.get("removed"))
+        event["queue_remaining"] = queue_state.get("remaining")
         if bool(queue_state.get("removed")):
             queue_removed += 1
         updated += 1

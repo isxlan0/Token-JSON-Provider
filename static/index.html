@@ -48,7 +48,7 @@
     </footer>
   </section>
 
-    <section id="banned-screen" class="screen login-screen hidden">
+  <section id="banned-screen" class="screen login-screen hidden">
     <div class="card login-card banned-card">
       <div class="brand-logo danger">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
@@ -174,7 +174,7 @@
               <div class="stat-meta">剩余：<span id="quota-remaining">0</span></div>
             </div>
             <div class="stat-card">
-              <div class="stat-label">可领取库存</div>
+              <div class="stat-label">预估可领取库存</div>
               <div class="stat-value"><span id="inventory-available">0</span></div>
               <div class="stat-meta">总账号：<span id="inventory-total">0</span></div>
               <div class="stat-meta">单位：次</div>
@@ -284,7 +284,8 @@
             <div class="panel-toolbar">
               <div>
                 <div class="panel-title">上传账号</div>
-                <div class="hint">仅接受包含 <code>access_token</code>、<code>refresh_token</code>、<code>account_id</code> 的 JSON。系统会排队探活，只有正常账号才会入库。</div>
+                <div class="hint">仅接受包含 <code>access_token</code>、<code>refresh_token</code>、<code>account_id</code> 的
+                  JSON。系统会排队探活，只有正常账号才会入库。</div>
               </div>
               <div class="upload-policy" id="upload-policy">上传限制：-</div>
             </div>

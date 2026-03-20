@@ -639,6 +639,7 @@ class DashboardMemoryCache:
         self._token_claimers: dict[int, set[int]] = {}
         self._user_total_claims: dict[int, int] = {}
         self._user_unique_tokens: dict[int, set[int]] = {}
+        self._user_other_unique_tokens: dict[int, int] = {}
         self._leaderboard_cache: dict[str, dict[str, Any]] = {}
         self._recent_cache: dict[str, dict[str, Any]] = {}
         self._trends_cache: dict[str, dict[str, Any]] = {}
@@ -689,7 +690,6 @@ class DashboardMemoryCache:
                 GROUP BY user_id, token_id
                 """
             ).fetchall()
-
         policy = build_inventory_policy_from_snapshot(inventory)
         claim_events = [
             {
@@ -711,6 +711,7 @@ class DashboardMemoryCache:
             token_id = int(row["token_id"])
             user_unique_tokens.setdefault(user_id, set()).add(token_id)
             token_claimers.setdefault(token_id, set()).add(user_id)
+        user_other_unique_tokens = self._build_user_other_unique_tokens(token_claimers)
 
         with self._lock:
             self._inventory = inventory
@@ -722,6 +723,7 @@ class DashboardMemoryCache:
             self._user_total_claims = user_total_claims
             self._user_unique_tokens = user_unique_tokens
             self._token_claimers = token_claimers
+            self._user_other_unique_tokens = user_other_unique_tokens
             self._invalidate_derived_locked()
 
         _POLICY_CACHE["value"] = policy
@@ -751,7 +753,10 @@ class DashboardMemoryCache:
 
             user_total = self._user_total_claims.get(user_id, 0)
             user_unique = len(self._user_unique_tokens.get(user_id, set()))
-            others_unique = sum(1 for claimers in self._token_claimers.values() if any(uid != user_id for uid in claimers))
+            others_unique = self._user_other_unique_tokens.get(user_id)
+            if others_unique is None:
+                self._user_other_unique_tokens = self._build_user_other_unique_tokens(self._token_claimers)
+                others_unique = self._user_other_unique_tokens.get(user_id, len(self._token_claimers))
             stats = {
                 "total_tokens": int(self._inventory["total"]),
                 "available_tokens": int(self._inventory["available"]),
@@ -856,6 +861,19 @@ class DashboardMemoryCache:
         self._trends_cache = {}
         self._stats_cache = {}
 
+    def _build_user_other_unique_tokens(self, token_claimers: dict[int, set[int]]) -> dict[int, int]:
+        user_other_unique_tokens: dict[int, int] = {}
+        for claimers in token_claimers.values():
+            if not claimers:
+                continue
+            if len(claimers) == 1:
+                only_user = next(iter(claimers))
+                user_other_unique_tokens.setdefault(int(only_user), 0)
+                continue
+            for claimer_id in claimers:
+                user_other_unique_tokens[int(claimer_id)] = user_other_unique_tokens.get(int(claimer_id), 0) + 1
+        return user_other_unique_tokens
+
     def record_claim(
         self,
         *,
@@ -887,9 +905,15 @@ class DashboardMemoryCache:
             self._inventory["unclaimed"] = max(0, int(self._inventory["unclaimed"]) - first_claim_count)
             self._user_total_claims[user_id] = self._user_total_claims.get(user_id, 0) + granted
             claimed_tokens = self._user_unique_tokens.setdefault(user_id, set())
-            for token_id in token_ids:
-                claimed_tokens.add(int(token_id))
-                self._token_claimers.setdefault(int(token_id), set()).add(user_id)
+            for raw_token_id in token_ids:
+                token_id = int(raw_token_id)
+                before_claimers = self._token_claimers.setdefault(token_id, set())
+                was_new_for_user = user_id not in before_claimers
+                if was_new_for_user:
+                    claimed_tokens.add(token_id)
+                before_claimers.add(user_id)
+            # Safer than incrementally maintaining another derived projection across every write path.
+            self._user_other_unique_tokens = {}
             self._invalidate_derived_locked()
 
     def set_queue_total(self, total: int) -> None:
@@ -1013,6 +1037,7 @@ class TokenDb:
                     api_key_id INTEGER,
                     requested INTEGER NOT NULL,
                     remaining INTEGER NOT NULL,
+                    queue_rank INTEGER NOT NULL,
                     enqueued_at_ts INTEGER NOT NULL,
                     request_id TEXT NOT NULL,
                     status TEXT NOT NULL
@@ -1022,6 +1047,12 @@ class TokenDb:
                     id INTEGER PRIMARY KEY CHECK(id = 1),
                     status TEXT NOT NULL,
                     max_claims INTEGER NOT NULL,
+                    updated_at_ts INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS queue_runtime (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    total_queued INTEGER NOT NULL,
                     updated_at_ts INTEGER NOT NULL
                 );
 
@@ -1066,6 +1097,38 @@ class TokenDb:
             }
             if "key_value" not in columns:
                 conn.execute("ALTER TABLE api_keys ADD COLUMN key_value TEXT")
+            queue_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(claim_queue)").fetchall()
+            }
+            if "queue_rank" not in queue_columns:
+                conn.execute("ALTER TABLE claim_queue ADD COLUMN queue_rank INTEGER NOT NULL DEFAULT 0")
+                queue_rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM claim_queue
+                    WHERE status = 'queued' AND remaining > 0
+                    ORDER BY enqueued_at_ts ASC, id ASC
+                    """
+                ).fetchall()
+                for rank, row in enumerate(queue_rows, start=1):
+                    conn.execute(
+                        "UPDATE claim_queue SET queue_rank = ? WHERE id = ?",
+                        (rank, int(row["id"])),
+                    )
+            queue_total_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM claim_queue WHERE status = 'queued' AND remaining > 0"
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO queue_runtime (id, total_queued, updated_at_ts)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    total_queued = excluded.total_queued,
+                    updated_at_ts = excluded.updated_at_ts
+                """,
+                (int(queue_total_row["cnt"]) if queue_total_row else 0, now_ts()),
+            )
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(tokens)").fetchall()
@@ -1223,12 +1286,22 @@ class TokenDb:
                     ON user_token_claims(user_id, token_id);
                 CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
                     ON claim_queue(status, enqueued_at_ts, id);
+                CREATE INDEX IF NOT EXISTS idx_claim_queue_user_status_remaining_time
+                    ON claim_queue(user_id, status, remaining, enqueued_at_ts, id);
+                CREATE INDEX IF NOT EXISTS idx_claim_queue_status_remaining_time
+                    ON claim_queue(status, remaining, enqueued_at_ts, id);
+                CREATE INDEX IF NOT EXISTS idx_claim_queue_status_rank
+                    ON claim_queue(status, queue_rank);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_account_id_unique
                     ON tokens(account_id)
                     WHERE account_id IS NOT NULL AND account_id != '';
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_access_token_hash_unique
                     ON tokens(access_token_hash)
                     WHERE access_token_hash IS NOT NULL AND access_token_hash != '';
+                CREATE INDEX IF NOT EXISTS idx_token_claims_token_user
+                    ON token_claims(token_id, user_id);
+                CREATE INDEX IF NOT EXISTS idx_tokens_claimable_candidates
+                    ON tokens(is_active, is_enabled, is_banned, is_available, probe_lock_until_ts, claim_count, max_claims, id);
                 CREATE INDEX IF NOT EXISTS idx_api_keys_user_status
                     ON api_keys(user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
@@ -1968,7 +2041,10 @@ class TokenDb:
             "name": user.name or user.username,
             "trust_level": user.trust_level,
         }
-        invalidate_all_runtime_cache(user_id=user_id, include_admin=True)
+        invalidate_user_profile_cache(user_id)
+        invalidate_user_queue_cache(user_id)
+        invalidate_dashboard_cache(user_id=user_id)
+        invalidate_admin_cache()
         return result
 
     def get_user(self, user_id: int) -> dict[str, Any] | None:
@@ -2141,7 +2217,9 @@ class TokenDb:
             ).fetchone()
         target_user = self.get_user_by_linuxdo_id(linuxdo_user_id)
         if target_user:
-            invalidate_user_cache(int(target_user["id"]))
+            target_user_id = int(target_user["id"])
+            invalidate_user_cache(target_user_id)
+            invalidate_user_queue_cache(target_user_id)
         invalidate_admin_cache()
         return self._format_ban_row(row) if row else {}
 
@@ -2163,7 +2241,9 @@ class TokenDb:
         if changed:
             target_user = self.get_user_by_linuxdo_id(linuxdo_user_id)
             if target_user:
-                invalidate_user_cache(int(target_user["id"]))
+                target_user_id = int(target_user["id"])
+                invalidate_user_cache(target_user_id)
+                invalidate_user_queue_cache(target_user_id)
             invalidate_admin_cache()
         return changed
 
@@ -2948,6 +3028,41 @@ class TokenDb:
             for row in rows
         ]
 
+    def get_api_keys_payload(self, user_id: int) -> dict[str, Any]:
+        items = self.list_api_keys(user_id)
+        return {
+            "items": items,
+            "limit": get_apikey_max_per_user(),
+            "active": sum(1 for item in items if str(item.get("status")) == "active"),
+        }
+
+    def get_api_key_summary(self, user_id: int) -> dict[str, int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM api_keys
+                WHERE user_id = ? AND status = 'active'
+                """,
+                (user_id,),
+            ).fetchone()
+        return {
+            "limit": get_apikey_max_per_user(),
+            "active": int(row["cnt"]) if row else 0,
+        }
+
+    def list_queued_user_ids(self) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id
+                FROM claim_queue
+                WHERE status = 'queued' AND remaining > 0
+                ORDER BY queue_rank ASC, id ASC
+                """
+            ).fetchall()
+        return [int(row["user_id"]) for row in rows]
+
     def create_api_key(self, user_id: int, name: str | None) -> dict[str, Any]:
         now = now_ts()
         api_key = generate_api_key()
@@ -2978,12 +3093,14 @@ class TokenDb:
             )
             api_key_id = int(cursor.lastrowid)
 
-        created = {
+        created_item = {
             "id": api_key_id,
             "name": name,
             "prefix": prefix,
             "token": api_key,
+            "status": "active",
             "created_at": isoformat_from_ts(now),
+            "last_used_at": None,
         }
         with _API_KEY_CACHE_LOCK:
             _API_KEY_CACHE_BY_HASH[key_hash] = {
@@ -2996,18 +3113,26 @@ class TokenDb:
             {"api_key_id": api_key_id, "user_id": user_id, "status": "active"},
             ttl_sec=get_cache_me_ttl(),
         )
-        invalidate_user_cache(user_id)
+        cached_payload = get_user_api_keys_snapshot(user_id)
+        payload = set_user_api_keys_snapshot(
+            user_id,
+            {
+                "items": [created_item, *(cached_payload.get("items") or [])],
+                "limit": int(cached_payload.get("limit") or get_apikey_max_per_user()),
+                "active": int(cached_payload.get("active") or 0) + 1,
+            },
+        )
         invalidate_admin_cache()
-        return created
+        return payload
 
-    def revoke_api_key(self, user_id: int, api_key_id: int) -> None:
+    def revoke_api_key(self, user_id: int, api_key_id: int) -> dict[str, Any]:
         now = now_ts()
         with self._lock, self.connect() as conn:
             row = conn.execute(
                 "SELECT key_hash FROM api_keys WHERE id = ? AND user_id = ?",
                 (api_key_id, user_id),
             ).fetchone()
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE api_keys
                 SET status = 'revoked', revoked_at_ts = ?
@@ -3015,12 +3140,35 @@ class TokenDb:
                 """,
                 (now, api_key_id, user_id),
             )
+        if not cursor.rowcount:
+            return get_user_api_keys_snapshot(user_id)
         if row:
             with _API_KEY_CACHE_LOCK:
                 _API_KEY_CACHE_BY_HASH.pop(str(row["key_hash"]), None)
             _APP_CACHE.delete(build_cache_key("apikey-resolve", str(row["key_hash"])))
-        invalidate_user_cache(user_id)
+        cached_payload = get_user_api_keys_snapshot(user_id)
+        updated_items: list[dict[str, Any]] = []
+        active = 0
+        for item in cached_payload.get("items") or []:
+            if int(item.get("id") or 0) == int(api_key_id):
+                updated = dict(item)
+                updated["status"] = "revoked"
+                updated_items.append(updated)
+            else:
+                updated_items.append(item)
+        for item in updated_items:
+            if str(item.get("status")) == "active":
+                active += 1
+        payload = set_user_api_keys_snapshot(
+            user_id,
+            {
+                "items": updated_items,
+                "limit": int(cached_payload.get("limit") or get_apikey_max_per_user()),
+                "active": active,
+            },
+        )
         invalidate_admin_cache()
+        return payload
 
     def resolve_api_key(self, api_key: str) -> dict[str, Any] | None:
         key_hash = hash_api_key(api_key)
@@ -3336,35 +3484,19 @@ class TokenDb:
         return series
 
     def get_queue_overview(self) -> dict[str, int]:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM claim_queue WHERE status = 'queued' AND remaining > 0"
-            ).fetchone()
-        total = int(row["cnt"]) if row else 0
-        return {"total": total}
+        return {"total": self.get_queue_total_runtime()}
 
-    def count_claimable_tokens_for_user(self, conn: sqlite3.Connection, user_id: int) -> int:
-        now = now_ts()
-        row = conn.execute(
-            """
-            SELECT COUNT(*) as cnt
-            FROM tokens
-            WHERE is_active = 1
-              AND is_enabled = 1
-              AND is_banned = 0
-              AND is_available = 1
-              AND claim_count < max_claims
-              AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM user_token_claims
-                  WHERE user_token_claims.user_id = ?
-                    AND user_token_claims.token_id = tokens.id
-              )
-            """,
-            (now, user_id),
-        ).fetchone()
-        return int(row["cnt"]) if row else 0
+    def get_queue_total_runtime(self, conn: sqlite3.Connection | None = None) -> int:
+        def _read(target_conn: sqlite3.Connection) -> int:
+            row = target_conn.execute(
+                "SELECT total_queued FROM queue_runtime WHERE id = 1"
+            ).fetchone()
+            return int(row["total_queued"]) if row else 0
+
+        if conn is not None:
+            return _read(conn)
+        with self.connect() as target_conn:
+            return _read(target_conn)
 
     def list_claimable_tokens_for_user(
         self,
@@ -3414,6 +3546,7 @@ class TokenDb:
         granted_token_ids: list[int] = []
         first_claim_count = 0
         queued_created = False
+        queued_result: dict[str, Any] | None = None
         with self.connect() as conn:
             self.ensure_inventory_policy(conn=conn)
             batch_limit = get_claim_batch_limit(self, conn=conn)
@@ -3465,8 +3598,29 @@ class TokenDb:
                 }
                 if queued_created:
                     _DASHBOARD_CACHE.adjust_queue_total(1)
-                invalidate_all_runtime_cache(user_id=user_id, include_admin=True)
-                return result
+                queued_result = result
+        if queued_result is not None:
+            set_user_queue_snapshot(
+                user_id,
+                build_user_queue_snapshot_payload(
+                    user_id,
+                    {
+                        "queue_id": queued_result["queue_id"],
+                        "position": queued_result["queue_position"],
+                        "ahead": max(0, int(queued_result["queue_position"]) - 1),
+                        "requested": queued_result["requested"],
+                        "remaining": queued_result["queue_remaining"],
+                        "enqueued_at": isoformat_from_ts(int(queued["enqueued_at_ts"])),
+                        "request_id": queued_result["request_id"],
+                    },
+                    available_tokens=get_global_available_tokens_estimate(),
+                ),
+            )
+            if queued_created:
+                refresh_queue_meta_runtime(self)
+            invalidate_dashboard_cache(user_id=user_id)
+            invalidate_admin_cache()
+            return queued_result
 
         items: list[dict[str, Any]] = []
         while len(items) < target:
@@ -3521,6 +3675,25 @@ class TokenDb:
 
         if queued_created:
             _DASHBOARD_CACHE.adjust_queue_total(1)
+        if result.get("queued"):
+            set_user_queue_snapshot(
+                user_id,
+                build_user_queue_snapshot_payload(
+                    user_id,
+                    {
+                        "queue_id": result["queue_id"],
+                        "position": result["queue_position"],
+                        "ahead": max(0, int(result["queue_position"]) - 1),
+                        "requested": result["requested"],
+                        "remaining": result["queue_remaining"],
+                        "enqueued_at": isoformat_from_ts(int(queued["enqueued_at_ts"])),
+                        "request_id": result["request_id"],
+                    },
+                    available_tokens=get_global_available_tokens_estimate(),
+                ),
+            )
+            if queued_created:
+                refresh_queue_meta_runtime(self)
         if result.get("granted"):
             user = self.get_user(user_id)
             if user:
@@ -3532,7 +3705,14 @@ class TokenDb:
                     first_claim_count=first_claim_count,
                     granted=int(result["granted"]),
                 )
-        invalidate_all_runtime_cache(user_id=user_id, include_admin=True)
+            set_user_queue_snapshot(user_id, build_default_user_queue_snapshot(queued=False))
+        if result.get("granted"):
+            # Keep the aggregated /me payload fresh even when child snapshots are maintained separately.
+            invalidate_user_profile_cache(user_id)
+            invalidate_user_quota_cache(user_id)
+            invalidate_user_claims_cache(user_id)
+        invalidate_dashboard_cache(user_id=user_id)
+        invalidate_admin_cache()
         return result
 
     def get_claimed_token(self, token_id: int, user_id: int) -> dict[str, Any] | None:
@@ -3609,70 +3789,45 @@ class TokenDb:
         return items
 
     def get_queue_status(self, user_id: int) -> dict[str, Any] | None:
-        now = now_ts()
+        return self.list_queue_statuses([user_id]).get(int(user_id))
+
+    def list_queue_statuses(self, user_ids: list[int] | None = None) -> dict[int, dict[str, Any]]:
+        unique_user_ids = sorted({int(user_id) for user_id in (user_ids or [])})
         with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, requested, remaining, enqueued_at_ts, request_id
-                FROM claim_queue
-                WHERE user_id = ? AND status = 'queued' AND remaining > 0
-                ORDER BY enqueued_at_ts ASC, id ASC
-                LIMIT 1
-                """,
-                (user_id,),
-            ).fetchone()
-            if not row:
-                return None
-            queue_id = int(row["id"])
-            ahead_row = conn.execute(
-                """
-                SELECT COUNT(*) as cnt
-                FROM claim_queue
-                WHERE status = 'queued'
-                  AND (enqueued_at_ts < ? OR (enqueued_at_ts = ? AND id < ?))
-                """,
-                (int(row["enqueued_at_ts"]), int(row["enqueued_at_ts"]), queue_id),
-            ).fetchone()
-            ahead = int(ahead_row["cnt"]) if ahead_row else 0
-            total_row = conn.execute(
-                """
-                SELECT COUNT(*) as cnt
-                FROM claim_queue
-                WHERE status = 'queued' AND remaining > 0
-                """
-            ).fetchone()
-            total_queued = int(total_row["cnt"]) if total_row else 0
-            available_row = conn.execute(
-                """
-                SELECT COUNT(*) as cnt
-                FROM tokens
-                WHERE is_active = 1 AND is_enabled = 1
-                  AND is_banned = 0
-                  AND is_available = 1
-                  AND claim_count < max_claims
-                  AND (probe_lock_until_ts IS NULL OR probe_lock_until_ts < ?)
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM user_token_claims
-                      WHERE user_token_claims.user_id = ?
-                        AND user_token_claims.token_id = tokens.id
-                  )
-                """
-                ,
-                (now, user_id),
-            ).fetchone()
-            available = int(available_row["cnt"]) if available_row else 0
-        return {
-            "queue_id": queue_id,
-            "position": ahead + 1,
-            "ahead": ahead,
-            "total_queued": total_queued,
-            "available_tokens": available,
-            "requested": int(row["requested"]),
-            "remaining": int(row["remaining"]),
-            "enqueued_at": isoformat_from_ts(int(row["enqueued_at_ts"])),
-            "request_id": row["request_id"],
-        }
+            if unique_user_ids:
+                placeholders = ",".join("?" for _ in unique_user_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT id, user_id, requested, remaining, queue_rank, enqueued_at_ts, request_id
+                    FROM claim_queue
+                    WHERE status = 'queued' AND remaining > 0 AND user_id IN ({placeholders})
+                    ORDER BY queue_rank ASC, id ASC
+                    """,
+                    tuple(unique_user_ids),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, user_id, requested, remaining, queue_rank, enqueued_at_ts, request_id
+                    FROM claim_queue
+                    WHERE status = 'queued' AND remaining > 0
+                    ORDER BY queue_rank ASC, id ASC
+                    """
+                ).fetchall()
+        payloads: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            user_id = int(row["user_id"])
+            queue_rank = max(1, int(row["queue_rank"]))
+            payloads[user_id] = {
+                "queue_id": int(row["id"]),
+                "position": queue_rank,
+                "ahead": max(0, queue_rank - 1),
+                "requested": int(row["requested"]),
+                "remaining": int(row["remaining"]),
+                "enqueued_at": isoformat_from_ts(int(row["enqueued_at_ts"])),
+                "request_id": row["request_id"],
+            }
+        return payloads
 
     def consume_queue_grant(self, queue_id: int, granted: int, *, timeout_s: float = 30.0) -> dict[str, Any]:
         granted = max(0, int(granted))
@@ -3681,14 +3836,32 @@ class TokenDb:
         with self._lock, self.connect(timeout=timeout_s) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT remaining FROM claim_queue WHERE id = ? AND status = 'queued'",
+                "SELECT remaining, queue_rank FROM claim_queue WHERE id = ? AND status = 'queued'",
                 (queue_id,),
             ).fetchone()
             if not row:
                 return {"removed": False, "remaining": None}
             remaining_after = max(0, int(row["remaining"]) - granted)
             if remaining_after <= 0:
+                removed_rank = int(row["queue_rank"])
                 conn.execute("DELETE FROM claim_queue WHERE id = ?", (queue_id,))
+                conn.execute(
+                    """
+                    UPDATE claim_queue
+                    SET queue_rank = queue_rank - 1
+                    WHERE status = 'queued' AND remaining > 0 AND queue_rank > ?
+                    """,
+                    (removed_rank,),
+                )
+                current_total = self.get_queue_total_runtime(conn)
+                conn.execute(
+                    """
+                    UPDATE queue_runtime
+                    SET total_queued = ?, updated_at_ts = ?
+                    WHERE id = 1
+                    """,
+                    (max(0, current_total - 1), now_ts()),
+                )
                 return {"removed": True, "remaining": 0}
             conn.execute(
                 """
@@ -3715,7 +3888,7 @@ class TokenDb:
             )
             changed = int(cursor.rowcount or 0)
         if changed:
-            invalidate_user_cache(user_id)
+            invalidate_user_claims_cache(user_id)
         return changed
 
     def list_claim_files(self, user_id: int) -> list[dict[str, Any]]:
@@ -3884,6 +4057,10 @@ def get_cache_queue_ttl() -> int:
     return max(1, env_int(CACHE_QUEUE_TTL_ENV, 5))
 
 
+def get_cache_queue_snapshot_ttl() -> int:
+    return max(get_cache_queue_ttl(), 86400)
+
+
 def get_cache_dashboard_ttl() -> int:
     return max(1, env_int(CACHE_DASHBOARD_TTL_ENV, 10))
 
@@ -3930,9 +4107,70 @@ def cache_json(key: str, ttl_sec: int, loader: Callable[[], Any]) -> Any:
     return payload
 
 
+def build_snapshot_cache_key(prefix: str, *parts: Any) -> str:
+    return build_cache_key("snapshot", prefix, *parts)
+
+
+def build_user_apikeys_cache_key(user_id: int) -> str:
+    version = get_cache_scope_version("user-apikeys", user_id)
+    return build_snapshot_cache_key("user-apikeys", user_id, f"v{version}")
+
+
+def build_user_apikey_summary_cache_key(user_id: int) -> str:
+    version = get_cache_scope_version("user-apikey-summary", user_id)
+    return build_snapshot_cache_key("user-apikey-summary", user_id, f"v{version}")
+
+
+def build_user_queue_cache_key(user_id: int) -> str:
+    version = get_cache_scope_version("user-queue", user_id)
+    return build_snapshot_cache_key(
+        "user-queue",
+        user_id,
+        f"v{version}",
+    )
+
+
+def build_user_profile_cache_key(user_id: int, *, is_admin: bool) -> str:
+    version = get_cache_scope_version("user-profile", user_id)
+    return build_snapshot_cache_key("user-profile", user_id, int(bool(is_admin)), f"v{version}")
+
+
+def invalidate_user_profile_cache(user_id: int) -> None:
+    bump_cache_scope("user-basic", user_id)
+    bump_cache_scope("user-profile", user_id)
+
+
+def invalidate_user_quota_cache(user_id: int) -> None:
+    bump_cache_scope("user-quota", user_id)
+    bump_cache_scope("user-profile", user_id)
+
+
+def invalidate_user_apikeys_cache(user_id: int) -> None:
+    bump_cache_scope("user-apikeys", user_id)
+    bump_cache_scope("user-apikey-summary", user_id)
+    bump_cache_scope("user-profile", user_id)
+
+
+def invalidate_user_claims_cache(user_id: int) -> None:
+    bump_cache_scope("user-claims", user_id)
+    bump_cache_scope("user-claims-summary", user_id)
+    bump_cache_scope("user-profile", user_id)
+
+
+def invalidate_user_queue_cache(user_id: int) -> None:
+    bump_cache_scope("user-queue", user_id)
+
+
+def invalidate_inventory_cache() -> None:
+    bump_cache_scope("inventory")
+
+
 def invalidate_user_cache(user_id: int) -> None:
     bump_cache_scope("user", user_id)
-    _QUEUE_STATUS_CACHE.pop(int(user_id), None)
+    invalidate_user_profile_cache(user_id)
+    invalidate_user_quota_cache(user_id)
+    invalidate_user_apikeys_cache(user_id)
+    invalidate_user_claims_cache(user_id)
 
 
 def invalidate_dashboard_cache(*, user_id: int | None = None) -> None:
@@ -3951,6 +4189,18 @@ def invalidate_all_runtime_cache(*, user_id: int | None = None, include_admin: b
     invalidate_dashboard_cache(user_id=user_id)
     if include_admin:
         invalidate_admin_cache()
+
+
+def _get_cached_snapshot(key: str) -> dict[str, Any] | None:
+    payload = _APP_CACHE.get_json(key)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _set_cached_snapshot(key: str, payload: dict[str, Any], ttl_sec: int) -> dict[str, Any]:
+    _APP_CACHE.set_json(key, payload, ttl_sec=ttl_sec)
+    return payload
 
 
 def build_user_cache_key(prefix: str, user_id: int, *parts: Any) -> str:
@@ -3972,11 +4222,7 @@ def build_admin_cache_key(prefix: str, *parts: Any) -> str:
 
 
 def get_queue_total_snapshot(db_handle: "TokenDb") -> int:
-    with db_handle.connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM claim_queue WHERE status = 'queued' AND remaining > 0"
-        ).fetchone()
-    return int(row["cnt"]) if row else 0
+    return db_handle.get_queue_total_runtime()
 
 
 def refresh_queue_total_snapshot(db_handle: "TokenDb") -> int:
@@ -3985,6 +4231,223 @@ def refresh_queue_total_snapshot(db_handle: "TokenDb") -> int:
     _DASHBOARD_CACHE.set_queue_total(total)
     token_import_log(f"[queue-refresh] total={before}->{total}")
     return total
+
+
+def get_global_available_tokens_estimate() -> int:
+    return max(0, int(_DASHBOARD_CACHE.get_system_status().get("inventory", {}).get("available", 0)))
+
+
+def build_default_user_queue_snapshot(*, queued: bool = False) -> dict[str, Any]:
+    payload = {
+        "queued": bool(queued),
+        "total_queued": int(_DASHBOARD_CACHE.get_system_status().get("queue", {}).get("total", 0)),
+        "available_tokens": get_global_available_tokens_estimate(),
+    }
+    if not queued:
+        return payload
+    return payload
+
+
+def build_user_basic_cache_key(user_id: int, *, is_admin: bool) -> str:
+    version = get_cache_scope_version("user-basic", user_id)
+    return build_snapshot_cache_key("user-basic", user_id, int(bool(is_admin)), f"v{version}")
+
+
+def build_user_quota_cache_key(user_id: int) -> str:
+    version = get_cache_scope_version("user-quota", user_id)
+    return build_snapshot_cache_key("user-quota", user_id, f"v{version}")
+
+
+def build_user_claim_summary_cache_key(user_id: int) -> str:
+    version = get_cache_scope_version("user-claims-summary", user_id)
+    return build_snapshot_cache_key("user-claims-summary", user_id, f"v{version}")
+
+
+def get_user_basic_snapshot(user_id: int, *, is_admin: bool) -> dict[str, Any]:
+    key = build_user_basic_cache_key(user_id, is_admin=is_admin)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return cached
+    user = db.get_user(user_id)
+    if not user:
+        raise PermissionError
+    payload = {
+        "id": user["linuxdo_user_id"],
+        "username": user["linuxdo_username"],
+        "name": user["linuxdo_name"] or user["linuxdo_username"],
+        "trust_level": user["trust_level"],
+        "is_admin": is_admin,
+        "is_banned": False,
+    }
+    return _set_cached_snapshot(key, payload, get_cache_me_ttl())
+
+
+def get_user_quota_snapshot(user_id: int) -> dict[str, Any]:
+    key = build_user_quota_cache_key(user_id)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return cached
+    return _set_cached_snapshot(key, db.get_quota_usage(user_id), get_cache_me_ttl())
+
+
+def get_user_claim_summary_snapshot(user_id: int) -> dict[str, int]:
+    key = build_user_claim_summary_cache_key(user_id)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return {
+            "total": int(cached.get("total") or 0),
+            "unique": int(cached.get("unique") or 0),
+        }
+    return _set_cached_snapshot(key, db.get_user_claim_totals(user_id), get_cache_me_ttl())
+
+
+def _hydrate_user_profile_snapshot(user_id: int, *, is_admin: bool) -> dict[str, Any]:
+    user = get_user_basic_snapshot(user_id, is_admin=is_admin)
+    quota = get_user_quota_snapshot(user_id)
+    totals = get_user_claim_summary_snapshot(user_id)
+    api_keys = get_user_api_key_summary_snapshot(user_id)
+    return {
+        "user": user,
+        "quota": quota,
+        "claims": totals,
+        "api_keys": {
+            "limit": int(api_keys.get("limit") or get_apikey_max_per_user()),
+            "active": int(api_keys.get("active") or 0),
+        },
+        "uploads": {
+            "max_files_per_request": get_upload_max_files_per_request(),
+            "max_file_size_bytes": get_upload_max_file_size_bytes(),
+            "max_success_per_hour": get_upload_max_success_per_hour(),
+            "min_trust_level": get_linuxdo_min_trust_level(),
+        },
+    }
+
+
+def get_user_profile_snapshot(user_id: int, *, is_admin: bool) -> dict[str, Any]:
+    key = build_user_profile_cache_key(user_id, is_admin=is_admin)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return cached
+    payload = _hydrate_user_profile_snapshot(user_id, is_admin=is_admin)
+    return _set_cached_snapshot(key, payload, get_cache_me_ttl())
+
+
+def get_user_api_keys_snapshot(user_id: int) -> dict[str, Any]:
+    key = build_user_apikeys_cache_key(user_id)
+    cached = _APP_CACHE.get_json(key)
+    if isinstance(cached, dict):
+        return {
+            "items": list(cached.get("items") or []),
+            "limit": int(cached.get("limit") or get_apikey_max_per_user()),
+            "active": int(cached.get("active") or 0),
+        }
+    api_keys = db.get_api_keys_payload(user_id)
+    _APP_CACHE.set_json(key, api_keys, ttl_sec=get_cache_me_ttl())
+    return api_keys
+
+
+def set_user_api_keys_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    key = build_user_apikeys_cache_key(user_id)
+    normalized = {
+        "items": list(payload.get("items") or []),
+        "limit": int(payload.get("limit") or get_apikey_max_per_user()),
+        "active": int(payload.get("active") or 0),
+    }
+    _APP_CACHE.set_json(key, normalized, ttl_sec=get_cache_me_ttl())
+    set_user_api_key_summary_snapshot(
+        user_id,
+        {"limit": normalized["limit"], "active": normalized["active"]},
+    )
+    # /me aggregates api key summary, so any direct payload rewrite must also evict the top-level profile snapshot.
+    bump_cache_scope("user-profile", user_id)
+    return normalized
+
+
+def get_user_api_key_summary_snapshot(user_id: int) -> dict[str, int]:
+    key = build_user_apikey_summary_cache_key(user_id)
+    cached = _get_cached_snapshot(key)
+    if cached is not None:
+        return {
+            "limit": int(cached.get("limit") or get_apikey_max_per_user()),
+            "active": int(cached.get("active") or 0),
+        }
+    return set_user_api_key_summary_snapshot(
+        user_id,
+        db.get_api_key_summary(user_id),
+    )
+
+
+def set_user_api_key_summary_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, int]:
+    key = build_user_apikey_summary_cache_key(user_id)
+    normalized = {
+        "limit": int(payload.get("limit") or get_apikey_max_per_user()),
+        "active": int(payload.get("active") or 0),
+    }
+    _set_cached_snapshot(key, normalized, get_cache_me_ttl())
+    return normalized
+
+
+def get_cached_user_queue_snapshot(user_id: int) -> dict[str, Any] | None:
+    key = build_user_queue_cache_key(user_id)
+    return _get_cached_snapshot(key)
+
+
+def build_user_queue_snapshot_payload(
+    user_id: int,
+    status: dict[str, Any] | None,
+    *,
+    available_tokens: int | None,
+) -> dict[str, Any]:
+    if not status:
+        return build_default_user_queue_snapshot(queued=False)
+    total_queued = int(_DASHBOARD_CACHE.get_system_status().get("queue", {}).get("total", 0))
+    claimable = get_global_available_tokens_estimate()
+    if available_tokens is not None:
+        claimable = max(0, int(available_tokens))
+    return {
+        "queued": True,
+        **status,
+        "total_queued": total_queued,
+        "available_tokens": claimable,
+    }
+
+
+def set_user_queue_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    key = build_user_queue_cache_key(user_id)
+    return _set_cached_snapshot(key, payload, get_cache_queue_snapshot_ttl())
+
+
+def refresh_queue_meta_runtime(db_handle: "TokenDb") -> None:
+    refresh_queue_total_snapshot(db_handle)
+
+
+def refresh_user_queue_snapshots(user_ids: list[int]) -> None:
+    unique_user_ids = sorted({int(user_id) for user_id in user_ids})
+    if not unique_user_ids:
+        return
+    status_map = db.list_queue_statuses(unique_user_ids)
+    for user_id in unique_user_ids:
+        payload = build_user_queue_snapshot_payload(
+            user_id,
+            status_map.get(user_id),
+            available_tokens=None,
+        )
+        set_user_queue_snapshot(user_id, payload)
+
+
+def rebuild_user_queue_snapshots_from_db(user_ids: list[int]) -> None:
+    unique_user_ids = sorted({int(user_id) for user_id in user_ids})
+    if not unique_user_ids:
+        return
+    refresh_user_queue_snapshots(unique_user_ids)
+
+
+def rebuild_all_queue_snapshots_from_db() -> None:
+    queued_user_ids = db.list_queued_user_ids()
+    refresh_queue_meta_runtime(db)
+    if not queued_user_ids:
+        return
+    rebuild_user_queue_snapshots_from_db(queued_user_ids)
 
 
 
@@ -4534,7 +4997,6 @@ _LEADERBOARD_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "key": None}
 _RECENT_CLAIMS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "key": None}
 _TRENDS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "key": None}
 _SYSTEM_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
-_QUEUE_STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
 _CACHE_TTL_SEC = 5.0
 _QUEUE_PUMP_THREAD: threading.Thread | None = None
 _QUEUE_PUMP_STOP = threading.Event()
@@ -4565,7 +5027,7 @@ def _refresh_dashboard_memory() -> None:
     before = _DASHBOARD_CACHE.get_system_status()
     _DASHBOARD_CACHE.refresh_from_db(db)
     after = _DASHBOARD_CACHE.get_system_status()
-    _QUEUE_STATUS_CACHE.clear()
+    invalidate_inventory_cache()
     invalidate_dashboard_cache()
     token_import_log(
         "[dashboard-refresh] "
@@ -4587,7 +5049,10 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
         apikey_rate_limit=get_apikey_rate_per_minute(),
     )
     if result.get("fulfilled") or result.get("updated"):
+        queue_removed = bool(result.get("queue_removed"))
+        refresh_queue_meta_runtime(db_handle)
         for event in result.get("events", []):
+            user_id = int(event["user_id"])
             user = db_handle.get_user(int(event["user_id"]))
             if user:
                 _DASHBOARD_CACHE.record_claim(
@@ -4598,13 +5063,33 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
                     first_claim_count=int(event.get("first_claim_count", 0)),
                     granted=int(event.get("granted", 0)),
                 )
-            invalidate_all_runtime_cache(user_id=int(event["user_id"]), include_admin=True)
-        refresh_queue_total_snapshot(db_handle)
+            if bool(event.get("queue_removed")):
+                set_user_queue_snapshot(user_id, build_default_user_queue_snapshot(queued=False))
+            else:
+                set_user_queue_snapshot(
+                    user_id,
+                    build_user_queue_snapshot_payload(
+                        user_id,
+                        {
+                            "queue_id": int(event.get("queue_id") or 0),
+                            "position": int(event.get("queue_position") or 1),
+                            "ahead": max(0, int(event.get("queue_position") or 1) - 1),
+                            "requested": int(event.get("queue_requested") or 0),
+                            "remaining": int(event.get("queue_remaining") or 0),
+                            "enqueued_at": isoformat_from_ts(int(event.get("queue_enqueued_at_ts") or now_ts())),
+                            "request_id": str(event["request_id"]),
+                        },
+                        available_tokens=get_global_available_tokens_estimate(),
+                    ),
+                )
+            invalidate_user_profile_cache(user_id)
+            invalidate_user_quota_cache(user_id)
+            invalidate_user_claims_cache(user_id)
+            invalidate_dashboard_cache(user_id=user_id)
+            invalidate_admin_cache()
+        if queue_removed:
+            refresh_user_queue_snapshots(db_handle.list_queued_user_ids())
         invalidate_dashboard_cache()
-
-
-def _cache_fresh(ts: float, ttl_sec: float | None = None) -> bool:
-    return time.time() - ts < (ttl_sec if ttl_sec is not None else _CACHE_TTL_SEC)
 
 
 def _queue_pump_loop() -> None:
@@ -5114,7 +5599,7 @@ async def lifespan(_: FastAPI):
     run_startup_step("start codex probe", _CODEX_PROBE.start)
     run_startup_step("initialize database", db.init_db)
     run_startup_step("refresh dashboard memory", _refresh_dashboard_memory)
-    run_startup_step("refresh queue snapshot", lambda: refresh_queue_total_snapshot(db))
+    run_startup_step("rebuild queue snapshots", rebuild_all_queue_snapshots_from_db)
     startup_log(f"application startup finished in {time.perf_counter() - startup_begin:.3f}s")
 
     _QUEUE_PUMP_STOP.clear()
@@ -5488,37 +5973,25 @@ def admin_get_policy(request: Request) -> dict[str, Any]:
 def get_me(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    key = build_user_cache_key("me", user_id, int(session["is_admin"]))
-    def _load_me() -> dict[str, Any]:
-        user = db.get_user(user_id)
-        if not user:
-            raise PermissionError
-        quota = db.get_quota_usage(user_id)
-        totals = db.get_user_claim_totals(user_id)
-        api_keys = db.list_api_keys(user_id)
-        return {
-            "user": {
-                "id": user["linuxdo_user_id"],
-                "username": user["linuxdo_username"],
-                "name": user["linuxdo_name"] or user["linuxdo_username"],
-                "trust_level": user["trust_level"],
-                "is_admin": session["is_admin"],
-                "is_banned": False,
-            },
-            "quota": quota,
-            "claims": totals,
-            "api_keys": {
-                "limit": get_apikey_max_per_user(),
-                "active": len([key for key in api_keys if key["status"] == "active"]),
-            },
-            "uploads": {
-                "max_files_per_request": get_upload_max_files_per_request(),
-                "max_file_size_bytes": get_upload_max_file_size_bytes(),
-                "max_success_per_hour": get_upload_max_success_per_hour(),
-                "min_trust_level": get_linuxdo_min_trust_level(),
-            },
-        }
-    return cache_json(key, get_cache_me_ttl(), _load_me)
+    return get_user_profile_snapshot(user_id, is_admin=bool(session["is_admin"]))
+
+
+@app.get("/me/quota")
+def get_me_quota(request: Request) -> dict[str, Any]:
+    session = require_session_user(request)
+    return get_user_quota_snapshot(session["user_id"])
+
+
+@app.get("/me/claims-summary")
+def get_me_claims_summary(request: Request) -> dict[str, int]:
+    session = require_session_user(request)
+    return get_user_claim_summary_snapshot(session["user_id"])
+
+
+@app.get("/me/api-key-summary")
+def get_me_apikey_summary(request: Request) -> dict[str, int]:
+    session = require_session_user(request)
+    return get_user_api_key_summary_snapshot(session["user_id"])
 
 
 @app.get("/dashboard/leaderboard")
@@ -5637,12 +6110,7 @@ def get_dashboard_stats(request: Request) -> dict[str, Any]:
 def list_api_keys(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    key = build_user_cache_key("me-api-keys", user_id)
-    return cache_json(
-        key,
-        get_cache_me_ttl(),
-        lambda: {"items": db.list_api_keys(user_id), "limit": get_apikey_max_per_user()},
-    )
+    return get_user_api_keys_snapshot(user_id)
 
 
 @app.post("/me/api-keys")
@@ -5655,11 +6123,10 @@ def create_api_key(request: Request, payload: ApiKeyCreatePayload | None = Body(
 
 
 @app.post("/me/api-keys/{api_key_id}/revoke")
-def revoke_api_key(request: Request, api_key_id: int) -> Response:
+def revoke_api_key(request: Request, api_key_id: int) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    db.revoke_api_key(user_id, api_key_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return db.revoke_api_key(user_id, api_key_id)
 
 
 @app.post("/me/uploads/tokens")
@@ -5950,7 +6417,7 @@ def upload_tokens_session(
 def list_claims(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    key = build_user_cache_key("me-claims", user_id)
+    key = build_cache_key("me-claims", user_id, f"v{get_cache_scope_version('user-claims', user_id)}")
     def _load_claims() -> dict[str, Any]:
         items = db.list_claims(user_id)
         for item in items:
@@ -5963,24 +6430,16 @@ def list_claims(request: Request) -> dict[str, Any]:
 def get_queue_status(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     user_id = session["user_id"]
-    key = build_user_cache_key("me-queue-status", user_id)
-    cached_payload = _APP_CACHE.get_json(key)
+    cached_payload = get_cached_user_queue_snapshot(user_id)
     if cached_payload is not None:
         return cached_payload
-    cached = _QUEUE_STATUS_CACHE.get(user_id)
-    if cached and _cache_fresh(cached[0], ttl_sec=float(get_cache_queue_ttl())):
-        _APP_CACHE.set_json(key, cached[1], ttl_sec=get_cache_queue_ttl())
-        return cached[1]
     status = db.get_queue_status(user_id)
-    if not status:
-        payload = {"queued": False}
-        _QUEUE_STATUS_CACHE[user_id] = (time.time(), payload)
-        _APP_CACHE.set_json(key, payload, ttl_sec=get_cache_queue_ttl())
-        return payload
-    payload = {"queued": True, **status}
-    _QUEUE_STATUS_CACHE[user_id] = (time.time(), payload)
-    _APP_CACHE.set_json(key, payload, ttl_sec=get_cache_queue_ttl())
-    return payload
+    payload = build_user_queue_snapshot_payload(
+        user_id,
+        status,
+        available_tokens=None,
+    )
+    return set_user_queue_snapshot(user_id, payload)
 
 
 @app.post("/me/claims/hide")
@@ -5996,7 +6455,7 @@ def hide_claims(request: Request, payload: ClaimHidePayload) -> dict[str, Any]:
 def download_claims_archive(request: Request) -> StreamingResponse:
     session = require_session_user(request)
     user_id = session["user_id"]
-    key = build_user_cache_key("me-claim-files", user_id)
+    key = build_cache_key("me-claim-files", user_id, f"v{get_cache_scope_version('user-claims', user_id)}")
     items = cache_json(key, get_cache_claims_ttl(), lambda: db.list_claim_files(user_id))
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -6052,7 +6511,7 @@ def download_claimed_token(
     if not user_id:
         raise PermissionError
 
-    key = build_user_cache_key("claimed-token", user_id, token_id)
+    key = build_cache_key("claimed-token", user_id, token_id, f"v{get_cache_scope_version('user-claims', user_id)}")
     token = cache_json(key, get_cache_claims_ttl(), lambda: db.get_claimed_token(token_id, user_id))
     if not token:
         raise PermissionError
