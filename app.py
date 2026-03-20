@@ -7,6 +7,7 @@ import hashlib
 import json
 import io
 import os
+import queue
 import secrets
 import sqlite3
 import threading
@@ -28,6 +29,14 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 import claim_queue
 import codex_probe
+try:
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler, FileMovedEvent
+    from watchdog.observers import Observer
+except Exception:
+    FileSystemEvent = Any  # type: ignore[assignment]
+    FileMovedEvent = Any  # type: ignore[assignment]
+    FileSystemEventHandler = object  # type: ignore[assignment]
+    Observer = None
 
 try:
     import redis
@@ -44,10 +53,40 @@ def startup_log(message: str) -> None:
     print(f"[startup] {message}", flush=True)
 
 
+def token_import_log(message: str) -> None:
+    print(f"[token-import] {message}", flush=True)
+
+
 def count_token_files(token_dir: Path) -> int | None:
     try:
         with os.scandir(token_dir) as entries:
             return sum(1 for entry in entries if entry.is_file() and entry.name.lower().endswith(".json"))
+    except OSError:
+        return None
+
+
+def list_token_json_names(token_dir: Path) -> list[str]:
+    try:
+        with os.scandir(token_dir) as entries:
+            return sorted(
+                entry.name
+                for entry in entries
+                if entry.is_file() and entry.name.lower().endswith(".json")
+            )
+    except OSError:
+        return []
+
+
+def list_token_json_stats(token_dir: Path) -> dict[str, tuple[int, int]] | None:
+    try:
+        with os.scandir(token_dir) as entries:
+            stats: dict[str, tuple[int, int]] = {}
+            for entry in entries:
+                if not entry.is_file() or not entry.name.lower().endswith(".json"):
+                    continue
+                stat = entry.stat()
+                stats[entry.name] = (int(stat.st_mtime_ns), int(stat.st_size))
+            return stats
     except OSError:
         return None
 
@@ -1635,6 +1674,218 @@ class TokenDb:
             _refresh_dashboard_memory()
             invalidate_all_runtime_cache(include_admin=True)
         return {"imported": imported, "skipped": skipped, "errors": errors}
+
+    def list_token_file_names(self) -> set[str]:
+        with self.connect(timeout=3.0) as conn:
+            return {
+                str(row["file_name"])
+                for row in conn.execute("SELECT file_name FROM tokens").fetchall()
+            }
+
+    def list_token_file_states(self) -> dict[str, dict[str, int]]:
+        with self.connect(timeout=3.0) as conn:
+            rows = conn.execute(
+                "SELECT file_name, updated_at_ts, is_active FROM tokens"
+            ).fetchall()
+        return {
+            str(row["file_name"]): {
+                "updated_at_ts": int(row["updated_at_ts"] or 0),
+                "is_active": int(row["is_active"] or 0),
+            }
+            for row in rows
+        }
+
+    def deactivate_token_file(self, file_name: str, *, timeout: float = 3.0) -> bool:
+        now = now_ts()
+        with self._lock, self.connect(timeout=timeout) as conn:
+            row = conn.execute(
+                "SELECT id FROM tokens WHERE file_name = ? AND is_active != 0",
+                (file_name,),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                """
+                UPDATE tokens
+                SET is_active = 0,
+                    is_available = 0,
+                    updated_at_ts = ?,
+                    last_seen_at_ts = ?
+                WHERE id = ?
+                """,
+                (now, now, int(row["id"])),
+            )
+        _refresh_dashboard_memory()
+        invalidate_all_runtime_cache(include_admin=True)
+        return True
+
+    def deactivate_missing_token_files(self, existing_file_names: set[str], *, timeout: float = 3.0) -> int:
+        now = now_ts()
+        with self._lock, self.connect(timeout=timeout) as conn:
+            if existing_file_names:
+                placeholders = ",".join("?" for _ in existing_file_names)
+                cursor = conn.execute(
+                    f"""
+                    UPDATE tokens
+                    SET is_active = 0,
+                        is_available = 0,
+                        updated_at_ts = ?,
+                        last_seen_at_ts = ?
+                    WHERE file_name NOT IN ({placeholders})
+                      AND is_active != 0
+                    """,
+                    (now, now, *sorted(existing_file_names)),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE tokens
+                    SET is_active = 0,
+                        is_available = 0,
+                        updated_at_ts = ?,
+                        last_seen_at_ts = ?
+                    WHERE is_active != 0
+                    """,
+                    (now, now),
+                )
+            changed = int(cursor.rowcount or 0)
+        if changed:
+            _refresh_dashboard_memory()
+            invalidate_all_runtime_cache(include_admin=True)
+        return changed
+
+    def import_token_file(self, path: Path, *, timeout: float = 3.0) -> dict[str, Any]:
+        file_name = path.name
+        if not file_name.lower().endswith(".json"):
+            return {"status": "ignored", "file_name": file_name}
+
+        now = now_ts()
+        healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
+        try:
+            encoding, content_json, file_hash = self._load_token_file(path)
+            normalized = normalize_upload_content(json.loads(content_json))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return {"status": "error", "file_name": file_name, "reason": type(exc).__name__}
+        except UploadValidationError as exc:
+            return {"status": "error", "file_name": file_name, "reason": str(exc)}
+
+        file_path = path.relative_to(BASE_DIR).as_posix()
+        result: dict[str, Any]
+        with self._lock, self.connect(timeout=timeout) as conn:
+            existing = conn.execute(
+                "SELECT id, claim_count, max_claims, is_enabled, is_banned FROM tokens WHERE file_name = ?",
+                (file_name,),
+            ).fetchone()
+            current_token_id = int(existing["id"]) if existing else None
+            conflict = self._find_sync_token_conflict(
+                current_token_id=current_token_id,
+                normalized=normalized,
+                conn=conn,
+            )
+            if conflict:
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE tokens
+                        SET is_active = 0,
+                            is_available = 0,
+                            updated_at_ts = ?,
+                            last_seen_at_ts = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, current_token_id),
+                    )
+                    self.ensure_inventory_policy(conn=conn)
+                    action = "deactivated"
+                else:
+                    action = "skipped"
+                result = {"status": action, "file_name": file_name, "reason": "token_conflict"}
+            elif existing:
+                claim_count = int(existing["claim_count"])
+                effective_max_claims = int(existing["max_claims"])
+                is_enabled = int(existing["is_enabled"]) if "is_enabled" in existing.keys() else 1
+                is_banned = int(existing["is_banned"]) if "is_banned" in existing.keys() else 0
+                is_available = 1 if is_enabled and not is_banned and claim_count < effective_max_claims else 0
+                conn.execute(
+                    """
+                    UPDATE tokens
+                    SET file_path = ?,
+                        file_hash = ?,
+                        encoding = ?,
+                        content_json = ?,
+                        account_id = ?,
+                        access_token_hash = ?,
+                        is_active = 1,
+                        is_available = ?,
+                        updated_at_ts = ?,
+                        last_seen_at_ts = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        file_path,
+                        file_hash,
+                        encoding,
+                        content_json,
+                        normalized["account_id"],
+                        hash_token_value(normalized["access_token"]),
+                        is_available,
+                        now,
+                        now,
+                        current_token_id,
+                    ),
+                )
+                result = {"status": "updated", "file_name": file_name}
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO tokens (
+                        file_name,
+                        file_path,
+                        file_hash,
+                        encoding,
+                        content_json,
+                        account_id,
+                        access_token_hash,
+                        is_active,
+                        is_cleaned,
+                        is_enabled,
+                        is_banned,
+                        is_available,
+                        claim_count,
+                        max_claims,
+                        created_at_ts,
+                        cleaned_at_ts,
+                        updated_at_ts,
+                        last_seen_at_ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        file_name,
+                        file_path,
+                        file_hash,
+                        encoding,
+                        content_json,
+                        normalized["account_id"],
+                        hash_token_value(normalized["access_token"]),
+                        1,
+                        0,
+                        1,
+                        0,
+                        1,
+                        0,
+                        healthy_max_claims,
+                        now,
+                        None,
+                        now,
+                        now,
+                    ),
+                )
+                result = {"status": "imported", "file_name": file_name}
+            self.ensure_inventory_policy(conn=conn)
+        if result["status"] != "skipped":
+            _refresh_dashboard_memory()
+            invalidate_all_runtime_cache(include_admin=True)
+        return result
 
     def upsert_user(self, user: LinuxDOUser) -> dict[str, Any]:
         now = now_ts()
@@ -4196,6 +4447,7 @@ def build_upload_response(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 def write_uploaded_token_file(file_name: str, content_json: str) -> tuple[Path, str]:
     path = TOKEN_DIR / file_name
+    _mark_internal_token_write(file_name)
     path.write_text(content_json, encoding="utf-8", newline="\n")
     return path, path.relative_to(BASE_DIR).as_posix()
 
@@ -4241,7 +4493,15 @@ _QUEUE_PUMP_STOP = threading.Event()
 _QUEUE_PUMP_INTERVAL_SEC = 20.0
 _TOKEN_IMPORT_THREAD: threading.Thread | None = None
 _TOKEN_IMPORT_STOP = threading.Event()
-_TOKEN_IMPORT_INTERVAL_SEC = 60.0
+_TOKEN_IMPORT_QUEUE: queue.Queue[tuple[str, int, str]] = queue.Queue()
+_TOKEN_IMPORT_PENDING_LOCK = threading.RLock()
+_TOKEN_IMPORT_PENDING_FILES: set[str] = set()
+_TOKEN_IMPORT_INTERNAL_WRITES: dict[str, float] = {}
+_TOKEN_IMPORT_RETRY_DELAY_SEC = 0.5
+_TOKEN_IMPORT_MAX_RETRIES = 8
+_TOKEN_IMPORT_INTERNAL_WRITE_TTL_SEC = 30.0
+_TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC = 30.0
+_TOKEN_WATCHDOG_OBSERVER: Any = None
 _API_KEY_CACHE_LOCK = threading.RLock()
 _API_KEY_CACHE_BY_HASH: dict[str, dict[str, Any]] = {}
 _APP_CACHE = AppCache()
@@ -4298,13 +4558,313 @@ def _queue_pump_loop() -> None:
         _QUEUE_PUMP_STOP.wait(timeout=_QUEUE_PUMP_INTERVAL_SEC)
 
 
-def _token_import_loop() -> None:
-    while not _TOKEN_IMPORT_STOP.wait(timeout=_TOKEN_IMPORT_INTERVAL_SEC):
+def _cleanup_internal_token_writes(now: float | None = None) -> None:
+    moment = time.time() if now is None else now
+    expired = [
+        file_name
+        for file_name, expires_at in _TOKEN_IMPORT_INTERNAL_WRITES.items()
+        if expires_at <= moment
+    ]
+    for file_name in expired:
+        _TOKEN_IMPORT_INTERNAL_WRITES.pop(file_name, None)
+
+
+def _mark_internal_token_write(file_name: str) -> None:
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        _cleanup_internal_token_writes()
+        _TOKEN_IMPORT_INTERNAL_WRITES[file_name] = time.time() + _TOKEN_IMPORT_INTERNAL_WRITE_TTL_SEC
+
+
+def _should_ignore_internal_token_write(file_name: str) -> bool:
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        _cleanup_internal_token_writes()
+        expires_at = _TOKEN_IMPORT_INTERNAL_WRITES.get(file_name)
+        return expires_at is not None and expires_at > time.time()
+
+
+def _enqueue_token_import(
+    file_name: str,
+    *,
+    reason: str,
+    attempt: int = 0,
+    emit_log: bool = True,
+) -> bool:
+    if not file_name.lower().endswith(".json"):
+        return False
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        if attempt == 0:
+            _cleanup_internal_token_writes()
+            if file_name in _TOKEN_IMPORT_INTERNAL_WRITES:
+                return False
+        if file_name in _TOKEN_IMPORT_PENDING_FILES:
+            return False
+        _TOKEN_IMPORT_PENDING_FILES.add(file_name)
+    _TOKEN_IMPORT_QUEUE.put((file_name, attempt, reason))
+    if emit_log:
+        token_import_log(f"queued file={file_name} reason={reason} attempt={attempt}")
+    return True
+
+
+def _requeue_token_import(file_name: str, *, reason: str, attempt: int) -> None:
+    _TOKEN_IMPORT_QUEUE.put((file_name, attempt, reason))
+    token_import_log(f"requeued file={file_name} reason={reason} attempt={attempt}")
+
+
+def _release_token_import(file_name: str) -> None:
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        _TOKEN_IMPORT_PENDING_FILES.discard(file_name)
+
+
+def _clear_token_import_queue() -> None:
+    while True:
         try:
-            sync_tokens_with_retry(db, TOKEN_DIR)
-            try_fulfill_queue(db)
-        except Exception:
-            pass
+            _TOKEN_IMPORT_QUEUE.get_nowait()
+        except queue.Empty:
+            return
+        else:
+            _TOKEN_IMPORT_QUEUE.task_done()
+
+
+def _wait_for_token_file_ready(path: Path) -> bool:
+    stable_size: int | None = None
+    stable_hits = 0
+    for _ in range(8):
+        if _TOKEN_IMPORT_STOP.is_set():
+            return False
+        try:
+            stat = path.stat()
+            size = int(stat.st_size)
+        except OSError:
+            time.sleep(_TOKEN_IMPORT_RETRY_DELAY_SEC)
+            continue
+        if size == stable_size:
+            stable_hits += 1
+        else:
+            stable_size = size
+            stable_hits = 1
+        if stable_hits >= 2:
+            return True
+        time.sleep(_TOKEN_IMPORT_RETRY_DELAY_SEC)
+    return path.exists()
+
+
+def _startup_reconcile_token_files() -> dict[str, int]:
+    file_stats = list_token_json_stats(TOKEN_DIR)
+    if file_stats is None:
+        token_import_log("startup reconcile skipped: unable to read token directory")
+        return {"queued": 0, "total": 0, "deactivated": 0}
+    if not file_stats:
+        deactivated = db.deactivate_missing_token_files(set())
+        return {"queued": 0, "total": 0, "deactivated": deactivated}
+    try:
+        known_states = db.list_token_file_states()
+    except sqlite3.OperationalError as exc:
+        token_import_log(f"startup reconcile skipped: database error: {exc}")
+        return {"queued": 0, "total": len(file_stats), "deactivated": 0}
+    queued = 0
+    for file_name, (mtime_ns, _size) in file_stats.items():
+        state = known_states.get(file_name)
+        should_queue = False
+        if state is None:
+            should_queue = True
+        elif state["is_active"] == 0:
+            should_queue = True
+        elif int(mtime_ns / 1_000_000_000) > state["updated_at_ts"]:
+            should_queue = True
+        if should_queue and _enqueue_token_import(file_name, reason="startup_reconcile", emit_log=False):
+            queued += 1
+    deactivated = db.deactivate_missing_token_files(set(file_stats))
+    return {"queued": queued, "total": len(file_stats), "deactivated": deactivated}
+
+
+def _poll_token_directory_changes(previous_stats: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
+    current_stats = list_token_json_stats(TOKEN_DIR)
+    if current_stats is None:
+        token_import_log("fallback scan skipped: unable to read token directory")
+        return previous_stats
+    previous_names = set(previous_stats)
+    current_names = set(current_stats)
+
+    removed_names = sorted(previous_names - current_names)
+    for file_name in removed_names:
+        if db.deactivate_token_file(file_name, timeout=3.0):
+            token_import_log(f"deactivated file={file_name} reason=poll_deleted")
+
+    for file_name, stat_pair in current_stats.items():
+        previous_pair = previous_stats.get(file_name)
+        if previous_pair != stat_pair:
+            _enqueue_token_import(file_name, reason="poll_changed", emit_log=False)
+
+    return current_stats
+
+
+def _process_token_import_task(file_name: str, attempt: int, reason: str) -> None:
+    path = TOKEN_DIR / file_name
+    keep_pending = False
+    try:
+        if not _wait_for_token_file_ready(path):
+            if _TOKEN_IMPORT_STOP.is_set():
+                return
+            if attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
+                keep_pending = True
+                _requeue_token_import(
+                    file_name,
+                    reason=f"{reason}:waiting_for_ready",
+                    attempt=attempt + 1,
+                )
+            else:
+                token_import_log(f"failed file={file_name} reason=file_not_ready attempts={attempt + 1}")
+            return
+
+        try:
+            result = db.import_token_file(path, timeout=3.0)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" in str(exc).lower() and attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
+                keep_pending = True
+                _requeue_token_import(
+                    file_name,
+                    reason=f"{reason}:db_locked",
+                    attempt=attempt + 1,
+                )
+                return
+            token_import_log(
+                f"failed file={file_name} reason=database_error error={type(exc).__name__}:{exc}"
+            )
+            return
+
+        status = str(result.get("status", "unknown"))
+        if status in {"imported", "updated"}:
+            token_import_log(f"imported file={file_name} reason={reason}")
+            try:
+                try_fulfill_queue(db)
+            except Exception as exc:
+                token_import_log(
+                    f"queue fulfill after import failed file={file_name} error={type(exc).__name__}:{exc}"
+                )
+            return
+        if status == "skipped":
+            token_import_log(
+                f"skipped file={file_name} reason={result.get('reason', 'unknown')}"
+            )
+            return
+        if status == "ignored":
+            return
+
+        retryable = str(result.get("reason", "")).lower() in {
+            "oserror",
+            "unicodedecodeerror",
+            "jsondecodeerror",
+        }
+        if retryable and attempt + 1 < _TOKEN_IMPORT_MAX_RETRIES:
+            keep_pending = True
+            _requeue_token_import(
+                file_name,
+                reason=f"{reason}:{result.get('reason', 'retry')}",
+                attempt=attempt + 1,
+            )
+            return
+        token_import_log(
+            f"failed file={file_name} reason={result.get('reason', 'unknown')} attempts={attempt + 1}"
+        )
+    finally:
+        if not keep_pending:
+            _release_token_import(file_name)
+
+
+class _TokenImportEventHandler(FileSystemEventHandler):
+    def _is_token_path(self, raw_path: str) -> bool:
+        try:
+            return Path(raw_path).resolve().parent == TOKEN_DIR.resolve()
+        except OSError:
+            return False
+
+    def _queue_event_path(self, raw_path: str, *, reason: str) -> None:
+        if not self._is_token_path(raw_path):
+            return
+        file_name = Path(raw_path).name
+        if not file_name.lower().endswith(".json"):
+            return
+        if _should_ignore_internal_token_write(file_name):
+            token_import_log(f"ignored internal write file={file_name}")
+            return
+        _enqueue_token_import(file_name, reason=reason)
+
+    def _deactivate_event_path(self, raw_path: str, *, reason: str) -> None:
+        if not self._is_token_path(raw_path):
+            return
+        file_name = Path(raw_path).name
+        if not file_name.lower().endswith(".json"):
+            return
+        if db.deactivate_token_file(file_name, timeout=3.0):
+            token_import_log(f"deactivated file={file_name} reason={reason}")
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if getattr(event, "is_directory", False):
+            return
+        self._queue_event_path(str(event.src_path), reason="watch_created")
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if getattr(event, "is_directory", False):
+            return
+        self._queue_event_path(str(event.src_path), reason="watch_modified")
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        if getattr(event, "is_directory", False):
+            return
+        self._deactivate_event_path(str(event.src_path), reason="watch_deleted")
+
+    def on_moved(self, event: FileMovedEvent) -> None:
+        if getattr(event, "is_directory", False):
+            return
+        self._deactivate_event_path(str(event.src_path), reason="watch_moved_out")
+        self._queue_event_path(str(event.dest_path), reason="watch_moved_in")
+
+
+def _start_token_watchdog() -> Any:
+    if Observer is None:
+        token_import_log("watchdog unavailable; using fallback polling scanner")
+        return None
+    observer = Observer()
+    observer.schedule(_TokenImportEventHandler(), str(TOKEN_DIR), recursive=False)
+    observer.start()
+    token_import_log(f"watcher started dir={TOKEN_DIR}")
+    return observer
+
+
+def _token_import_loop() -> None:
+    global _TOKEN_WATCHDOG_OBSERVER
+    token_import_log("background worker started")
+    reconcile_result = _startup_reconcile_token_files()
+    token_import_log(
+        "startup reconcile finished "
+        f"queued={reconcile_result['queued']} total={reconcile_result['total']} "
+        f"deactivated={reconcile_result['deactivated']}"
+    )
+    observer = _start_token_watchdog()
+    _TOKEN_WATCHDOG_OBSERVER = observer
+    fallback_snapshot: dict[str, tuple[int, int]] = {}
+    if observer is None:
+        fallback_snapshot = list_token_json_stats(TOKEN_DIR) or {}
+    next_fallback_scan_at = time.time() + _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC
+    try:
+        while not _TOKEN_IMPORT_STOP.is_set():
+            try:
+                file_name, attempt, reason = _TOKEN_IMPORT_QUEUE.get(timeout=0.5)
+            except queue.Empty:
+                if observer is None and time.time() >= next_fallback_scan_at:
+                    fallback_snapshot = _poll_token_directory_changes(fallback_snapshot)
+                    next_fallback_scan_at = time.time() + _TOKEN_IMPORT_FALLBACK_SCAN_INTERVAL_SEC
+                continue
+            try:
+                _process_token_import_task(file_name, attempt, reason)
+            finally:
+                _TOKEN_IMPORT_QUEUE.task_done()
+    finally:
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=5)
+            token_import_log("watcher stopped")
+        _TOKEN_WATCHDOG_OBSERVER = None
 
 
 @asynccontextmanager
@@ -4336,7 +4896,6 @@ async def lifespan(_: FastAPI):
     run_startup_step("configure cache backend", lambda: _APP_CACHE.configure(emit_log=True))
     run_startup_step("start codex probe", _CODEX_PROBE.start)
     run_startup_step("initialize database", db.init_db)
-    run_startup_step("sync tokens", lambda: sync_tokens_with_retry(db, TOKEN_DIR))
     run_startup_step("fulfill queued claims", lambda: try_fulfill_queue(db))
     run_startup_step("refresh dashboard memory", _refresh_dashboard_memory)
     run_startup_step("refresh queue snapshot", lambda: refresh_queue_total_snapshot(db))
@@ -4344,6 +4903,10 @@ async def lifespan(_: FastAPI):
 
     _QUEUE_PUMP_STOP.clear()
     _TOKEN_IMPORT_STOP.clear()
+    _clear_token_import_queue()
+    with _TOKEN_IMPORT_PENDING_LOCK:
+        _TOKEN_IMPORT_PENDING_FILES.clear()
+        _TOKEN_IMPORT_INTERNAL_WRITES.clear()
     global _QUEUE_PUMP_THREAD
     global _TOKEN_IMPORT_THREAD
     _QUEUE_PUMP_THREAD = threading.Thread(
@@ -4371,6 +4934,10 @@ async def lifespan(_: FastAPI):
         if _TOKEN_IMPORT_THREAD is not None:
             _TOKEN_IMPORT_THREAD.join(timeout=5)
             _TOKEN_IMPORT_THREAD = None
+        _clear_token_import_queue()
+        with _TOKEN_IMPORT_PENDING_LOCK:
+            _TOKEN_IMPORT_PENDING_FILES.clear()
+            _TOKEN_IMPORT_INTERNAL_WRITES.clear()
 
 
 app = FastAPI(title="Token Atlas", version="1.1.0", lifespan=lifespan)
