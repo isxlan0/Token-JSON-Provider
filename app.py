@@ -5994,4 +5994,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=env_int("PORT", 8000),
         reload=False,
+        access_log=False,
+        log_level="warning",
     )
