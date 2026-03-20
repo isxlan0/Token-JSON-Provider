@@ -4516,17 +4516,6 @@ def get_default_upload_results_snapshot() -> dict[str, Any]:
 
 
 def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
-    with _UPLOAD_RESULTS_MEMORY_LOCK:
-        memory_payload = _UPLOAD_RESULTS_MEMORY.get(int(user_id))
-        if isinstance(memory_payload, dict):
-            return {
-                "batch_id": memory_payload.get("batch_id"),
-                "created_at": memory_payload.get("created_at"),
-                "summary": dict(memory_payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
-                "items": list(memory_payload.get("items") or []),
-                "history": [],
-                "queue_status": dict(memory_payload.get("queue_status") or {}) if isinstance(memory_payload.get("queue_status"), dict) else None,
-            }
     key = build_user_upload_results_cache_key(user_id)
     cached = _get_cached_snapshot(key)
     if cached is not None:
@@ -4538,6 +4527,17 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
             "history": [],
             "queue_status": dict(cached.get("queue_status") or {}) if isinstance(cached.get("queue_status"), dict) else None,
         }
+    with _UPLOAD_RESULTS_MEMORY_LOCK:
+        memory_payload = _UPLOAD_RESULTS_MEMORY.get(int(user_id))
+        if isinstance(memory_payload, dict):
+            return {
+                "batch_id": memory_payload.get("batch_id"),
+                "created_at": memory_payload.get("created_at"),
+                "summary": dict(memory_payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
+                "items": list(memory_payload.get("items") or []),
+                "history": [],
+                "queue_status": dict(memory_payload.get("queue_status") or {}) if isinstance(memory_payload.get("queue_status"), dict) else None,
+            }
     return get_default_upload_results_snapshot()
 
 
