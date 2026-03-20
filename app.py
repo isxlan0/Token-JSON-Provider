@@ -3623,6 +3623,10 @@ class TokenDb:
         api_key_id: int | None,
         count: int,
     ) -> dict[str, Any]:
+        if claim_queue.has_pending_queue(self):
+            # When inventory still exists, try to advance the queue before deciding that
+            # this request must wait behind older queued requests.
+            advance_claim_queue_on_demand(only_when_stock_hint=True)
         requested = max(1, count)
         request_id = secrets.token_hex(8)
         now = now_ts()
@@ -5333,6 +5337,17 @@ def try_fulfill_queue(db_handle: TokenDb) -> None:
         invalidate_dashboard_cache()
 
 
+def advance_claim_queue_on_demand(*, only_when_stock_hint: bool = False) -> None:
+    if only_when_stock_hint and get_global_available_tokens_estimate() <= 0:
+        return
+    if not claim_queue.has_pending_queue(db):
+        return
+    try:
+        try_fulfill_queue(db)
+    except Exception as exc:
+        startup_log(f"advance claim queue skipped: {type(exc).__name__}: {exc}")
+
+
 def _cache_fresh(ts: float, ttl_sec: float | None = None) -> bool:
     return time.time() - ts < (ttl_sec if ttl_sec is not None else _CACHE_TTL_SEC)
 
@@ -6926,6 +6941,7 @@ def list_claims(request: Request) -> dict[str, Any]:
 @app.get("/me/queue-status")
 def get_queue_status(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
+    advance_claim_queue_on_demand(only_when_stock_hint=True)
     payload = get_current_user_queue_status_snapshot(session["user_id"])
     if get_cached_user_queue_snapshot(session["user_id"]) is None:
         return set_user_queue_snapshot(session["user_id"], payload)
