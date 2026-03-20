@@ -795,6 +795,8 @@ function renderUploadSelected() {
 
 function uploadStatusLabel(status) {
   const map = {
+    queued: "排队中",
+    processing: "处理中",
     accepted: "已入库",
     duplicate: "重复账号",
     invalid_json: "JSON 非法",
@@ -802,6 +804,7 @@ function uploadStatusLabel(status) {
     invalid_file: "文件无效",
     file_too_large: "文件过大",
     banned_401: "账号失效",
+    probe_timeout: "探活超时",
     probe_failed: "探活失败",
     rate_limited: "额度不足",
     db_busy: "数据库繁忙",
@@ -840,10 +843,16 @@ function renderUploadResults() {
 
 function applyUploadResultsPayload(payload) {
   state.uploadResults = payload.items || [];
+  if (payload?.queue_status) {
+    state.queueStatus = payload.queue_status;
+    renderQueueStatus();
+  }
   renderUploadResults();
   const summary = payload.summary || {};
   elements.uploadSummary.textContent =
     `本次共处理 ${summary.total ?? 0} 个文件，成功 ${summary.accepted ?? 0} 个，重复 ${summary.duplicates ?? 0} 个` +
+    `${summary.queued ? `，排队中 ${summary.queued} 个` : ""}` +
+    `${summary.processing ? `，处理中 ${summary.processing} 个` : ""}` +
     `${summary.db_busy ? `，数据库繁忙 ${summary.db_busy} 个` : ""}。`;
   if ((summary.total ?? 0) > 0) {
     elements.uploadSummary.classList.remove("hidden");
@@ -864,7 +873,7 @@ function setUploadSubmitting(submitting) {
   }
   elements.uploadSubmitBtn.disabled = submitting || !state.uploadQueue.length;
   elements.uploadSubmitBtn.classList.toggle("is-loading", submitting);
-  elements.uploadSubmitBtn.textContent = submitting ? "上传校验中..." : "开始上传";
+  elements.uploadSubmitBtn.textContent = submitting ? "正在加入队列..." : "开始上传";
 }
 
 function mergeUploadQueue(files) {
@@ -917,7 +926,11 @@ async function uploadTokens() {
         .filter((item) => item.status === "db_busy" && Number.isInteger(item.request_index))
         .map((item) => item.request_index)
     );
-    state.uploadQueue = state.uploadQueue.filter((_, index) => retryIndexes.has(index));
+    if (retryIndexes.size) {
+      state.uploadQueue = state.uploadQueue.filter((_, index) => retryIndexes.has(index));
+    } else {
+      state.uploadQueue = [];
+    }
     renderUploadSelected();
     await loadDashboardSummary();
   } catch (error) {
@@ -1228,6 +1241,7 @@ async function refreshAll() {
     await loadQueueStatus();
     await loadQuotaSummary();
     await loadApiKeySummary();
+    await loadUploadResultsSnapshot();
     if (shouldRefreshClaims) {
       await loadClaimSummary();
       await loadClaims();

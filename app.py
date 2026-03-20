@@ -376,6 +376,22 @@ class UploadTokensPayload(BaseModel):
     files: list[UploadTokenFilePayload] = Field(default_factory=list)
 
 
+@dataclass
+class QueuedUploadTask:
+    batch_id: str
+    user_id: int
+    provider_username: str
+    provider_name: str
+    hourly_limit: int
+    request_index: int
+    file_name: str
+    content_json: str
+    account_id: str
+    access_token: str
+    refresh_token: str
+    access_token_hash: str
+
+
 class LinuxDOUser(BaseModel):
     id: int
     username: str
@@ -4457,6 +4473,7 @@ def set_user_api_key_summary_snapshot(user_id: int, payload: dict[str, Any]) -> 
 
 def get_default_upload_results_snapshot() -> dict[str, Any]:
     return {
+        "batch_id": None,
         "summary": {
             "total": 0,
             "accepted": 0,
@@ -4464,8 +4481,11 @@ def get_default_upload_results_snapshot() -> dict[str, Any]:
             "invalid": 0,
             "rejected": 0,
             "db_busy": 0,
+            "queued": 0,
+            "processing": 0,
         },
         "items": [],
+        "queue_status": None,
     }
 
 
@@ -4474,8 +4494,10 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
     cached = _get_cached_snapshot(key)
     if cached is not None:
         return {
+            "batch_id": cached.get("batch_id"),
             "summary": dict(cached.get("summary") or get_default_upload_results_snapshot()["summary"]),
             "items": list(cached.get("items") or []),
+            "queue_status": dict(cached.get("queue_status") or {}) if isinstance(cached.get("queue_status"), dict) else None,
         }
     return get_default_upload_results_snapshot()
 
@@ -4483,8 +4505,10 @@ def get_user_upload_results_snapshot(user_id: int) -> dict[str, Any]:
 def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     key = build_user_upload_results_cache_key(user_id)
     normalized = {
+        "batch_id": payload.get("batch_id"),
         "summary": dict(payload.get("summary") or get_default_upload_results_snapshot()["summary"]),
         "items": list(payload.get("items") or []),
+        "queue_status": dict(payload.get("queue_status") or {}) if isinstance(payload.get("queue_status"), dict) else None,
     }
     return _set_cached_snapshot(key, normalized, get_cache_me_ttl())
 
@@ -5042,7 +5066,12 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
     return documents
 
 
-def build_upload_response(items: list[dict[str, Any]]) -> dict[str, Any]:
+def build_upload_response(
+    items: list[dict[str, Any]],
+    *,
+    batch_id: str | None = None,
+    queue_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     summary = {
         "total": len(items),
         "accepted": sum(1 for item in items if item["status"] == "accepted"),
@@ -5051,11 +5080,61 @@ def build_upload_response(items: list[dict[str, Any]]) -> dict[str, Any]:
         "rejected": sum(
             1
             for item in items
-            if item["status"] not in {"accepted", "duplicate", "invalid_json", "missing_fields", "invalid_file", "file_too_large"}
+            if item["status"] not in {"accepted", "duplicate", "invalid_json", "missing_fields", "invalid_file", "file_too_large", "queued", "processing"}
         ),
         "db_busy": sum(1 for item in items if item["status"] == "db_busy"),
+        "queued": sum(1 for item in items if item["status"] == "queued"),
+        "processing": sum(1 for item in items if item["status"] == "processing"),
     }
-    return {"summary": summary, "items": items}
+    return {
+        "batch_id": batch_id,
+        "summary": summary,
+        "items": items,
+        "queue_status": dict(queue_status) if isinstance(queue_status, dict) else None,
+    }
+
+
+def get_current_user_queue_status_snapshot(user_id: int) -> dict[str, Any]:
+    cached_payload = get_cached_user_queue_snapshot(user_id)
+    if cached_payload is not None:
+        return dict(cached_payload)
+    status = db.get_queue_status(user_id)
+    return build_user_queue_snapshot_payload(
+        user_id,
+        status,
+        available_tokens=None,
+    )
+
+
+def update_user_upload_results_snapshot(
+    user_id: int,
+    batch_id: str,
+    request_index: int,
+    item_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    current = get_user_upload_results_snapshot(user_id)
+    if current.get("batch_id") != batch_id:
+        return None
+    items = list(current.get("items") or [])
+    target_position = next(
+        (
+            index
+            for index, existing in enumerate(items)
+            if int(existing["request_index"]) == request_index
+        ),
+        None,
+    )
+    if target_position is None:
+        return None
+    merged = dict(items[target_position])
+    merged.update(item_payload)
+    items[target_position] = merged
+    payload = build_upload_response(
+        items,
+        batch_id=batch_id,
+        queue_status=get_current_user_queue_status_snapshot(user_id),
+    )
+    return set_user_upload_results_snapshot(user_id, payload)
 
 
 def write_uploaded_token_file(file_name: str, content_json: str) -> tuple[Path, str]:
@@ -5106,6 +5185,9 @@ _QUEUE_PUMP_INTERVAL_SEC = 20.0
 _TOKEN_IMPORT_THREAD: threading.Thread | None = None
 _TOKEN_IMPORT_STOP = threading.Event()
 _TOKEN_IMPORT_QUEUE: queue.Queue[tuple[str, int, str]] = queue.Queue()
+_UPLOAD_TASK_THREAD: threading.Thread | None = None
+_UPLOAD_TASK_STOP = threading.Event()
+_UPLOAD_TASK_QUEUE: queue.Queue[QueuedUploadTask] = queue.Queue()
 _TOKEN_IMPORT_DELAYED_LOCK = threading.RLock()
 _TOKEN_IMPORT_DELAYED_QUEUE: list[tuple[float, int, str, int, str]] = []
 _TOKEN_IMPORT_DELAYED_SEQUENCE = itertools.count()
@@ -5675,6 +5757,182 @@ def _token_import_loop() -> None:
         _TOKEN_WATCHDOG_OBSERVER = None
 
 
+def _clear_upload_task_queue() -> None:
+    cleared = 0
+    while True:
+        try:
+            _UPLOAD_TASK_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        else:
+            cleared += 1
+            _UPLOAD_TASK_QUEUE.task_done()
+    if cleared:
+        upload_log(f"[upload-worker] cleared queued tasks count={cleared}")
+
+
+def _process_upload_task(task: QueuedUploadTask) -> None:
+    update_user_upload_results_snapshot(
+        task.user_id,
+        task.batch_id,
+        task.request_index,
+        {
+            "status": "processing",
+            "reason": "后台校验中，请稍候刷新结果。",
+        },
+    )
+    upload_log(
+        f"[upload-worker] start user_id={task.user_id} batch={task.batch_id} "
+        f"index={task.request_index} file={task.file_name} account_id={task.account_id}"
+    )
+    result_item: dict[str, Any]
+    try:
+        try:
+            conflict = db.get_uploaded_token_conflict(
+                account_id=task.account_id,
+                access_token_hash=task.access_token_hash,
+            )
+        except sqlite3.OperationalError as exc:
+            if "database is locked" in str(exc).lower():
+                result_item = {
+                    "status": "db_busy",
+                    "reason": "数据库正忙，本文件尚未处理，请稍后重试。",
+                }
+            else:
+                raise
+        else:
+            if conflict:
+                result_item = {
+                    "status": "duplicate",
+                    "reason": "账号已存在于历史库存中",
+                    "account_id": task.account_id,
+                }
+            else:
+                probe_result = _CODEX_PROBE.submit(
+                    {
+                        "account_id": task.account_id,
+                        "access_token": task.access_token,
+                        "refresh_token": task.refresh_token,
+                    },
+                    wait_timeout_sec=get_codex_probe_timeout_sec() + get_codex_probe_delay_sec() + 5.0,
+                )
+                if probe_result.is_banned:
+                    result_item = {
+                        "status": "banned_401",
+                        "reason": "账号已失效或被上游封禁",
+                    }
+                elif probe_result.detail == "probe_queue_timeout":
+                    result_item = {
+                        "status": "probe_timeout",
+                        "reason": "账号探活超时，请稍后重试",
+                    }
+                elif probe_result.status != "ok":
+                    reason = "账号探活失败"
+                    if probe_result.http_status is not None:
+                        reason = f"账号探活请求异常（HTTP {probe_result.http_status}）"
+                    elif probe_result.detail:
+                        reason = f"账号探活请求异常（{probe_result.detail}）"
+                    result_item = {
+                        "status": "probe_failed",
+                        "reason": reason,
+                    }
+                else:
+                    uploaded_at_ts = now_ts()
+                    target_name = build_uploaded_filename(
+                        account_id=task.account_id,
+                        uploaded_at_ts=uploaded_at_ts,
+                    )
+                    file_path_obj, relative_path = write_uploaded_token_file(target_name, task.content_json)
+                    try:
+                        created = run_db_write_with_retry(
+                            lambda: db.create_uploaded_token(
+                                file_name=target_name,
+                                file_path=relative_path,
+                                content_json=task.content_json,
+                                provider={
+                                    "id": task.user_id,
+                                    "username": task.provider_username,
+                                    "name": task.provider_name,
+                                },
+                                uploaded_at_ts=uploaded_at_ts,
+                                hourly_success_limit=task.hourly_limit,
+                                timeout_s=3.0,
+                            ),
+                            retries=2,
+                            delay_sec=0.2,
+                        )
+                    except UploadValidationError:
+                        file_path_obj.unlink(missing_ok=True)
+                        result_item = {
+                            "status": "duplicate",
+                            "reason": "账号已存在于历史库存中",
+                            "account_id": task.account_id,
+                        }
+                    except RateLimitError:
+                        file_path_obj.unlink(missing_ok=True)
+                        result_item = {
+                            "status": "rate_limited",
+                            "reason": "当前小时上传额度不足",
+                        }
+                    except sqlite3.OperationalError as exc:
+                        file_path_obj.unlink(missing_ok=True)
+                        if "database is locked" in str(exc).lower():
+                            result_item = {
+                                "status": "db_busy",
+                                "reason": "数据库正忙，本文件尚未处理，请稍后重试。",
+                            }
+                        else:
+                            raise
+                    except Exception:
+                        file_path_obj.unlink(missing_ok=True)
+                        raise
+                    else:
+                        invalidate_user_cache(task.user_id)
+                        try:
+                            try_fulfill_queue(db)
+                        except Exception as exc:
+                            upload_log(
+                                f"[upload-worker] fulfill_failed user_id={task.user_id} "
+                                f"batch={task.batch_id} index={task.request_index} "
+                                f"error={type(exc).__name__}:{exc}"
+                            )
+                        result_item = {
+                            "status": "accepted",
+                            "reason": "校验通过，已加入可领取库存",
+                            "token_id": created["token_id"],
+                            "account_id": created["account_id"],
+                        }
+    except Exception as exc:
+        upload_log(
+            f"[upload-worker] failed user_id={task.user_id} batch={task.batch_id} "
+            f"index={task.request_index} file={task.file_name} "
+            f"error={type(exc).__name__}:{exc}"
+        )
+        result_item = {
+            "status": "probe_failed",
+            "reason": "后台处理失败，请稍后重试",
+        }
+    update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
+    upload_log(
+        f"[upload-worker] finished user_id={task.user_id} batch={task.batch_id} "
+        f"index={task.request_index} file={task.file_name} status={result_item['status']}"
+    )
+
+
+def _upload_task_loop() -> None:
+    upload_log("[upload-worker] background worker started")
+    while not _UPLOAD_TASK_STOP.is_set():
+        try:
+            task = _UPLOAD_TASK_QUEUE.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            _process_upload_task(task)
+        finally:
+            _UPLOAD_TASK_QUEUE.task_done()
+    upload_log("[upload-worker] background worker stopped")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     startup_begin = time.perf_counter()
@@ -5710,14 +5968,17 @@ async def lifespan(_: FastAPI):
 
     _QUEUE_PUMP_STOP.clear()
     _TOKEN_IMPORT_STOP.clear()
+    _UPLOAD_TASK_STOP.clear()
     _clear_token_import_queue()
     _clear_delayed_token_imports()
+    _clear_upload_task_queue()
     with _TOKEN_IMPORT_PENDING_LOCK:
         _TOKEN_IMPORT_PENDING_FILES.clear()
         _TOKEN_IMPORT_DIRTY_FILES.clear()
         _TOKEN_IMPORT_INTERNAL_WRITES.clear()
     global _QUEUE_PUMP_THREAD
     global _TOKEN_IMPORT_THREAD
+    global _UPLOAD_TASK_THREAD
     _QUEUE_PUMP_THREAD = threading.Thread(
         target=_queue_pump_loop,
         daemon=True,
@@ -5730,12 +5991,19 @@ async def lifespan(_: FastAPI):
         name="token-import-pump",
     )
     _TOKEN_IMPORT_THREAD.start()
+    _UPLOAD_TASK_THREAD = threading.Thread(
+        target=_upload_task_loop,
+        daemon=True,
+        name="upload-task-pump",
+    )
+    _UPLOAD_TASK_THREAD.start()
 
     try:
         yield
     finally:
         _QUEUE_PUMP_STOP.set()
         _TOKEN_IMPORT_STOP.set()
+        _UPLOAD_TASK_STOP.set()
         _CODEX_PROBE.stop()
         if _QUEUE_PUMP_THREAD is not None:
             _QUEUE_PUMP_THREAD.join(timeout=5)
@@ -5743,8 +6011,12 @@ async def lifespan(_: FastAPI):
         if _TOKEN_IMPORT_THREAD is not None:
             _TOKEN_IMPORT_THREAD.join(timeout=5)
             _TOKEN_IMPORT_THREAD = None
+        if _UPLOAD_TASK_THREAD is not None:
+            _UPLOAD_TASK_THREAD.join(timeout=5)
+            _UPLOAD_TASK_THREAD = None
         _clear_token_import_queue()
         _clear_delayed_token_imports()
+        _clear_upload_task_queue()
         with _TOKEN_IMPORT_PENDING_LOCK:
             _TOKEN_IMPORT_PENDING_FILES.clear()
             _TOKEN_IMPORT_DIRTY_FILES.clear()
@@ -6103,7 +6375,9 @@ def get_me_apikey_summary(request: Request) -> dict[str, int]:
 @app.get("/me/uploads/results")
 def get_me_upload_results(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
-    return get_user_upload_results_snapshot(session["user_id"])
+    payload = get_user_upload_results_snapshot(session["user_id"])
+    payload["queue_status"] = get_current_user_queue_status_snapshot(session["user_id"])
+    return payload
 
 
 @app.get("/dashboard/leaderboard")
@@ -6304,6 +6578,8 @@ def upload_tokens_session(
         raise RateLimitError("当前小时内可成功上传的账号数量已用完")
 
     results: list[dict[str, Any]] = []
+    queued_tasks: list[QueuedUploadTask] = []
+    batch_id = secrets.token_hex(8)
     for request_index, upload in enumerate(files):
         original_name = os.path.basename(upload.name or "upload.json")
         upload_log(
@@ -6365,178 +6641,48 @@ def upload_tokens_session(
 
         access_token_hash = hash_token_value(normalized["access_token"])
         upload_log(
-            f"[upload-validate] parsed user_id={user['id']} index={request_index} "
+            f"[upload-queue] queued user_id={user['id']} index={request_index} "
             f"file={original_name} account_id={normalized['account_id']}"
-        )
-        try:
-            conflict = db.get_uploaded_token_conflict(
-                account_id=normalized["account_id"],
-                access_token_hash=access_token_hash,
-            )
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc).lower():
-                upload_log(
-                    f"[upload-validate] db_busy user_id={user['id']} index={request_index} "
-                    f"file={original_name} account_id={normalized['account_id']}"
-                )
-                append_db_busy_results(results, files, request_index)
-                break
-            raise
-        if conflict:
-            upload_log(
-                f"[upload-validate] duplicate user_id={user['id']} index={request_index} "
-                f"file={original_name} account_id={normalized['account_id']} existing_token_id={conflict.get('id')}"
-            )
-            results.append(
-                {
-                    "request_index": request_index,
-                    "file_name": original_name,
-                    "status": "duplicate",
-                    "reason": "账号已存在于历史库存中",
-                    "account_id": normalized["account_id"],
-                }
-            )
-            continue
-        if remaining_success <= 0:
-            upload_log(
-                f"[upload-validate] rate_limited user_id={user['id']} index={request_index} "
-                f"file={original_name} account_id={normalized['account_id']}"
-            )
-            results.append({"request_index": request_index, "file_name": original_name, "status": "rate_limited", "reason": "当前小时上传额度不足"})
-            continue
-
-        upload_log(
-            f"[upload-probe] submit user_id={user['id']} index={request_index} "
-            f"file={original_name} account_id={normalized['account_id']}"
-        )
-        probe_result = _CODEX_PROBE.submit(
-            normalized,
-            wait_timeout_sec=get_codex_probe_timeout_sec() + get_codex_probe_delay_sec() + 5.0,
-        )
-        upload_log(
-            f"[upload-probe] result user_id={user['id']} index={request_index} file={original_name} "
-            f"account_id={normalized['account_id']} status={probe_result.status} "
-            f"http_status={probe_result.http_status} detail={probe_result.detail or '-'}"
-        )
-        if probe_result.is_banned:
-            results.append({"request_index": request_index, "file_name": original_name, "status": "banned_401", "reason": "账号已失效或被上游封禁"})
-            continue
-        if probe_result.detail == "probe_queue_timeout":
-            results.append(
-                {
-                    "request_index": request_index,
-                    "file_name": original_name,
-                    "status": "probe_timeout",
-                    "reason": "账号探活超时，请稍后重试",
-                }
-            )
-            continue
-        if probe_result.status != "ok":
-            reason = "账号探活失败"
-            if probe_result.http_status is not None:
-                reason = f"账号探活请求异常（HTTP {probe_result.http_status}）"
-            elif probe_result.detail:
-                reason = f"账号探活请求异常（{probe_result.detail}）"
-            results.append(
-                {
-                    "request_index": request_index,
-                    "file_name": original_name,
-                    "status": "probe_failed",
-                    "reason": reason,
-                }
-            )
-            continue
-
-        uploaded_at_ts = now_ts()
-        target_name = build_uploaded_filename(
-            account_id=normalized["account_id"],
-            uploaded_at_ts=uploaded_at_ts,
-        )
-        file_path_obj, relative_path = write_uploaded_token_file(target_name, content_json)
-        upload_log(
-            f"[upload-store] file_written user_id={user['id']} index={request_index} "
-            f"file={original_name} target={target_name} account_id={normalized['account_id']}"
-        )
-        try:
-            created = run_db_write_with_retry(
-                lambda: db.create_uploaded_token(
-                    file_name=target_name,
-                    file_path=relative_path,
-                    content_json=content_json,
-                    provider=user,
-                    uploaded_at_ts=uploaded_at_ts,
-                    hourly_success_limit=hourly_limit,
-                    timeout_s=3.0,
-                ),
-                retries=2,
-                delay_sec=0.2,
-            )
-        except UploadValidationError:
-            file_path_obj.unlink(missing_ok=True)
-            upload_log(
-                f"[upload-store] duplicate_after_probe user_id={user['id']} index={request_index} "
-                f"file={original_name} account_id={normalized['account_id']}"
-            )
-            results.append(
-                {
-                    "request_index": request_index,
-                    "file_name": original_name,
-                    "status": "duplicate",
-                    "reason": "账号已存在于历史库存中",
-                    "account_id": normalized["account_id"],
-                }
-            )
-            continue
-        except RateLimitError:
-            file_path_obj.unlink(missing_ok=True)
-            remaining_success = 0
-            upload_log(
-                f"[upload-store] rate_limited_after_probe user_id={user['id']} index={request_index} "
-                f"file={original_name} account_id={normalized['account_id']}"
-            )
-            results.append({"request_index": request_index, "file_name": original_name, "status": "rate_limited", "reason": "当前小时上传额度不足"})
-            continue
-        except sqlite3.OperationalError as exc:
-            file_path_obj.unlink(missing_ok=True)
-            if "database is locked" in str(exc).lower():
-                upload_log(
-                    f"[upload-store] db_busy user_id={user['id']} index={request_index} "
-                    f"file={original_name} account_id={normalized['account_id']}"
-                )
-                append_db_busy_results(results, files, request_index)
-                break
-            raise
-        except Exception:
-            file_path_obj.unlink(missing_ok=True)
-            upload_log(
-                f"[upload-store] unexpected_error user_id={user['id']} index={request_index} "
-                f"file={original_name} account_id={normalized['account_id']}"
-            )
-            raise
-
-        remaining_success -= 1
-        upload_log(
-            f"[upload-store] accepted user_id={user['id']} index={request_index} "
-            f"file={original_name} account_id={created['account_id']} token_id={created['token_id']} "
-            f"remaining_success={remaining_success}"
         )
         results.append(
             {
                 "request_index": request_index,
                 "file_name": original_name,
-                "status": "accepted",
-                "reason": "校验通过，已加入可领取库存",
-                "token_id": created["token_id"],
-                "account_id": created["account_id"],
+                "status": "queued",
+                "reason": "已进入上传队列，后台校验中。",
+                "account_id": normalized["account_id"],
             }
         )
+        queued_tasks.append(
+            QueuedUploadTask(
+                batch_id=batch_id,
+                user_id=int(user["id"]),
+                provider_username=str(user["username"]),
+                provider_name=str(user["name"] or user["username"]),
+                hourly_limit=hourly_limit,
+                request_index=request_index,
+                file_name=original_name,
+                content_json=content_json,
+                account_id=normalized["account_id"],
+                access_token=normalized["access_token"],
+                refresh_token=normalized["refresh_token"],
+                access_token_hash=access_token_hash,
+            )
+        )
 
-    response_payload = build_upload_response(results)
+    queue_status_payload = get_current_user_queue_status_snapshot(session["user_id"])
+    response_payload = build_upload_response(
+        results,
+        batch_id=batch_id,
+        queue_status=queue_status_payload,
+    )
     set_user_upload_results_snapshot(session["user_id"], response_payload)
-    invalidate_user_cache(session["user_id"])
+    for task in queued_tasks:
+        _UPLOAD_TASK_QUEUE.put(task)
     success_count = sum(1 for item in results if item.get("status") == "accepted")
     upload_log(
-        f"[upload-request] finished user_id={user['id']} total={len(results)} accepted={success_count}"
+        f"[upload-request] finished user_id={user['id']} total={len(results)} "
+        f"accepted={success_count} queued={len(queued_tasks)} batch={batch_id}"
     )
     return response_payload
 
@@ -6557,17 +6703,10 @@ def list_claims(request: Request) -> dict[str, Any]:
 @app.get("/me/queue-status")
 def get_queue_status(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
-    user_id = session["user_id"]
-    cached_payload = get_cached_user_queue_snapshot(user_id)
-    if cached_payload is not None:
-        return cached_payload
-    status = db.get_queue_status(user_id)
-    payload = build_user_queue_snapshot_payload(
-        user_id,
-        status,
-        available_tokens=None,
-    )
-    return set_user_queue_snapshot(user_id, payload)
+    payload = get_current_user_queue_status_snapshot(session["user_id"])
+    if get_cached_user_queue_snapshot(session["user_id"]) is None:
+        return set_user_queue_snapshot(session["user_id"], payload)
+    return payload
 
 
 @app.post("/me/claims/hide")
