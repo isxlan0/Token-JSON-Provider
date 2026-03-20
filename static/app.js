@@ -21,6 +21,10 @@ const state = {
   refreshCounter: 0,
   isClaimSubmitting: false,
   isClaimQueued: false,
+  uploadPolicy: null,
+  uploadQueue: [],
+  uploadResults: [],
+  isUploading: false,
 };
 
 const elements = {
@@ -39,10 +43,12 @@ const elements = {
   tabData: document.getElementById("tab-data"),
   tabKeys: document.getElementById("tab-keys"),
   tabClaim: document.getElementById("tab-claim"),
+  tabUpload: document.getElementById("tab-upload"),
   tabDocs: document.getElementById("tab-docs"),
   viewData: document.getElementById("view-data"),
   viewKeys: document.getElementById("view-keys"),
   viewClaim: document.getElementById("view-claim"),
+  viewUpload: document.getElementById("view-upload"),
   viewDocs: document.getElementById("view-docs"),
   userName: document.getElementById("user-name"),
   userUsername: document.getElementById("user-username"),
@@ -93,6 +99,15 @@ const elements = {
   claimSummary: document.getElementById("claim-summary"),
   claimError: document.getElementById("claim-error"),
   claimResults: document.getElementById("claim-results"),
+  uploadPolicy: document.getElementById("upload-policy"),
+  uploadSummary: document.getElementById("upload-summary"),
+  uploadError: document.getElementById("upload-error"),
+  uploadDropzone: document.getElementById("upload-dropzone"),
+  uploadInput: document.getElementById("upload-input"),
+  uploadSelectBtn: document.getElementById("upload-select-btn"),
+  uploadSubmitBtn: document.getElementById("upload-submit-btn"),
+  uploadSelectedList: document.getElementById("upload-selected-list"),
+  uploadResults: document.getElementById("upload-results"),
 };
 
 function showScreen(name) {
@@ -111,6 +126,7 @@ function switchTab(name) {
     { key: "data", tab: elements.tabData, view: elements.viewData },
     { key: "keys", tab: elements.tabKeys, view: elements.viewKeys },
     { key: "claim", tab: elements.tabClaim, view: elements.viewClaim },
+    { key: "upload", tab: elements.tabUpload, view: elements.viewUpload },
     { key: "docs", tab: elements.tabDocs, view: elements.viewDocs },
   ];
 
@@ -129,12 +145,13 @@ function switchTab(name) {
       data: "数据面板",
       keys: "API Key 管理",
       claim: "领取账号",
+      upload: "上传账号",
       docs: "API 使用指南",
     };
     headerTitle.textContent = map[name] || "数据面板";
   }
 
-  if (name === "claim") {
+  if (name === "claim" || name === "upload") {
     refreshAll();
   }
 }
@@ -157,7 +174,7 @@ async function loadClaims() {
     const lastTotal = state.lastClaimTotal ?? total;
     const delta = total - lastTotal;
     if (delta > 0 && !state.skipNextClaimModal) {
-      showModal("领取成功", `共 ${delta} 个账号`);
+      showModal("账号已到账", `共 ${delta} 个账号，可能来自排队自动发放或其他会话。`);
     }
   }
   state.skipNextClaimModal = false;
@@ -305,6 +322,23 @@ function renderStats() {
 function renderMyClaims() {
   const total = state.claims?.total ?? 0;
   elements.myClaimsTotal.textContent = total;
+}
+
+function formatBytes(value) {
+  const size = Number(value || 0);
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  return `${(size / 1024).toFixed(size >= 10 * 1024 ? 0 : 1)} KB`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function formatDateTime(value) {
@@ -644,6 +678,175 @@ function renderApiKeys(limit) {
   });
 }
 
+function renderUploadPolicy() {
+  if (!elements.uploadPolicy) {
+    return;
+  }
+  const policy = state.uploadPolicy;
+  if (!policy) {
+    elements.uploadPolicy.textContent = "上传限制：-";
+    return;
+  }
+  elements.uploadPolicy.textContent =
+    `上传限制：单次 ${policy.max_files_per_request} 个 / 单文件 ${formatBytes(policy.max_file_size_bytes)} / ` +
+    `每小时成功 ${policy.max_success_per_hour} 个 / 最低信任 ${policy.min_trust_level}`;
+}
+
+function renderUploadSelected() {
+  const list = elements.uploadSelectedList;
+  if (!list) {
+    return;
+  }
+  list.innerHTML = "";
+  if (!state.uploadQueue.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "还没有选择文件。";
+    list.appendChild(empty);
+    return;
+  }
+  state.uploadQueue.forEach((file, index) => {
+    const item = document.createElement("div");
+    item.className = "upload-selected-item";
+    item.innerHTML = `
+      <div>
+        <div class="upload-selected-name">${escapeHtml(file.name)}</div>
+        <div class="upload-selected-meta">${formatBytes(file.size)}</div>
+      </div>
+      <button class="btn btn-ghost btn-inline" type="button" data-upload-remove="${index}">移除</button>
+    `;
+    item.querySelector("[data-upload-remove]")?.addEventListener("click", () => {
+      state.uploadQueue = state.uploadQueue.filter((_, currentIndex) => currentIndex !== index);
+      renderUploadSelected();
+      setUploadSubmitting(false);
+    });
+    list.appendChild(item);
+  });
+}
+
+function uploadStatusLabel(status) {
+  const map = {
+    accepted: "已入库",
+    duplicate: "重复账号",
+    invalid_json: "JSON 非法",
+    missing_fields: "字段缺失",
+    invalid_file: "文件无效",
+    file_too_large: "文件过大",
+    banned_401: "账号失效",
+    probe_failed: "探活失败",
+    rate_limited: "额度不足",
+    db_busy: "数据库繁忙",
+  };
+  return map[status] || status || "-";
+}
+
+function renderUploadResults() {
+  const list = elements.uploadResults;
+  if (!list) {
+    return;
+  }
+  list.innerHTML = "";
+  if (!state.uploadResults.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "上传完成后会在这里显示每个文件的校验结果。";
+    list.appendChild(empty);
+    return;
+  }
+  state.uploadResults.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "upload-result-item";
+    row.innerHTML = `
+      <div class="upload-result-main">
+        <div class="upload-selected-name">${escapeHtml(item.file_name || "-")}</div>
+        <div class="upload-selected-meta">${escapeHtml(item.reason || "-")}</div>
+      </div>
+      <div class="upload-result-status is-${item.status}">
+        <span>${uploadStatusLabel(item.status)}</span>
+      </div>
+    `;
+    list.appendChild(row);
+  });
+}
+
+function setUploadSubmitting(submitting) {
+  state.isUploading = submitting;
+  if (!elements.uploadSubmitBtn) {
+    return;
+  }
+  elements.uploadSubmitBtn.disabled = submitting || !state.uploadQueue.length;
+  elements.uploadSubmitBtn.classList.toggle("is-loading", submitting);
+  elements.uploadSubmitBtn.textContent = submitting ? "上传校验中..." : "开始上传";
+}
+
+function mergeUploadQueue(files) {
+  const nextFiles = Array.from(files || []).filter(Boolean);
+  if (!nextFiles.length) {
+    return;
+  }
+  state.uploadQueue = [...state.uploadQueue, ...nextFiles];
+  renderUploadSelected();
+  setUploadSubmitting(false);
+}
+
+async function fileToBase64(file) {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+async function uploadTokens() {
+  if (state.isUploading || !state.uploadQueue.length) {
+    return;
+  }
+  elements.uploadSummary.classList.add("hidden");
+  elements.uploadError.classList.add("hidden");
+  setUploadSubmitting(true);
+  try {
+    const files = await Promise.all(
+      state.uploadQueue.map(async (file) => ({
+        name: file.name,
+        content_base64: await fileToBase64(file),
+      }))
+    );
+    const payload = await fetchJson("/me/uploads/tokens", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Upload-Source": "web",
+      },
+      body: JSON.stringify({ files }),
+    });
+    state.uploadResults = payload.items || [];
+    renderUploadResults();
+    const summary = payload.summary || {};
+    elements.uploadSummary.textContent =
+      `本次共处理 ${summary.total ?? 0} 个文件，成功 ${summary.accepted ?? 0} 个，重复 ${summary.duplicates ?? 0} 个` +
+      `${summary.db_busy ? `，数据库繁忙 ${summary.db_busy} 个` : ""}。`;
+    elements.uploadSummary.classList.remove("hidden");
+    const retryIndexes = new Set(
+      state.uploadResults
+        .filter((item) => item.status === "db_busy" && Number.isInteger(item.request_index))
+        .map((item) => item.request_index)
+    );
+    state.uploadQueue = state.uploadQueue.filter((_, index) => retryIndexes.has(index));
+    renderUploadSelected();
+    await loadDashboard();
+    await loadDashboardSummary();
+  } catch (error) {
+    elements.uploadError.textContent = error.message;
+    elements.uploadError.classList.remove("hidden");
+  } finally {
+    setUploadSubmitting(false);
+  }
+}
+
 async function removeSelectedClaims() {
   if (!state.claimResults.length || !state.claimSelected.size) {
     return;
@@ -698,26 +901,33 @@ function renderClaimResults() {
     const content = JSON.stringify(item.content, null, 2);
     const claimId = item.claim_id ?? index;
     const selected = state.claimSelected.has(claimId);
+    const providerName = item.provider?.name || item.provider?.username || "-";
+    const providerUsername = item.provider?.username || "-";
     card.className = "claim-card";
     card.classList.toggle("selectable", state.claimMultiMode);
     card.classList.toggle("selected", selected);
     card.innerHTML = `
   <div class="claim-card-header">
     <div>
-      <div class="claim-file">#${index + 1} | ${item.file_name}</div>
-      <div class="claim-meta">Path: ${item.file_path} | Encoding: ${item.encoding}</div>
+      <div class="claim-file">#${index + 1} | ${escapeHtml(item.file_name)}</div>
+      <div class="claim-meta">Path: ${escapeHtml(item.file_path)} | Encoding: ${escapeHtml(item.encoding)}</div>
+      ${item.provider ? `<div class="claim-provider">该账号由用户 ${escapeHtml(providerName)} (@${escapeHtml(providerUsername)}) 提供，感谢支持</div>` : ""}
     </div>
     <div class="claim-actions">
       <span class="claim-selection-state ${selected ? "is-visible" : ""}">Selected</span>
       <button class="btn btn-outline btn-inline" data-claim-copy="${claimId}">复制账号 JSON</button>
-      <a class="btn btn-outline btn-inline" href="${item.download_url}" target="_blank" rel="noopener noreferrer">下载 JSON</a>
+      <a class="btn btn-outline btn-inline" data-claim-download="${claimId}" target="_blank" rel="noopener noreferrer">下载 JSON</a>
       <button class="btn btn-ghost btn-inline btn-danger" data-claim-remove="${claimId}">删除账号</button>
     </div>
   </div>
-  <pre class="token-json">${content}</pre>
+  <pre class="token-json">${escapeHtml(content)}</pre>
 `;
     const copyBtn = card.querySelector(`button[data-claim-copy="${claimId}"]`);
     const removeBtn = card.querySelector(`button[data-claim-remove="${claimId}"]`);
+    const downloadLink = card.querySelector(`a[data-claim-download="${claimId}"]`);
+    if (downloadLink) {
+      downloadLink.href = item.download_url || "#";
+    }
     copyBtn.addEventListener("click", async () => {
       const ok = await copyText(content);
       if (ok) {
@@ -755,9 +965,11 @@ async function loadDashboard() {
   state.user = me.user;
   state.quota = me.quota;
   state.claims = me.claims;
+  state.uploadPolicy = me.uploads || null;
   renderUser();
   renderQuota();
   renderMyClaims();
+  renderUploadPolicy();
 }
 
 async function loadApiKeys() {
@@ -936,6 +1148,9 @@ function bindEvents() {
   if (elements.tabClaim) {
     elements.tabClaim.addEventListener("click", () => switchTab("claim"));
   }
+  if (elements.tabUpload) {
+    elements.tabUpload.addEventListener("click", () => switchTab("upload"));
+  }
   if (elements.tabDocs) {
     elements.tabDocs.addEventListener("click", () => switchTab("docs"));
   }
@@ -971,10 +1186,54 @@ function bindEvents() {
   if (elements.claimClear) {
     elements.claimClear.addEventListener("click", clearClaimResults);
   }
+  if (elements.uploadSelectBtn && elements.uploadInput) {
+    elements.uploadSelectBtn.addEventListener("click", () => elements.uploadInput.click());
+  }
+  if (elements.uploadInput) {
+    elements.uploadInput.addEventListener("change", (event) => {
+      mergeUploadQueue(event.target.files);
+      elements.uploadInput.value = "";
+    });
+  }
+  if (elements.uploadSubmitBtn) {
+    elements.uploadSubmitBtn.addEventListener("click", uploadTokens);
+  }
+  if (elements.uploadDropzone) {
+    ["dragenter", "dragover"].forEach((type) => {
+      elements.uploadDropzone.addEventListener(type, (event) => {
+        event.preventDefault();
+        elements.uploadDropzone.classList.add("is-dragover");
+      });
+    });
+    ["dragleave", "drop"].forEach((type) => {
+      elements.uploadDropzone.addEventListener(type, (event) => {
+        event.preventDefault();
+        elements.uploadDropzone.classList.remove("is-dragover");
+      });
+    });
+    elements.uploadDropzone.addEventListener("drop", (event) => {
+      mergeUploadQueue(event.dataTransfer?.files);
+    });
+    elements.uploadDropzone.addEventListener("click", (event) => {
+      if (event.target.closest("button")) {
+        return;
+      }
+      elements.uploadInput?.click();
+    });
+    elements.uploadDropzone.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        elements.uploadInput?.click();
+      }
+    });
+  }
 }
 
 async function init() {
   bindEvents();
+  renderUploadSelected();
+  renderUploadResults();
+  setUploadSubmitting(false);
   elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
   const url = new URL(window.location.href);
   const authError = url.searchParams.get("auth_error");

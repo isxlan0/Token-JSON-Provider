@@ -12,7 +12,7 @@
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap"
     rel="stylesheet">
 
-  <link rel="stylesheet" href="/assets/styles.css?v=20260318">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260320b">
 </head>
 
 <body class="light-theme">
@@ -111,6 +111,15 @@
             <rect x="3" y="3" width="18" height="18" rx="2" />
           </svg>
           领取账号
+        </button>
+        <button id="tab-upload" class="nav-item" type="button">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="17 8 12 3 7 8" />
+            <line x1="12" y1="3" x2="12" y2="15" />
+          </svg>
+          上传账号
         </button>
         <button id="tab-docs" class="nav-item" type="button">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -270,6 +279,47 @@
           </div>
         </section>
 
+        <section id="view-upload" class="tab-view">
+          <div class="data-panel upload-panel">
+            <div class="panel-toolbar">
+              <div>
+                <div class="panel-title">上传账号</div>
+                <div class="hint">仅接受包含 <code>access_token</code>、<code>refresh_token</code>、<code>account_id</code> 的 JSON。系统会排队探活，只有正常账号才会入库。</div>
+              </div>
+              <div class="upload-policy" id="upload-policy">上传限制：-</div>
+            </div>
+            <div class="panel-body">
+              <div id="upload-summary" class="callout info hidden"></div>
+              <div id="upload-error" class="callout danger hidden"></div>
+
+              <div id="upload-dropzone" class="upload-dropzone" tabindex="0" role="button" aria-label="拖拽或选择 JSON 文件上传">
+                <div class="upload-dropzone-badge">Batch Upload</div>
+                <h3>拖拽 JSON 到这里，或直接选择文件</h3>
+                <p>支持批量上传、批量拖拽。系统会清洗垃圾字段，只保留必要账号数据。</p>
+                <div class="upload-dropzone-actions">
+                  <button id="upload-select-btn" class="btn btn-outline btn-inline" type="button">选择 JSON 文件</button>
+                  <button id="upload-submit-btn" class="btn btn-primary btn-inline" type="button">开始上传</button>
+                </div>
+                <input id="upload-input" type="file" accept=".json,application/json" multiple class="hidden" />
+              </div>
+
+              <div class="upload-selected-wrap">
+                <div class="upload-selected-title">待上传文件</div>
+                <div id="upload-selected-list" class="upload-selected-list">
+                  <div class="empty-state">还没有选择文件。</div>
+                </div>
+              </div>
+
+              <div class="upload-results-wrap">
+                <div class="upload-selected-title">上传结果</div>
+                <div id="upload-results" class="upload-results">
+                  <div class="empty-state">上传完成后会在这里显示每个文件的校验结果。</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section id="view-docs" class="tab-view">
           <div class="docs-container">
             <h2 class="docs-title">API 使用指南</h2>
@@ -360,7 +410,7 @@
     </main>
   </section>
 
-  <script src="/assets/app.js?v=20260318" defer></script>
+  <script src="/assets/app.js?v=20260320b" defer></script>
 </body>
 
 </html>

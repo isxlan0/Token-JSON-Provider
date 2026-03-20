@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -37,6 +38,18 @@ BASE_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = BASE_DIR / "token"
 STATIC_DIR = BASE_DIR / "static"
 ENV_FILE = BASE_DIR / ".env"
+
+
+def startup_log(message: str) -> None:
+    print(f"[startup] {message}", flush=True)
+
+
+def count_token_files(token_dir: Path) -> int | None:
+    try:
+        with os.scandir(token_dir) as entries:
+            return sum(1 for entry in entries if entry.is_file() and entry.name.lower().endswith(".json"))
+    except OSError:
+        return None
 
 API_KEY_HEADER = "X-API-Key"
 LEGACY_ACCESS_KEY_HEADER = "X-Access-Key"
@@ -76,6 +89,9 @@ CACHE_DASHBOARD_TTL_ENV = "TOKEN_CACHE_DASHBOARD_TTL_SEC"
 TOKEN_CODEX_PROBE_DELAY_SEC_ENV = "TOKEN_CODEX_PROBE_DELAY_SEC"
 TOKEN_CODEX_PROBE_TIMEOUT_SEC_ENV = "TOKEN_CODEX_PROBE_TIMEOUT_SEC"
 TOKEN_CODEX_PROBE_RESERVE_SEC_ENV = "TOKEN_CODEX_PROBE_RESERVE_SEC"
+TOKEN_UPLOAD_MAX_FILES_ENV = "TOKEN_UPLOAD_MAX_FILES_PER_REQUEST"
+TOKEN_UPLOAD_MAX_FILE_SIZE_ENV = "TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES"
+TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR_ENV = "TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR"
 SESSION_COOKIE_NAME = "token_atlas_session"
 SESSION_AUTH_KEY = "auth"
 SESSION_OAUTH_STATE_KEY = "linuxdo_oauth_state"
@@ -83,6 +99,7 @@ SESSION_POST_LOGIN_REDIRECT_KEY = "post_login_redirect"
 LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize"
 LINUXDO_TOKEN_URL = "https://connect.linux.do/oauth2/token"
 LINUXDO_USER_URL = "https://connect.linux.do/api/user"
+REQUIRED_UPLOAD_FIELDS = ("access_token", "refresh_token", "account_id")
 
 
 def isoformat_timestamp(timestamp: float) -> str:
@@ -142,6 +159,14 @@ def get_non_healthy_max_claims_scope() -> str:
 
 def normalize_username(value: str) -> str:
     return value.strip().lstrip("@").strip().lower()
+
+
+def normalize_uploaded_value(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def hash_token_value(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def parse_admin_identities(raw: str) -> dict[str, set[str]]:
@@ -284,6 +309,24 @@ class TokenCleanupPayload(BaseModel):
     mode: str = "files_only"
 
 
+class UploadResultItem(BaseModel):
+    request_index: int | None = None
+    file_name: str
+    status: str
+    reason: str | None = None
+    token_id: int | None = None
+    account_id: str | None = None
+
+
+class UploadTokenFilePayload(BaseModel):
+    name: str
+    content_base64: str
+
+
+class UploadTokensPayload(BaseModel):
+    files: list[UploadTokenFilePayload] = Field(default_factory=list)
+
+
 class LinuxDOUser(BaseModel):
     id: int
     username: str
@@ -306,6 +349,46 @@ class BannedUserError(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(payload.get("detail") or "User is banned")
         self.payload = payload
+
+
+class UploadValidationError(ValueError):
+    pass
+
+
+def _extract_upload_candidate(content: Any) -> dict[str, Any]:
+    if not isinstance(content, dict):
+        raise UploadValidationError("JSON 根节点必须是对象")
+    storage = content.get("storage")
+    if isinstance(storage, dict):
+        return storage
+    return content
+
+
+def normalize_upload_content(content: Any) -> dict[str, str]:
+    candidate = _extract_upload_candidate(content)
+    normalized = {
+        key: normalize_uploaded_value(candidate.get(key))
+        for key in REQUIRED_UPLOAD_FIELDS
+    }
+    missing = [key for key, value in normalized.items() if not value]
+    if missing:
+        raise UploadValidationError(f"缺少必填字段：{', '.join(missing)}")
+    return normalized
+
+
+def load_uploaded_json(raw: bytes) -> tuple[str, dict[str, str], str]:
+    encoding = detect_encoding(raw)
+    decoded = raw.decode(encoding)
+    parsed = json.loads(decoded.lstrip("\ufeff"))
+    normalized = normalize_upload_content(parsed)
+    content_json = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return "utf-8", normalized, content_json
+
+
+def build_uploaded_filename(*, account_id: str, uploaded_at_ts: int) -> str:
+    hash_prefix = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:8]
+    random_suffix = secrets.token_hex(3)
+    return f"upload-{uploaded_at_ts}-{hash_prefix}-{random_suffix}.json"
 
 
 class CacheBackend(ABC):
@@ -819,6 +902,12 @@ class TokenDb:
                     file_hash TEXT NOT NULL,
                     encoding TEXT NOT NULL,
                     content_json TEXT NOT NULL,
+                    account_id TEXT,
+                    access_token_hash TEXT,
+                    provider_user_id TEXT,
+                    provider_username TEXT,
+                    provider_name TEXT,
+                    uploaded_at_ts INTEGER,
                     is_active INTEGER NOT NULL,
                     is_cleaned INTEGER NOT NULL DEFAULT 0,
                     is_enabled INTEGER NOT NULL DEFAULT 1,
@@ -848,6 +937,9 @@ class TokenDb:
                     claim_file_path TEXT,
                     claim_encoding TEXT,
                     claim_content_json TEXT,
+                    provider_user_id TEXT,
+                    provider_username TEXT,
+                    provider_name TEXT,
                     request_id TEXT NOT NULL,
                     FOREIGN KEY(token_id) REFERENCES tokens(id),
                     FOREIGN KEY(user_id) REFERENCES users(id),
@@ -912,6 +1004,12 @@ class TokenDb:
                     ON user_token_claims(user_id, token_id);
                 CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
                     ON claim_queue(status, enqueued_at_ts, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_account_id_unique
+                    ON tokens(account_id)
+                    WHERE account_id IS NOT NULL AND account_id != '';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_access_token_hash_unique
+                    ON tokens(access_token_hash)
+                    WHERE access_token_hash IS NOT NULL AND access_token_hash != '';
                 CREATE INDEX IF NOT EXISTS idx_api_keys_user_status
                     ON api_keys(user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
@@ -934,6 +1032,12 @@ class TokenDb:
                 conn.execute("ALTER TABLE token_claims ADD COLUMN claim_encoding TEXT")
             if "claim_content_json" not in claims_columns:
                 conn.execute("ALTER TABLE token_claims ADD COLUMN claim_content_json TEXT")
+            if "provider_user_id" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN provider_user_id TEXT")
+            if "provider_username" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN provider_username TEXT")
+            if "provider_name" not in claims_columns:
+                conn.execute("ALTER TABLE token_claims ADD COLUMN provider_name TEXT")
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(api_keys)").fetchall()
@@ -964,6 +1068,18 @@ class TokenDb:
                 conn.execute("ALTER TABLE tokens ADD COLUMN last_probe_status TEXT")
             if "probe_lock_until_ts" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN probe_lock_until_ts INTEGER")
+            if "account_id" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN account_id TEXT")
+            if "access_token_hash" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN access_token_hash TEXT")
+            if "provider_user_id" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN provider_user_id TEXT")
+            if "provider_username" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN provider_username TEXT")
+            if "provider_name" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN provider_name TEXT")
+            if "uploaded_at_ts" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN uploaded_at_ts INTEGER")
             conn.execute(
                 """
                 UPDATE token_claims
@@ -989,6 +1105,53 @@ class TokenDb:
                    OR claim_content_json IS NULL
                 """
             )
+            conn.execute(
+                """
+                UPDATE token_claims
+                SET provider_user_id = COALESCE(
+                        provider_user_id,
+                        (SELECT tokens.provider_user_id FROM tokens WHERE tokens.id = token_claims.token_id)
+                    ),
+                    provider_username = COALESCE(
+                        provider_username,
+                        (SELECT tokens.provider_username FROM tokens WHERE tokens.id = token_claims.token_id)
+                    ),
+                    provider_name = COALESCE(
+                        provider_name,
+                        (SELECT tokens.provider_name FROM tokens WHERE tokens.id = token_claims.token_id)
+                    )
+                WHERE provider_user_id IS NULL
+                   OR provider_username IS NULL
+                   OR provider_name IS NULL
+                """
+            )
+            token_rows = conn.execute(
+                """
+                SELECT id, content_json
+                FROM tokens
+                WHERE (account_id IS NULL OR account_id = '')
+                   OR (access_token_hash IS NULL OR access_token_hash = '')
+                """
+            ).fetchall()
+            for row in token_rows:
+                try:
+                    content = json.loads(str(row["content_json"]))
+                    normalized = normalize_upload_content(content)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                conn.execute(
+                    """
+                    UPDATE tokens
+                    SET account_id = COALESCE(NULLIF(account_id, ''), ?),
+                        access_token_hash = COALESCE(NULLIF(access_token_hash, ''), ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized["account_id"],
+                        hash_token_value(normalized["access_token"]),
+                        int(row["id"]),
+                    ),
+                )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
@@ -1062,6 +1225,168 @@ class TokenDb:
         content_json = json.dumps(content, ensure_ascii=False)
         return encoding, content_json, file_hash
 
+    def get_uploaded_token_conflict(
+        self,
+        *,
+        account_id: str,
+        access_token_hash: str,
+        exclude_token_id: int | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        target_conn = conn or self.connect()
+        should_close = conn is None
+        try:
+            params: list[Any] = [account_id, access_token_hash]
+            extra_where = ""
+            if exclude_token_id is not None:
+                extra_where = " AND id != ?"
+                params.append(int(exclude_token_id))
+            row = target_conn.execute(
+                f"""
+                SELECT id, account_id, access_token_hash, file_name
+                FROM tokens
+                WHERE account_id = ?
+                   OR access_token_hash = ?
+                  {extra_where}
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            if should_close:
+                target_conn.close()
+
+    def count_recent_successful_uploads(
+        self,
+        provider_user_id: int,
+        *,
+        within_sec: int = 3600,
+        conn: sqlite3.Connection | None = None,
+    ) -> int:
+        target_conn = conn or self.connect()
+        should_close = conn is None
+        try:
+            row = target_conn.execute(
+                """
+                SELECT COUNT(*) as cnt
+                FROM tokens
+                WHERE provider_user_id = ?
+                  AND uploaded_at_ts IS NOT NULL
+                  AND uploaded_at_ts >= ?
+                """,
+                (str(provider_user_id), now_ts() - within_sec),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+        finally:
+            if should_close:
+                target_conn.close()
+
+    def create_uploaded_token(
+        self,
+        *,
+        file_name: str,
+        file_path: str,
+        content_json: str,
+        provider: dict[str, Any],
+        uploaded_at_ts: int,
+        hourly_success_limit: int,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        normalized = normalize_upload_content(json.loads(content_json))
+        file_hash = hashlib.sha256(content_json.encode("utf-8")).hexdigest()
+        account_id = normalized["account_id"]
+        access_token_hash = hash_token_value(normalized["access_token"])
+        healthy_max_claims = get_inventory_limits()["healthy"]["max_claims"]
+
+        with self._lock, self.connect(timeout=timeout_s) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            uploaded_count = self.count_recent_successful_uploads(
+                int(provider["id"]),
+                conn=conn,
+            )
+            if uploaded_count >= hourly_success_limit:
+                raise RateLimitError("当前小时上传额度不足")
+            conflict = self.get_uploaded_token_conflict(
+                account_id=account_id,
+                access_token_hash=access_token_hash,
+                conn=conn,
+            )
+            if conflict:
+                raise UploadValidationError("重复账号")
+            cursor = conn.execute(
+                """
+                INSERT INTO tokens (
+                    file_name,
+                    file_path,
+                    file_hash,
+                    encoding,
+                    content_json,
+                    account_id,
+                    access_token_hash,
+                    provider_user_id,
+                    provider_username,
+                    provider_name,
+                    uploaded_at_ts,
+                    is_active,
+                    is_cleaned,
+                    is_enabled,
+                    is_banned,
+                    is_available,
+                    claim_count,
+                    max_claims,
+                    created_at_ts,
+                    cleaned_at_ts,
+                    updated_at_ts,
+                    last_seen_at_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_name,
+                    file_path,
+                    file_hash,
+                    "utf-8",
+                    content_json,
+                    account_id,
+                    access_token_hash,
+                    str(provider["id"]),
+                    provider["username"],
+                    provider["name"],
+                    uploaded_at_ts,
+                    1,
+                    0,
+                    1,
+                    0,
+                    1,
+                    0,
+                    healthy_max_claims,
+                    uploaded_at_ts,
+                    None,
+                    uploaded_at_ts,
+                    uploaded_at_ts,
+                ),
+            )
+            token_id = int(cursor.lastrowid)
+            self.ensure_inventory_policy(conn=conn)
+        _refresh_dashboard_memory()
+        invalidate_all_runtime_cache(include_admin=True)
+        return {"token_id": token_id, "account_id": account_id, "file_name": file_name}
+
+    def _find_sync_token_conflict(
+        self,
+        *,
+        current_token_id: int | None,
+        normalized: dict[str, str],
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any] | None:
+        return self.get_uploaded_token_conflict(
+            account_id=normalized["account_id"],
+            access_token_hash=hash_token_value(normalized["access_token"]),
+            exclude_token_id=current_token_id,
+            conn=conn,
+        )
+
     def sync_tokens(self, token_dir: Path) -> None:
         files = sorted(token_dir.glob("*.json"), key=lambda path: path.name.lower())
         seen_names: set[str] = set()
@@ -1072,7 +1397,10 @@ class TokenDb:
             for path in files:
                 try:
                     encoding, content_json, file_hash = self._load_token_file(path)
+                    normalized = normalize_upload_content(json.loads(content_json))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                except UploadValidationError:
                     continue
 
                 file_name = path.name
@@ -1084,6 +1412,24 @@ class TokenDb:
                     (file_name,),
                 ).fetchone()
                 if row:
+                    conflict = self._find_sync_token_conflict(
+                        current_token_id=int(row["id"]),
+                        normalized=normalized,
+                        conn=conn,
+                    )
+                    if conflict:
+                        conn.execute(
+                            """
+                            UPDATE tokens
+                            SET is_active = 0,
+                                is_available = 0,
+                                updated_at_ts = ?,
+                                last_seen_at_ts = ?
+                            WHERE id = ?
+                            """,
+                            (now, now, int(row["id"])),
+                        )
+                        continue
                     claim_count = int(row["claim_count"])
                     effective_max_claims = int(row["max_claims"])
                     is_enabled = int(row["is_enabled"]) if "is_enabled" in row.keys() else 1
@@ -1096,6 +1442,8 @@ class TokenDb:
                             file_hash = ?,
                             encoding = ?,
                             content_json = ?,
+                            account_id = COALESCE(NULLIF(account_id, ''), ?),
+                            access_token_hash = COALESCE(NULLIF(access_token_hash, ''), ?),
                             is_active = 1,
                             is_available = ?,
                             updated_at_ts = ?,
@@ -1107,6 +1455,8 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
+                            normalized["account_id"],
+                            hash_token_value(normalized["access_token"]),
                             is_available,
                             now,
                             now,
@@ -1114,6 +1464,13 @@ class TokenDb:
                         ),
                     )
                 else:
+                    conflict = self._find_sync_token_conflict(
+                        current_token_id=None,
+                        normalized=normalized,
+                        conn=conn,
+                    )
+                    if conflict:
+                        continue
                     conn.execute(
                         """
                         INSERT INTO tokens (
@@ -1122,6 +1479,8 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
+                            account_id,
+                            access_token_hash,
                             is_active,
                             is_enabled,
                             is_banned,
@@ -1131,7 +1490,7 @@ class TokenDb:
                             created_at_ts,
                             updated_at_ts,
                             last_seen_at_ts
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             file_name,
@@ -1139,6 +1498,8 @@ class TokenDb:
                             file_hash,
                             encoding,
                             content_json,
+                            normalized["account_id"],
+                            hash_token_value(normalized["access_token"]),
                             1,
                             1,
                             0,
@@ -1201,10 +1562,22 @@ class TokenDb:
                     continue
                 try:
                     encoding, content_json, file_hash = self._load_token_file(path)
+                    normalized = normalize_upload_content(json.loads(content_json))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     errors += 1
                     continue
+                except UploadValidationError:
+                    errors += 1
+                    continue
                 file_path = path.relative_to(BASE_DIR).as_posix()
+                conflict = self._find_sync_token_conflict(
+                    current_token_id=None,
+                    normalized=normalized,
+                    conn=conn,
+                )
+                if conflict:
+                    skipped += 1
+                    continue
                 conn.execute(
                     """
                     INSERT INTO tokens (
@@ -1213,6 +1586,8 @@ class TokenDb:
                         file_hash,
                         encoding,
                         content_json,
+                        account_id,
+                        access_token_hash,
                         is_active,
                         is_cleaned,
                         is_enabled,
@@ -1224,7 +1599,7 @@ class TokenDb:
                         cleaned_at_ts,
                         updated_at_ts,
                         last_seen_at_ts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         file_name,
@@ -1232,6 +1607,8 @@ class TokenDb:
                         file_hash,
                         encoding,
                         content_json,
+                        normalized["account_id"],
+                        hash_token_value(normalized["access_token"]),
                         1,
                         0,
                         1,
@@ -1925,6 +2302,7 @@ class TokenDb:
             row = conn.execute(
                 """
                 SELECT id, file_name, file_path, encoding, content_json, claim_count, max_claims,
+                       provider_user_id, provider_username, provider_name,
                        is_active, is_enabled, is_banned, is_available
                 FROM tokens
                 WHERE id = ?
@@ -2032,8 +2410,9 @@ class TokenDb:
                     INSERT INTO token_claims (
                         token_id, user_id, api_key_id, claimed_at_ts, is_hidden,
                         claim_file_name, claim_file_path, claim_encoding, claim_content_json,
+                        provider_user_id, provider_username, provider_name,
                         request_id
-                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         token_id,
@@ -2044,6 +2423,9 @@ class TokenDb:
                         row["file_path"],
                         row["encoding"],
                         row["content_json"],
+                        row["provider_user_id"],
+                        row["provider_username"],
+                        row["provider_name"],
                         request_id,
                     ),
                 )
@@ -2903,7 +3285,10 @@ class TokenDb:
                        COALESCE(token_claims.claim_file_name, tokens.file_name) as file_name,
                        COALESCE(token_claims.claim_file_path, tokens.file_path) as file_path,
                        COALESCE(token_claims.claim_encoding, tokens.encoding) as encoding,
-                       COALESCE(token_claims.claim_content_json, tokens.content_json) as content_json
+                       COALESCE(token_claims.claim_content_json, tokens.content_json) as content_json,
+                       token_claims.provider_user_id as provider_user_id,
+                       token_claims.provider_username as provider_username,
+                       token_claims.provider_name as provider_name
                 FROM token_claims
                 LEFT JOIN tokens ON tokens.id = token_claims.token_id
                 WHERE token_claims.user_id = ? AND token_claims.is_hidden = 0
@@ -2923,6 +3308,15 @@ class TokenDb:
                     "encoding": row["encoding"],
                     "claimed_at": isoformat_from_ts(int(row["claimed_at_ts"])),
                     "content": json.loads(row["content_json"]),
+                    "provider": (
+                        {
+                            "user_id": row["provider_user_id"],
+                            "username": row["provider_username"],
+                            "name": row["provider_name"],
+                        }
+                        if row["provider_user_id"] or row["provider_username"] or row["provider_name"]
+                        else None
+                    ),
                 }
             )
         return items
@@ -3353,6 +3747,23 @@ def build_download_url(request: Request, token_id: int) -> str:
     return f"{base_url}{parsed.path}{query}"
 
 
+def require_web_upload_request(request: Request) -> None:
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    referer = request.headers.get("referer") or ""
+    fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    upload_source = (request.headers.get("x-upload-source") or "").strip().lower()
+    expected_origin = str(request.base_url).rstrip("/")
+
+    if upload_source != "web":
+        raise AccessDeniedError("上传仅允许从网页端发起。")
+    if origin != expected_origin:
+        raise AccessDeniedError("上传来源无效。")
+    if fetch_site not in {"same-origin", "same-site"}:
+        raise AccessDeniedError("仅允许网页端同源上传。")
+    if referer and not referer.startswith(f"{expected_origin}/"):
+        raise AccessDeniedError("上传来源无效。")
+
+
 def get_inventory_thresholds() -> dict[str, int]:
     return {
         "healthy": max(1, env_int(TOKEN_HEALTHY_THRESHOLD_ENV, 1000)),
@@ -3446,6 +3857,18 @@ def get_codex_probe_timeout_sec() -> float:
 
 def get_codex_probe_reserve_sec() -> int:
     return max(5, int(env_float(TOKEN_CODEX_PROBE_RESERVE_SEC_ENV, 30.0)))
+
+
+def get_upload_max_files_per_request() -> int:
+    return max(1, env_int(TOKEN_UPLOAD_MAX_FILES_ENV, 10))
+
+
+def get_upload_max_file_size_bytes() -> int:
+    return max(1024, env_int(TOKEN_UPLOAD_MAX_FILE_SIZE_ENV, 10 * 1024))
+
+
+def get_upload_max_success_per_hour() -> int:
+    return max(1, env_int(TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR_ENV, 20))
 
 
 def get_admin_identities() -> dict[str, set[str]]:
@@ -3750,6 +4173,45 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
     return documents
 
 
+def build_upload_response(items: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {
+        "total": len(items),
+        "accepted": sum(1 for item in items if item["status"] == "accepted"),
+        "duplicates": sum(1 for item in items if item["status"] == "duplicate"),
+        "invalid": sum(1 for item in items if item["status"] in {"invalid_json", "missing_fields", "invalid_file", "file_too_large"}),
+        "rejected": sum(
+            1
+            for item in items
+            if item["status"] not in {"accepted", "duplicate", "invalid_json", "missing_fields", "invalid_file", "file_too_large"}
+        ),
+        "db_busy": sum(1 for item in items if item["status"] == "db_busy"),
+    }
+    return {"summary": summary, "items": items}
+
+
+def write_uploaded_token_file(file_name: str, content_json: str) -> tuple[Path, str]:
+    path = TOKEN_DIR / file_name
+    path.write_text(content_json, encoding="utf-8", newline="\n")
+    return path, path.relative_to(BASE_DIR).as_posix()
+
+
+def append_db_busy_results(
+    results: list[dict[str, Any]],
+    files: list[UploadTokenFilePayload],
+    start_index: int,
+) -> None:
+    for request_index in range(start_index, len(files)):
+        upload = files[request_index]
+        results.append(
+            {
+                "request_index": request_index,
+                "file_name": os.path.basename(upload.name or "upload.json"),
+                "status": "db_busy",
+                "reason": "数据库正忙，本文件尚未处理，请稍后重试。",
+            }
+        )
+
+
 db = TokenDb(get_db_path())
 db.init_db()
 _CODEX_PROBE = codex_probe.CodexProbeQueue(
@@ -3842,14 +4304,38 @@ def _token_import_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    _APP_CACHE.configure(emit_log=True)
-    _CODEX_PROBE.start()
-    db.init_db()
-    sync_tokens_with_retry(db, TOKEN_DIR)
-    try_fulfill_queue(db)
-    _refresh_dashboard_memory()
-    refresh_queue_total_snapshot(db)
+    startup_begin = time.perf_counter()
+
+    def run_startup_step(name: str, func: Callable[[], None]) -> None:
+        step_begin = time.perf_counter()
+        startup_log(f"{name} started")
+        try:
+            func()
+        except Exception as exc:
+            startup_log(
+                f"{name} failed after {time.perf_counter() - step_begin:.3f}s: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        startup_log(f"{name} finished in {time.perf_counter() - step_begin:.3f}s")
+
+    startup_log(f"application startup begin pid={os.getpid()}")
+    startup_log(f"token directory={TOKEN_DIR}")
+    token_file_count = count_token_files(TOKEN_DIR)
+    if token_file_count is None:
+        startup_log("token file count unavailable before sync")
+    else:
+        startup_log(f"token files detected before sync={token_file_count}")
+
+    run_startup_step("ensure token directory", lambda: TOKEN_DIR.mkdir(parents=True, exist_ok=True))
+    run_startup_step("configure cache backend", lambda: _APP_CACHE.configure(emit_log=True))
+    run_startup_step("start codex probe", _CODEX_PROBE.start)
+    run_startup_step("initialize database", db.init_db)
+    run_startup_step("sync tokens", lambda: sync_tokens_with_retry(db, TOKEN_DIR))
+    run_startup_step("fulfill queued claims", lambda: try_fulfill_queue(db))
+    run_startup_step("refresh dashboard memory", _refresh_dashboard_memory)
+    run_startup_step("refresh queue snapshot", lambda: refresh_queue_total_snapshot(db))
+    startup_log(f"application startup finished in {time.perf_counter() - startup_begin:.3f}s")
 
     _QUEUE_PUMP_STOP.clear()
     _TOKEN_IMPORT_STOP.clear()
@@ -4233,6 +4719,12 @@ def get_me(request: Request) -> dict[str, Any]:
                 "limit": get_apikey_max_per_user(),
                 "active": len([key for key in api_keys if key["status"] == "active"]),
             },
+            "uploads": {
+                "max_files_per_request": get_upload_max_files_per_request(),
+                "max_file_size_bytes": get_upload_max_file_size_bytes(),
+                "max_success_per_hour": get_upload_max_success_per_hour(),
+                "min_trust_level": get_linuxdo_min_trust_level(),
+            },
         }
     return cache_json(key, get_cache_me_ttl(), _load_me)
 
@@ -4376,6 +4868,172 @@ def revoke_api_key(request: Request, api_key_id: int) -> Response:
     user_id = session["user_id"]
     db.revoke_api_key(user_id, api_key_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post("/me/uploads/tokens")
+def upload_tokens_session(
+    request: Request,
+    payload: UploadTokensPayload | None = Body(default=None),
+) -> dict[str, Any]:
+    require_web_upload_request(request)
+    session = require_session_user(request)
+    user = session["user"]
+    max_files = get_upload_max_files_per_request()
+    max_file_size = get_upload_max_file_size_bytes()
+    hourly_limit = get_upload_max_success_per_hour()
+    files = payload.files if payload else []
+
+    if not files:
+        error_json = json.dumps({"detail": "请至少上传一个 JSON 文件。"}, ensure_ascii=False).encode("utf-8")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
+    if len(files) > max_files:
+        error_json = json.dumps(
+            {"detail": f"单次最多上传 {max_files} 个文件。"},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST, content=error_json, media_type="application/json")
+
+    try:
+        uploaded_count = db.count_recent_successful_uploads(user["id"])
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            return make_db_busy_response()
+        raise
+    remaining_success = max(0, hourly_limit - uploaded_count)
+    if remaining_success <= 0:
+        raise RateLimitError("当前小时内可成功上传的账号数量已用完")
+
+    results: list[dict[str, Any]] = []
+    for request_index, upload in enumerate(files):
+        original_name = os.path.basename(upload.name or "upload.json")
+        if not original_name.lower().endswith(".json"):
+            results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_file", "reason": "仅支持上传 .json 文件"})
+            continue
+        try:
+            raw = base64.b64decode(upload.content_base64 or "", validate=True)
+        except (ValueError, TypeError, binascii.Error):
+            results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_file", "reason": "文件内容编码无效"})
+            continue
+        if not raw:
+            results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_json", "reason": "文件为空"})
+            continue
+        if len(raw) > max_file_size:
+            results.append(
+                {
+                    "request_index": request_index,
+                    "file_name": original_name,
+                    "status": "file_too_large",
+                    "reason": f"单文件不能超过 {max_file_size} 字节",
+                }
+            )
+            continue
+        try:
+            _, normalized, content_json = load_uploaded_json(raw)
+        except json.JSONDecodeError:
+            results.append({"request_index": request_index, "file_name": original_name, "status": "invalid_json", "reason": "JSON 解析失败"})
+            continue
+        except UploadValidationError as exc:
+            results.append({"request_index": request_index, "file_name": original_name, "status": "missing_fields", "reason": str(exc)})
+            continue
+
+        access_token_hash = hash_token_value(normalized["access_token"])
+        try:
+            conflict = db.get_uploaded_token_conflict(
+                account_id=normalized["account_id"],
+                access_token_hash=access_token_hash,
+            )
+        except sqlite3.OperationalError as exc:
+            if "database is locked" in str(exc).lower():
+                append_db_busy_results(results, files, request_index)
+                break
+            raise
+        if conflict:
+            results.append(
+                {
+                    "request_index": request_index,
+                    "file_name": original_name,
+                    "status": "duplicate",
+                    "reason": "账号已存在于历史库存中",
+                    "account_id": normalized["account_id"],
+                }
+            )
+            continue
+        if remaining_success <= 0:
+            results.append({"request_index": request_index, "file_name": original_name, "status": "rate_limited", "reason": "当前小时上传额度不足"})
+            continue
+
+        probe_result = _CODEX_PROBE.submit(
+            normalized,
+            wait_timeout_sec=get_codex_probe_timeout_sec() + get_codex_probe_delay_sec() + 5.0,
+        )
+        if probe_result.is_banned:
+            results.append({"request_index": request_index, "file_name": original_name, "status": "banned_401", "reason": "账号已失效或被上游封禁"})
+            continue
+        if probe_result.status != "ok":
+            results.append({"request_index": request_index, "file_name": original_name, "status": "probe_failed", "reason": "账号探活失败"})
+            continue
+
+        uploaded_at_ts = now_ts()
+        target_name = build_uploaded_filename(
+            account_id=normalized["account_id"],
+            uploaded_at_ts=uploaded_at_ts,
+        )
+        file_path_obj, relative_path = write_uploaded_token_file(target_name, content_json)
+        try:
+            created = run_db_write_with_retry(
+                lambda: db.create_uploaded_token(
+                    file_name=target_name,
+                    file_path=relative_path,
+                    content_json=content_json,
+                    provider=user,
+                    uploaded_at_ts=uploaded_at_ts,
+                    hourly_success_limit=hourly_limit,
+                    timeout_s=3.0,
+                ),
+                retries=2,
+                delay_sec=0.2,
+            )
+        except UploadValidationError:
+            file_path_obj.unlink(missing_ok=True)
+            results.append(
+                {
+                    "request_index": request_index,
+                    "file_name": original_name,
+                    "status": "duplicate",
+                    "reason": "账号已存在于历史库存中",
+                    "account_id": normalized["account_id"],
+                }
+            )
+            continue
+        except RateLimitError:
+            file_path_obj.unlink(missing_ok=True)
+            remaining_success = 0
+            results.append({"request_index": request_index, "file_name": original_name, "status": "rate_limited", "reason": "当前小时上传额度不足"})
+            continue
+        except sqlite3.OperationalError as exc:
+            file_path_obj.unlink(missing_ok=True)
+            if "database is locked" in str(exc).lower():
+                append_db_busy_results(results, files, request_index)
+                break
+            raise
+        except Exception:
+            file_path_obj.unlink(missing_ok=True)
+            raise
+
+        remaining_success -= 1
+        results.append(
+            {
+                "request_index": request_index,
+                "file_name": original_name,
+                "status": "accepted",
+                "reason": "校验通过，已加入可领取库存",
+                "token_id": created["token_id"],
+                "account_id": created["account_id"],
+            }
+        )
+
+    invalidate_user_cache(session["user_id"])
+    return build_upload_response(results)
 
 
 @app.get("/me/claims")
