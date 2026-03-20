@@ -5255,6 +5255,8 @@ _UPLOAD_TASK_STOP = threading.Event()
 _UPLOAD_TASK_QUEUE: queue.Queue[QueuedUploadTask] = queue.Queue()
 _UPLOAD_TASK_STATE_LOCK = threading.RLock()
 _UPLOAD_TASK_ACTIVE_COUNT = 0
+_UPLOAD_TASK_STATUS_LOCK = threading.RLock()
+_UPLOAD_TASK_STATUS: dict[str, dict[int, dict[str, Any]]] = {}
 _HIDE_CLAIMS_THREAD: threading.Thread | None = None
 _HIDE_CLAIMS_STOP = threading.Event()
 _HIDE_CLAIMS_QUEUE: queue.Queue[HideClaimsTask] = queue.Queue()
@@ -5839,6 +5841,8 @@ def _clear_upload_task_queue() -> None:
             _UPLOAD_TASK_QUEUE.task_done()
     if cleared:
         upload_log(f"[upload-worker] cleared queued tasks count={cleared}")
+    with _UPLOAD_TASK_STATUS_LOCK:
+        _UPLOAD_TASK_STATUS.clear()
 
 
 def _clear_hide_claims_queue() -> None:
@@ -5861,7 +5865,94 @@ def get_upload_task_queue_position(offset: int = 0) -> int:
     return max(1, int(active) + _UPLOAD_TASK_QUEUE.qsize() + int(offset) + 1)
 
 
+def set_upload_task_status(batch_id: str, request_index: int, item_payload: dict[str, Any]) -> None:
+    with _UPLOAD_TASK_STATUS_LOCK:
+        batch = _UPLOAD_TASK_STATUS.setdefault(str(batch_id), {})
+        current = dict(batch.get(int(request_index)) or {})
+        current.update(item_payload)
+        batch[int(request_index)] = current
+
+
+def clear_upload_task_status_if_done(batch_id: str) -> None:
+    with _UPLOAD_TASK_STATUS_LOCK:
+        batch = _UPLOAD_TASK_STATUS.get(str(batch_id))
+        if not batch:
+            _UPLOAD_TASK_STATUS.pop(str(batch_id), None)
+            return
+        if any(item.get("status") in {"queued", "processing"} for item in batch.values()):
+            return
+        _UPLOAD_TASK_STATUS.pop(str(batch_id), None)
+
+
+def apply_runtime_upload_task_status(payload: dict[str, Any]) -> dict[str, Any]:
+    history = list(payload.get("history") or [])
+    if not history:
+        return payload
+    with _UPLOAD_TASK_STATUS_LOCK:
+        runtime = {
+            str(batch_id): {int(idx): dict(item) for idx, item in batch.items()}
+            for batch_id, batch in _UPLOAD_TASK_STATUS.items()
+        }
+    if not runtime:
+        return payload
+
+    updated_history: list[dict[str, Any]] = []
+    changed = False
+    for batch in history:
+        batch_id = str(batch.get("batch_id") or "")
+        runtime_items = runtime.get(batch_id)
+        if not runtime_items:
+            updated_history.append(batch)
+            continue
+        items = list(batch.get("items") or [])
+        next_items: list[dict[str, Any]] = []
+        batch_changed = False
+        for item in items:
+            request_index = item.get("request_index")
+            if request_index is None:
+                next_items.append(item)
+                continue
+            runtime_item = runtime_items.get(int(request_index))
+            if not runtime_item:
+                next_items.append(item)
+                continue
+            merged = dict(item)
+            merged.update(runtime_item)
+            next_items.append(merged)
+            if merged != item:
+                batch_changed = True
+        if batch_changed:
+            changed = True
+            updated_history.append(
+                build_upload_history_entry(
+                    batch_id,
+                    next_items,
+                    created_at=str(batch.get("created_at") or isoformat_now()),
+                )
+            )
+        else:
+            updated_history.append(batch)
+    if not changed:
+        return payload
+    latest = updated_history[0] if updated_history else get_default_upload_results_snapshot()
+    return build_upload_response(
+        list(latest.get("items") or []),
+        batch_id=latest.get("batch_id"),
+        created_at=latest.get("created_at"),
+        history=updated_history,
+        queue_status=payload.get("queue_status") if isinstance(payload.get("queue_status"), dict) else None,
+    )
+
+
 def _process_upload_task(task: QueuedUploadTask) -> None:
+    set_upload_task_status(
+        task.batch_id,
+        task.request_index,
+        {
+            "status": "processing",
+            "reason": "正在处理，请稍候刷新结果。",
+        },
+    )
     update_user_upload_results_snapshot(
         task.user_id,
         task.batch_id,
@@ -5994,7 +6085,9 @@ def _process_upload_task(task: QueuedUploadTask) -> None:
             "status": "probe_failed",
             "reason": "后台处理失败，请稍后重试",
         }
+    set_upload_task_status(task.batch_id, task.request_index, result_item)
     update_user_upload_results_snapshot(task.user_id, task.batch_id, task.request_index, result_item)
+    clear_upload_task_status_if_done(task.batch_id)
     upload_log(
         f"[upload-worker] finished user_id={task.user_id} batch={task.batch_id} "
         f"index={task.request_index} file={task.file_name} status={result_item['status']}"
@@ -6506,7 +6599,7 @@ def get_me_upload_results(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
     payload = get_user_upload_results_snapshot(session["user_id"])
     payload["queue_status"] = get_current_user_queue_status_snapshot(session["user_id"])
-    return payload
+    return apply_runtime_upload_task_status(payload)
 
 
 @app.get("/dashboard/leaderboard")
@@ -6784,6 +6877,18 @@ def upload_tokens_session(
                 "account_id": normalized["account_id"],
                 "queue_position": queue_position,
             }
+        )
+        set_upload_task_status(
+            batch_id,
+            request_index,
+            {
+                "request_index": request_index,
+                "file_name": original_name,
+                "status": "queued",
+                "reason": "已进入上传队列。",
+                "account_id": normalized["account_id"],
+                "queue_position": queue_position,
+            },
         )
         queued_tasks.append(
             QueuedUploadTask(
