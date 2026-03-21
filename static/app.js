@@ -668,7 +668,233 @@ function triggerBrowserDownload(blob, filename) {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+  // 延迟释放大文件下载的 blob URL，避免浏览器尚未接管文件时被提前回收。
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+}
+
+const CLAIM_DOWNLOAD_ALL_LABEL = "下载全部账号(ZIP格式)";
+const CLAIM_DOWNLOAD_TEXT_ENCODER = new TextEncoder();
+const ZIP_UTF8_FLAG = 0x0800;
+const ZIP_STORE_METHOD = 0;
+const ZIP_FORMAT_VERSION = 20;
+const ZIP_CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function normalizeDownloadFileName(fileName, fallbackName = "claimed-token.json") {
+  const fallback = String(fallbackName || "claimed-token.json").trim() || "claimed-token.json";
+  const raw = String(fileName || "").trim();
+  const baseName = raw.split(/[\\/]/).pop() || "";
+  const sanitized = baseName
+    .replace(/[\u0000-\u001f<>:"|?*]+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!sanitized || sanitized === "." || sanitized === "..") {
+    return fallback;
+  }
+  return sanitized;
+}
+
+function splitFileNameParts(fileName) {
+  const lastDot = fileName.lastIndexOf(".");
+  if (lastDot <= 0) {
+    return { stem: fileName, extension: "" };
+  }
+  return {
+    stem: fileName.slice(0, lastDot),
+    extension: fileName.slice(lastDot),
+  };
+}
+
+function ensureUniqueArchiveFileName(fileName, usedNames) {
+  const normalized = fileName.toLowerCase();
+  if (!usedNames.has(normalized)) {
+    usedNames.add(normalized);
+    return fileName;
+  }
+  const { stem, extension } = splitFileNameParts(fileName);
+  for (let suffix = 2; suffix <= 99999; suffix += 1) {
+    const candidate = `${stem} (${suffix})${extension}`;
+    const candidateKey = candidate.toLowerCase();
+    if (!usedNames.has(candidateKey)) {
+      usedNames.add(candidateKey);
+      return candidate;
+    }
+  }
+  throw new Error(`文件名重复过多，无法打包：${fileName}`);
+}
+
+function buildClaimJsonText(item) {
+  try {
+    const jsonText = JSON.stringify(item?.content, null, 2);
+    if (typeof jsonText !== "string") {
+      throw new Error("账号内容为空，无法生成下载文件。");
+    }
+    return `${jsonText}\n`;
+  } catch (error) {
+    if (error instanceof Error && error.message === "账号内容为空，无法生成下载文件。") {
+      throw error;
+    }
+    throw new Error("账号内容无法序列化为 JSON。");
+  }
+}
+
+function buildClaimJsonDownload(item, fallbackName = "claimed-token.json") {
+  const filename = normalizeDownloadFileName(item?.file_name, fallbackName);
+  const jsonText = buildClaimJsonText(item);
+  const bytes = CLAIM_DOWNLOAD_TEXT_ENCODER.encode(jsonText);
+  return {
+    filename,
+    bytes,
+    blob: new Blob([bytes], { type: "application/json;charset=utf-8" }),
+  };
+}
+
+function computeCrc32(bytes) {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc = ZIP_CRC32_TABLE[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function getZipDosTimestamp(date = new Date()) {
+  const safeDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+  const year = Math.min(Math.max(safeDate.getFullYear(), 1980), 2107);
+  return {
+    dosTime: ((safeDate.getHours() & 0x1f) << 11)
+      | ((safeDate.getMinutes() & 0x3f) << 5)
+      | Math.floor((safeDate.getSeconds() & 0x3f) / 2),
+    dosDate: (((year - 1980) & 0x7f) << 9)
+      | (((safeDate.getMonth() + 1) & 0x0f) << 5)
+      | (safeDate.getDate() & 0x1f),
+  };
+}
+
+function buildStoredZipBlob(files) {
+  if (!Array.isArray(files) || !files.length) {
+    throw new Error("当前没有可打包的账号。");
+  }
+  if (files.length > 0xffff) {
+    throw new Error("账号数量过多，无法在前端直接打包。");
+  }
+
+  const localParts = [];
+  const centralDirectoryParts = [];
+  let localOffset = 0;
+  let centralDirectorySize = 0;
+
+  files.forEach((file) => {
+    const fileNameBytes = CLAIM_DOWNLOAD_TEXT_ENCODER.encode(file.name);
+    const contentBytes = file.bytes;
+    if (fileNameBytes.length > 0xffff) {
+      throw new Error(`文件名过长，无法打包：${file.name}`);
+    }
+    if (contentBytes.length > 0xffffffff) {
+      throw new Error(`文件过大，无法打包：${file.name}`);
+    }
+    const nextLocalOffset = localOffset + 30 + fileNameBytes.length + contentBytes.length;
+    if (nextLocalOffset > 0xffffffff) {
+      throw new Error("打包内容过大，请分批下载。");
+    }
+
+    const { dosTime, dosDate } = getZipDosTimestamp(file.modifiedAt);
+    const crc32 = computeCrc32(contentBytes);
+
+    const localHeader = new ArrayBuffer(30);
+    const localView = new DataView(localHeader);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, ZIP_FORMAT_VERSION, true);
+    localView.setUint16(6, ZIP_UTF8_FLAG, true);
+    localView.setUint16(8, ZIP_STORE_METHOD, true);
+    localView.setUint16(10, dosTime, true);
+    localView.setUint16(12, dosDate, true);
+    localView.setUint32(14, crc32, true);
+    localView.setUint32(18, contentBytes.length, true);
+    localView.setUint32(22, contentBytes.length, true);
+    localView.setUint16(26, fileNameBytes.length, true);
+    localView.setUint16(28, 0, true);
+    localParts.push(localHeader, fileNameBytes, contentBytes);
+
+    const centralHeader = new ArrayBuffer(46);
+    const centralView = new DataView(centralHeader);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, ZIP_FORMAT_VERSION, true);
+    centralView.setUint16(6, ZIP_FORMAT_VERSION, true);
+    centralView.setUint16(8, ZIP_UTF8_FLAG, true);
+    centralView.setUint16(10, ZIP_STORE_METHOD, true);
+    centralView.setUint16(12, dosTime, true);
+    centralView.setUint16(14, dosDate, true);
+    centralView.setUint32(16, crc32, true);
+    centralView.setUint32(20, contentBytes.length, true);
+    centralView.setUint32(24, contentBytes.length, true);
+    centralView.setUint16(28, fileNameBytes.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, localOffset, true);
+    centralDirectoryParts.push(centralHeader, fileNameBytes);
+
+    localOffset = nextLocalOffset;
+    centralDirectorySize += 46 + fileNameBytes.length;
+  });
+
+  if (localOffset + centralDirectorySize > 0xffffffff) {
+    throw new Error("打包内容过大，请分批下载。");
+  }
+
+  const endRecord = new ArrayBuffer(22);
+  const endView = new DataView(endRecord);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(4, 0, true);
+  endView.setUint16(6, 0, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralDirectorySize, true);
+  endView.setUint32(16, localOffset, true);
+  endView.setUint16(20, 0, true);
+
+  return new Blob([...localParts, ...centralDirectoryParts, endRecord], { type: "application/zip" });
+}
+
+function formatArchiveTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join("") + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function buildClaimsArchiveDownload(items) {
+  if (!Array.isArray(items) || !items.length) {
+    throw new Error("当前没有可下载的账号。");
+  }
+  const usedNames = new Set();
+  const files = items.map((item, index) => {
+    const fallbackName = `claimed-token-${index + 1}.json`;
+    const payload = buildClaimJsonDownload(item, fallbackName);
+    return {
+      name: ensureUniqueArchiveFileName(payload.filename, usedNames),
+      bytes: payload.bytes,
+      modifiedAt: new Date(),
+    };
+  });
+
+  return {
+    filename: `claimed-${formatArchiveTimestamp(new Date())}.zip`,
+    blob: buildStoredZipBlob(files),
+  };
 }
 
 async function downloadFileWithValidation(url, options = {}) {
@@ -1101,6 +1327,17 @@ function setClaimSubmitting(submitting) {
 function setClaimQueued(queued) {
   state.isClaimQueued = queued;
   syncClaimButtonState();
+}
+
+function setClaimDownloadAllBusy(busy, count = 0) {
+  if (!elements.claimDownloadAll) {
+    return;
+  }
+  elements.claimDownloadAll.disabled = busy;
+  elements.claimDownloadAll.classList.toggle("is-loading", busy);
+  elements.claimDownloadAll.textContent = busy
+    ? (count > 0 ? `正在打包 ${count} 个账号...` : "正在打包...")
+    : CLAIM_DOWNLOAD_ALL_LABEL;
 }
 
 function renderApiKeys() {
@@ -1685,19 +1922,24 @@ async function claimTokens() {
 }
 
 async function downloadClaimFile(item, trigger = null) {
-  if (!item?.download_url) {
-    showClaimErrorMessage("当前账号缺少下载地址。");
-    return;
-  }
   hideClaimErrorMessage();
   if (trigger) {
     trigger.disabled = true;
   }
   try {
-    await downloadFileWithValidation(item.download_url, {
-      expectedContentType: "application/json",
-      fallbackFilename: item.file_name || "claimed-token.json",
-    });
+    const fallbackFilename = normalizeDownloadFileName(item?.file_name, "claimed-token.json");
+    try {
+      const payload = buildClaimJsonDownload(item, fallbackFilename);
+      triggerBrowserDownload(payload.blob, payload.filename);
+    } catch (directDownloadError) {
+      if (!item?.download_url) {
+        throw directDownloadError;
+      }
+      await downloadFileWithValidation(item.download_url, {
+        expectedContentType: "application/json",
+        fallbackFilename,
+      });
+    }
   } catch (error) {
     if (!handleAccessError(error)) {
       showClaimErrorMessage(error.message || "下载账号 JSON 失败。");
@@ -1711,22 +1953,40 @@ async function downloadClaimFile(item, trigger = null) {
 
 async function downloadAllClaims() {
   hideClaimErrorMessage();
-  if (elements.claimDownloadAll) {
-    elements.claimDownloadAll.disabled = true;
+  if (!state.claimsInitialized && !state.claimResults.length) {
+    try {
+      await ensureClaimsLoaded();
+    } catch (error) {
+      if (!handleAccessError(error)) {
+        showClaimErrorMessage(error.message || "加载领取记录失败。");
+      }
+      return;
+    }
   }
+
+  const items = Array.isArray(state.claimResults) ? state.claimResults.filter(Boolean) : [];
+  if (!items.length) {
+    showClaimErrorMessage("当前没有可下载的账号。");
+    return;
+  }
+
+  setClaimDownloadAllBusy(true, items.length);
   try {
-    await downloadFileWithValidation("/me/claims/archive", {
-      expectedContentType: "application/zip",
-      fallbackFilename: "claimed-tokens.zip",
-    });
+    try {
+      const payload = buildClaimsArchiveDownload(items);
+      triggerBrowserDownload(payload.blob, payload.filename);
+    } catch (directArchiveError) {
+      await downloadFileWithValidation("/me/claims/archive", {
+        expectedContentType: "application/zip",
+        fallbackFilename: `claimed-${formatArchiveTimestamp(new Date())}.zip`,
+      });
+    }
   } catch (error) {
     if (!handleAccessError(error)) {
       showClaimErrorMessage(error.message || "下载账号归档失败。");
     }
   } finally {
-    if (elements.claimDownloadAll) {
-      elements.claimDownloadAll.disabled = false;
-    }
+    setClaimDownloadAllBusy(false);
   }
 }
 
