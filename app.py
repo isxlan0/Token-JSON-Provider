@@ -68,6 +68,10 @@ def upload_log(message: str) -> None:
     print(_format_runtime_log("upload", message), flush=True)
 
 
+def download_log(message: str) -> None:
+    print(_format_runtime_log("download", message), flush=True)
+
+
 class QueueStatusEventBroker:
     @dataclass
     class Subscription:
@@ -499,7 +503,15 @@ class RateLimitError(Exception):
     pass
 
 
+class AuthenticationRequiredError(Exception):
+    pass
+
+
 class AccessDeniedError(Exception):
+    pass
+
+
+class ResourceNotFoundError(Exception):
     pass
 
 
@@ -507,6 +519,10 @@ class BannedUserError(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(payload.get("detail") or "User is banned")
         self.payload = payload
+
+
+class CorruptClaimDataError(Exception):
+    pass
 
 
 class UploadValidationError(ValueError):
@@ -3203,7 +3219,7 @@ class TokenDb:
                 (user_id,),
             ).fetchone()
             if existing and int(existing["cnt"]) >= get_apikey_max_per_user():
-                raise PermissionError("API key limit reached.")
+                raise AccessDeniedError("API key limit reached.")
 
             cursor = conn.execute(
                 """
@@ -3930,6 +3946,29 @@ class TokenDb:
             "content": json.loads(row["content_json"]),
         }
 
+    def get_claim_download_access_summary(self, token_id: int, user_id: int) -> dict[str, bool]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1
+                        FROM token_claims
+                        WHERE token_id = ? AND user_id = ? AND is_hidden = 1
+                    ) AS user_hidden_claim,
+                    EXISTS(
+                        SELECT 1
+                        FROM token_claims
+                        WHERE token_id = ? AND user_id != ? AND is_hidden = 0
+                    ) AS other_visible_claim
+                """,
+                (token_id, user_id, token_id, user_id),
+            ).fetchone()
+        return {
+            "user_hidden_claim": bool(int(row["user_hidden_claim"])) if row else False,
+            "other_visible_claim": bool(int(row["other_visible_claim"])) if row else False,
+        }
+
     def list_claims(self, user_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -4472,7 +4511,7 @@ def get_user_basic_snapshot(user_id: int, *, is_admin: bool) -> dict[str, Any]:
         return cached
     user = db.get_user(user_id)
     if not user:
-        raise PermissionError
+        raise AuthenticationRequiredError("User session is no longer valid.")
     payload = {
         "id": user["linuxdo_user_id"],
         "username": user["linuxdo_username"],
@@ -5054,15 +5093,15 @@ def fetch_linuxdo_user(access_token: str) -> LinuxDOUser:
 
 def validate_linuxdo_user(user: LinuxDOUser) -> None:
     if not user.active:
-        raise PermissionError("Linux.do user is not active")
+        raise AccessDeniedError("Linux.do user is not active")
     if user.silenced:
-        raise PermissionError("Linux.do user is silenced")
+        raise AccessDeniedError("Linux.do user is silenced")
     if user.trust_level < get_linuxdo_min_trust_level():
-        raise PermissionError("Linux.do trust level is below the configured minimum")
+        raise AccessDeniedError("Linux.do trust level is below the configured minimum")
 
     allowed_ids = get_linuxdo_allowed_ids()
     if allowed_ids and str(user.id) not in allowed_ids:
-        raise PermissionError("Linux.do user is not in the allowlist")
+        raise AccessDeniedError("Linux.do user is not in the allowlist")
 
 
 def set_linuxdo_session(request: Request, user: LinuxDOUser, db_user_id: int) -> None:
@@ -5111,13 +5150,13 @@ def build_ban_error_payload(context: dict[str, Any]) -> dict[str, Any]:
 def get_request_context(request: Request) -> dict[str, Any]:
     auth = get_session_auth(request)
     if not auth or auth.get("method") != "linuxdo":
-        raise PermissionError
+        raise AuthenticationRequiredError("Authentication required.")
     user_id = auth.get("user_id")
     if user_id is None:
-        raise PermissionError
+        raise AuthenticationRequiredError("Authentication required.")
     db_user = db.get_user(int(user_id))
     if not db_user:
-        raise PermissionError
+        raise AuthenticationRequiredError("Authentication required.")
     username = db_user["linuxdo_username"]
     public_user = {
         "id": db_user["linuxdo_user_id"],
@@ -5163,13 +5202,13 @@ def require_api_key(
     api_key: str | None = Depends(extract_api_key),
 ) -> dict[str, Any]:
     if not api_key:
-        raise PermissionError
+        raise AuthenticationRequiredError("API key is required.")
     record = db.resolve_api_key(api_key)
     if not record:
-        raise PermissionError
+        raise AuthenticationRequiredError("Invalid API key.")
     owner = db.get_user(int(record["user_id"]))
     if not owner:
-        raise PermissionError
+        raise AuthenticationRequiredError("Invalid API key owner.")
     ban = db.get_active_ban(owner["linuxdo_user_id"])
     if ban:
         raise BannedUserError(
@@ -5190,10 +5229,10 @@ def verify_api_key(
     api_key: str | None = Depends(extract_api_key),
 ) -> None:
     if not api_key:
-        raise PermissionError
+        raise AuthenticationRequiredError("API key is required.")
     record = db.resolve_api_key(api_key)
     if not record:
-        raise PermissionError
+        raise AuthenticationRequiredError("Invalid API key.")
 
 
 def build_claimed_documents(user_id: int) -> list[TokenDocument]:
@@ -5234,6 +5273,16 @@ def build_claimed_documents(user_id: int) -> list[TokenDocument]:
         )
 
     return documents
+
+
+def build_zip_buffer(items: list[tuple[str, Any]]) -> tuple[io.BytesIO, int]:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in items:
+            archive.writestr(name, json.dumps(content, ensure_ascii=False).encode("utf-8"))
+    output_bytes = buffer.tell()
+    buffer.seek(0)
+    return buffer, output_bytes
 
 
 def build_upload_response(
@@ -6588,23 +6637,70 @@ app.add_middleware(
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 
+def build_json_error_response(status_code: int, detail: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
+def log_download_result(
+    action: str,
+    *,
+    status: str,
+    user_id: int | None = None,
+    token_id: int | None = None,
+    claims_count: int | None = None,
+    output_bytes: int | None = None,
+    elapsed_ms: float | None = None,
+    reason: str | None = None,
+) -> None:
+    parts = [f"action={action}", f"status={status}"]
+    if user_id is not None:
+        parts.append(f"user_id={user_id}")
+    if token_id is not None:
+        parts.append(f"token_id={token_id}")
+    if claims_count is not None:
+        parts.append(f"claims_count={claims_count}")
+    if output_bytes is not None:
+        parts.append(f"output_bytes={output_bytes}")
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms:.2f}")
+    if reason:
+        parts.append(f"reason={reason}")
+    download_log(" ".join(parts))
+
+
 
 
 @app.exception_handler(PermissionError)
-def permission_error_handler(_: Any, __: PermissionError) -> Response:
-    return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+def permission_error_handler(_: Any, exc: PermissionError) -> JSONResponse:
+    detail = str(exc) or "Authentication required."
+    return build_json_error_response(status.HTTP_401_UNAUTHORIZED, detail)
+
+
+@app.exception_handler(AuthenticationRequiredError)
+def authentication_required_handler(_: Any, exc: AuthenticationRequiredError) -> JSONResponse:
+    detail = str(exc) or "Authentication required."
+    return build_json_error_response(status.HTTP_401_UNAUTHORIZED, detail)
 
 
 @app.exception_handler(AccessDeniedError)
-def access_denied_handler(_: Any, exc: AccessDeniedError) -> Response:
-    payload = json.dumps({"detail": str(exc)}, ensure_ascii=False).encode("utf-8")
-    return Response(status_code=status.HTTP_403_FORBIDDEN, content=payload, media_type="application/json")
+def access_denied_handler(_: Any, exc: AccessDeniedError) -> JSONResponse:
+    return build_json_error_response(status.HTTP_403_FORBIDDEN, str(exc))
+
+
+@app.exception_handler(ResourceNotFoundError)
+def resource_not_found_handler(_: Any, exc: ResourceNotFoundError) -> JSONResponse:
+    return build_json_error_response(status.HTTP_404_NOT_FOUND, str(exc))
 
 
 @app.exception_handler(BannedUserError)
 def banned_user_handler(_: Any, exc: BannedUserError) -> Response:
     payload = json.dumps(exc.payload, ensure_ascii=False).encode("utf-8")
     return Response(status_code=status.HTTP_403_FORBIDDEN, content=payload, media_type="application/json")
+
+
+@app.exception_handler(CorruptClaimDataError)
+def corrupt_claim_data_handler(_: Any, exc: CorruptClaimDataError) -> JSONResponse:
+    return build_json_error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc))
 
 
 @app.exception_handler(RateLimitError)
@@ -6659,7 +6755,7 @@ def get_auth_status(request: Request) -> dict[str, Any]:
                 "ban_reason": context["ban"]["reason"] if context["ban"] else None,
                 "ban_expires_at": context["ban"]["expires_at"] if context["ban"] else None,
             }
-        except PermissionError:
+        except (PermissionError, AuthenticationRequiredError):
             clear_auth_session(request)
             auth = None
     payload = {
@@ -7421,21 +7517,83 @@ def hide_claims(request: Request, payload: ClaimHidePayload) -> dict[str, Any]:
 
 @app.get("/me/claims/archive")
 def download_claims_archive(request: Request) -> StreamingResponse:
-    session = require_session_user(request)
-    user_id = session["user_id"]
-    key = build_cache_key("me-claim-files", user_id, f"v{get_cache_scope_version('user-claims', user_id)}")
-    items = cache_json(key, get_cache_claims_ttl(), lambda: db.list_claim_files(user_id))
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for item in items:
-            filename = item["file_name"]
-            content = json.dumps(item["content"], ensure_ascii=False).encode("utf-8")
-            archive.writestr(filename, content)
-
-    buffer.seek(0)
-    filename = f"claimed-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+    started_at = time.perf_counter()
+    user_id: int | None = None
+    claims_count = 0
+    try:
+        session = require_session_user(request)
+        user_id = int(session["user_id"])
+        key = build_cache_key("me-claim-files", user_id, f"v{get_cache_scope_version('user-claims', user_id)}")
+        items = cache_json(key, get_cache_claims_ttl(), lambda: db.list_claim_files(user_id))
+        claims_count = len(items)
+        if not items:
+            raise ResourceNotFoundError("No claimed token files available for archive.")
+        buffer, output_bytes = build_zip_buffer([
+            (item["file_name"], item["content"])
+            for item in items
+        ])
+        filename = f"claimed-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        log_download_result(
+            "claims-archive",
+            status="success",
+            user_id=user_id,
+            claims_count=claims_count,
+            output_bytes=output_bytes,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+        )
+        return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+    except ResourceNotFoundError as exc:
+        log_download_result(
+            "claims-archive",
+            status="not-found",
+            user_id=user_id,
+            claims_count=claims_count,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=str(exc),
+        )
+        raise
+    except (AuthenticationRequiredError, PermissionError) as exc:
+        log_download_result(
+            "claims-archive",
+            status="unauthorized",
+            user_id=user_id,
+            claims_count=claims_count,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=str(exc) or "Authentication required.",
+        )
+        raise
+    except (AccessDeniedError, BannedUserError) as exc:
+        reason = str(exc) if not isinstance(exc, BannedUserError) else (exc.payload.get("detail") or "Access denied")
+        log_download_result(
+            "claims-archive",
+            status="forbidden",
+            user_id=user_id,
+            claims_count=claims_count,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=reason,
+        )
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+        log_download_result(
+            "claims-archive",
+            status="corrupt-data",
+            user_id=user_id,
+            claims_count=claims_count,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        raise CorruptClaimDataError("Stored claim content is corrupted.") from exc
+    except Exception as exc:
+        log_download_result(
+            "claims-archive",
+            status="error",
+            user_id=user_id,
+            claims_count=claims_count,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
 
 @app.post("/me/claim")
@@ -7466,28 +7624,93 @@ def download_claimed_token(
     token_id: int,
     api_key: str | None = Depends(extract_api_key),
 ) -> Response:
+    started_at = time.perf_counter()
     user_id: int | None = None
-    if api_key:
-        resolved = db.resolve_api_key(api_key)
-        if not resolved:
-            raise PermissionError
-        user_id = resolved["user_id"]
-    else:
-        session = require_session_user(request)
-        user_id = int(session.get("user_id"))
+    try:
+        if api_key:
+            resolved = db.resolve_api_key(api_key)
+            if not resolved:
+                raise AuthenticationRequiredError("Invalid API key.")
+            user_id = int(resolved["user_id"])
+        else:
+            session = require_session_user(request)
+            user_id = int(session.get("user_id") or 0)
+        if not user_id:
+            raise AuthenticationRequiredError("Authentication required.")
 
-    if not user_id:
-        raise PermissionError
+        key = build_cache_key("claimed-token", user_id, token_id, f"v{get_cache_scope_version('user-claims', user_id)}")
+        token = cache_json(key, get_cache_claims_ttl(), lambda: db.get_claimed_token(token_id, user_id))
+        if not token:
+            access = db.get_claim_download_access_summary(token_id, user_id)
+            if access["other_visible_claim"]:
+                raise AccessDeniedError("You do not have access to this claimed token.")
+            if access["user_hidden_claim"]:
+                raise ResourceNotFoundError("Claimed token download is no longer available.")
+            raise ResourceNotFoundError("Claimed token download not found.")
 
-    key = build_cache_key("claimed-token", user_id, token_id, f"v{get_cache_scope_version('user-claims', user_id)}")
-    token = cache_json(key, get_cache_claims_ttl(), lambda: db.get_claimed_token(token_id, user_id))
-    if not token:
-        raise PermissionError
-
-    content_json = json.dumps(token["content"], ensure_ascii=False).encode("utf-8")
-    filename = token["file_name"]
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=content_json, media_type="application/json", headers=headers)
+        content_json = json.dumps(token["content"], ensure_ascii=False).encode("utf-8")
+        filename = token["file_name"]
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        log_download_result(
+            "claim-download",
+            status="success",
+            user_id=user_id,
+            token_id=token_id,
+            output_bytes=len(content_json),
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+        )
+        return Response(content=content_json, media_type="application/json", headers=headers)
+    except ResourceNotFoundError as exc:
+        log_download_result(
+            "claim-download",
+            status="not-found",
+            user_id=user_id,
+            token_id=token_id,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=str(exc),
+        )
+        raise
+    except (AuthenticationRequiredError, PermissionError) as exc:
+        log_download_result(
+            "claim-download",
+            status="unauthorized",
+            user_id=user_id,
+            token_id=token_id,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=str(exc) or "Authentication required.",
+        )
+        raise
+    except (AccessDeniedError, BannedUserError) as exc:
+        reason = str(exc) if not isinstance(exc, BannedUserError) else (exc.payload.get("detail") or "Access denied")
+        log_download_result(
+            "claim-download",
+            status="forbidden",
+            user_id=user_id,
+            token_id=token_id,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=reason,
+        )
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+        log_download_result(
+            "claim-download",
+            status="corrupt-data",
+            user_id=user_id,
+            token_id=token_id,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        raise CorruptClaimDataError("Stored claim content is corrupted.") from exc
+    except Exception as exc:
+        log_download_result(
+            "claim-download",
+            status="error",
+            user_id=user_id,
+            token_id=token_id,
+            elapsed_ms=(time.perf_counter() - started_at) * 1000,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
 
 @app.get("/auth/linuxdo/login")
@@ -7555,7 +7778,15 @@ def linuxdo_callback(
         validate_linuxdo_user(user)
         db_user = db.upsert_user(user)
         set_linuxdo_session(request, user, db_user["id"])
-    except (PermissionError, ValueError, urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+    except (
+        PermissionError,
+        AuthenticationRequiredError,
+        AccessDeniedError,
+        ValueError,
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+    ):
         response = RedirectResponse(
             url=f"{post_login_redirect}?auth_error=linuxdo_login_failed",
             status_code=status.HTTP_302_FOUND,

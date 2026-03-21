@@ -1,5 +1,5 @@
-import { createLeaderSyncController } from "./app/leader-sync.js?v=20260322e";
-import { createSummarySyncController } from "./app/summary-sync.js?v=20260322e";
+import { createLeaderSyncController } from "./app/leader-sync.js?v=20260322f";
+import { createSummarySyncController } from "./app/summary-sync.js?v=20260322f";
 
 const state = {
   user: null,
@@ -624,6 +624,95 @@ async function fetchJson(url, options = {}) {
     throw error;
   }
   return payload;
+}
+
+async function readResponseErrorMessage(response, fallbackMessage = "") {
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("application/json")) {
+    const payload = await response.json().catch(() => ({}));
+    if (payload?.detail) {
+      return String(payload.detail);
+    }
+  }
+  const text = await response.text().catch(() => "");
+  const normalized = text.trim();
+  if (normalized) {
+    return normalized.length > 400 ? normalized.slice(0, 400) : normalized;
+  }
+  return fallbackMessage || `请求失败: ${response.status}`;
+}
+
+function parseDownloadFilename(contentDisposition = "") {
+  const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch (error) {
+      return utf8Match[1];
+    }
+  }
+  const quotedMatch = contentDisposition.match(/filename=\"([^\"]+)\"/i);
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1];
+  }
+  const plainMatch = contentDisposition.match(/filename=([^;]+)/i);
+  return plainMatch?.[1]?.trim() || "";
+}
+
+function triggerBrowserDownload(blob, filename) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
+async function downloadFileWithValidation(url, options = {}) {
+  const expectedContentType = String(options.expectedContentType || "").toLowerCase();
+  const fallbackFilename = options.fallbackFilename || "";
+  const response = await fetch(url, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...options.fetchOptions,
+  });
+  if (!response.ok) {
+    const error = new Error(await readResponseErrorMessage(response, `下载失败: ${response.status}`));
+    error.status = response.status;
+    throw error;
+  }
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  if (!contentType.includes(expectedContentType)) {
+    const error = new Error(await readResponseErrorMessage(response, "下载响应格式无效。"));
+    error.status = response.status;
+    throw error;
+  }
+  const contentDisposition = response.headers.get("content-disposition") || "";
+  const filename = parseDownloadFilename(contentDisposition) || fallbackFilename;
+  if (!filename) {
+    throw new Error("下载响应缺少文件名。");
+  }
+  const blob = await response.blob();
+  triggerBrowserDownload(blob, filename);
+  return {
+    filename,
+    size: blob.size,
+  };
+}
+
+function showClaimErrorMessage(message) {
+  if (!elements.claimError) {
+    return;
+  }
+  elements.claimError.textContent = message;
+  elements.claimError.classList.remove("hidden");
+}
+
+function hideClaimErrorMessage() {
+  elements.claimError?.classList.add("hidden");
 }
 
 function renderBannedUser(user) {
@@ -1371,7 +1460,7 @@ function renderClaimResults() {
     <div class="claim-actions">
       <span class="claim-selection-state ${selected ? "is-visible" : ""}">Selected</span>
       <button class="btn btn-outline btn-inline" data-claim-copy="${claimId}">复制账号 JSON</button>
-      <a class="btn btn-outline btn-inline" data-claim-download="${claimId}" target="_blank" rel="noopener noreferrer">下载 JSON</a>
+      <button class="btn btn-outline btn-inline" data-claim-download="${claimId}" type="button">下载 JSON</button>
       <button class="btn btn-ghost btn-inline btn-danger" data-claim-remove="${claimId}">删除账号</button>
     </div>
   </div>
@@ -1379,10 +1468,7 @@ function renderClaimResults() {
 `;
     const copyBtn = card.querySelector(`button[data-claim-copy="${claimId}"]`);
     const removeBtn = card.querySelector(`button[data-claim-remove="${claimId}"]`);
-    const downloadLink = card.querySelector(`a[data-claim-download="${claimId}"]`);
-    if (downloadLink) {
-      downloadLink.href = item.download_url || "#";
-    }
+    const downloadBtn = card.querySelector(`button[data-claim-download="${claimId}"]`);
     copyBtn.addEventListener("click", async () => {
       const ok = await copyText(content);
       if (ok) {
@@ -1391,6 +1477,9 @@ function renderClaimResults() {
           copyBtn.textContent = "Copy JSON";
         }, 1200);
       }
+    });
+    downloadBtn?.addEventListener("click", async () => {
+      await downloadClaimFile(item, downloadBtn);
     });
     card.addEventListener("click", (event) => {
       if (!state.claimMultiMode || isClaimActionTarget(event.target)) {
@@ -1595,8 +1684,50 @@ async function claimTokens() {
   }
 }
 
-function downloadAllClaims() {
-  window.open("/me/claims/archive", "_blank");
+async function downloadClaimFile(item, trigger = null) {
+  if (!item?.download_url) {
+    showClaimErrorMessage("当前账号缺少下载地址。");
+    return;
+  }
+  hideClaimErrorMessage();
+  if (trigger) {
+    trigger.disabled = true;
+  }
+  try {
+    await downloadFileWithValidation(item.download_url, {
+      expectedContentType: "application/json",
+      fallbackFilename: item.file_name || "claimed-token.json",
+    });
+  } catch (error) {
+    if (!handleAccessError(error)) {
+      showClaimErrorMessage(error.message || "下载账号 JSON 失败。");
+    }
+  } finally {
+    if (trigger) {
+      trigger.disabled = false;
+    }
+  }
+}
+
+async function downloadAllClaims() {
+  hideClaimErrorMessage();
+  if (elements.claimDownloadAll) {
+    elements.claimDownloadAll.disabled = true;
+  }
+  try {
+    await downloadFileWithValidation("/me/claims/archive", {
+      expectedContentType: "application/zip",
+      fallbackFilename: "claimed-tokens.zip",
+    });
+  } catch (error) {
+    if (!handleAccessError(error)) {
+      showClaimErrorMessage(error.message || "下载账号归档失败。");
+    }
+  } finally {
+    if (elements.claimDownloadAll) {
+      elements.claimDownloadAll.disabled = false;
+    }
+  }
 }
 
 async function clearClaimResults() {
