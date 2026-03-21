@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -65,6 +66,92 @@ def token_import_log(message: str) -> None:
 
 def upload_log(message: str) -> None:
     print(_format_runtime_log("upload", message), flush=True)
+
+
+class QueueStatusEventBroker:
+    @dataclass
+    class Subscription:
+        user_id: int
+        subscription_id: int
+        loop: asyncio.AbstractEventLoop
+        queue: asyncio.Queue[int]
+
+    @dataclass
+    class Entry:
+        version: int = 0
+        subscriptions: dict[int, "QueueStatusEventBroker.Subscription"] = field(default_factory=dict)
+
+    def __init__(self) -> None:
+        self._entries: dict[int, QueueStatusEventBroker.Entry] = {}
+        self._lock = threading.Lock()
+        self._next_subscription_id = itertools.count(1)
+
+    @staticmethod
+    def _push_latest(queue: asyncio.Queue[int], version: int) -> None:
+        while True:
+            try:
+                queue.put_nowait(version)
+                return
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+    def _drop_subscription_locked(self, subscription: "QueueStatusEventBroker.Subscription") -> None:
+        entry = self._entries.get(int(subscription.user_id))
+        if entry is None:
+            return
+        entry.subscriptions.pop(int(subscription.subscription_id), None)
+        if not entry.subscriptions:
+            self._entries.pop(int(subscription.user_id), None)
+
+    def subscribe(
+        self,
+        user_id: int,
+        loop: asyncio.AbstractEventLoop,
+    ) -> tuple["QueueStatusEventBroker.Subscription", int]:
+        subscription = self.Subscription(
+            user_id=int(user_id),
+            subscription_id=next(self._next_subscription_id),
+            loop=loop,
+            queue=asyncio.Queue(maxsize=1),
+        )
+        with self._lock:
+            entry = self._entries.get(int(user_id))
+            if entry is None:
+                entry = self.Entry()
+                self._entries[int(user_id)] = entry
+            entry.subscriptions[int(subscription.subscription_id)] = subscription
+            return subscription, entry.version
+
+    def notify(self, user_id: int) -> int:
+        stale_subscriptions: list[QueueStatusEventBroker.Subscription] = []
+        with self._lock:
+            entry = self._entries.get(int(user_id))
+            if entry is None or not entry.subscriptions:
+                return 0
+            entry.version += 1
+            version = entry.version
+            subscriptions = list(entry.subscriptions.values())
+        for subscription in subscriptions:
+            try:
+                subscription.loop.call_soon_threadsafe(
+                    self._push_latest,
+                    subscription.queue,
+                    version,
+                )
+            except RuntimeError:
+                stale_subscriptions.append(subscription)
+        if stale_subscriptions:
+            with self._lock:
+                for subscription in stale_subscriptions:
+                    self._drop_subscription_locked(subscription)
+        return version
+
+    def unsubscribe(self, subscription: "QueueStatusEventBroker.Subscription") -> None:
+        with self._lock:
+            self._drop_subscription_locked(subscription)
 
 
 def count_token_files(token_dir: Path) -> int | None:
@@ -1522,6 +1609,7 @@ class TokenDb:
             self.ensure_inventory_policy(conn=conn)
         _refresh_dashboard_memory()
         invalidate_all_runtime_cache(include_admin=True)
+        wake_queue_pump()
         return {"token_id": token_id, "account_id": account_id, "file_name": file_name}
 
     def _find_sync_token_conflict(
@@ -1780,6 +1868,7 @@ class TokenDb:
         if imported:
             _refresh_dashboard_memory()
             invalidate_all_runtime_cache(include_admin=True)
+            wake_queue_pump()
         return {"imported": imported, "skipped": skipped, "errors": errors}
 
     def list_token_file_names(self) -> set[str]:
@@ -2019,6 +2108,7 @@ class TokenDb:
         if changed:
             _refresh_dashboard_memory()
             invalidate_all_runtime_cache(include_admin=True)
+            wake_queue_pump()
         return results
 
     def import_token_file(self, path: Path, *, timeout: float = 3.0) -> dict[str, Any]:
@@ -2580,6 +2670,8 @@ class TokenDb:
             self.ensure_inventory_policy(conn=conn)
         _refresh_dashboard_memory()
         invalidate_all_runtime_cache(include_admin=True)
+        if enabled and row and int(row["is_available"] or 0) > 0:
+            wake_queue_pump()
         if not row:
             return None
         return self._token_row_to_admin_payload(row)
@@ -3635,10 +3727,6 @@ class TokenDb:
         api_key_id: int | None,
         count: int,
     ) -> dict[str, Any]:
-        if claim_queue.has_pending_queue(self):
-            # When inventory still exists, try to advance the queue before deciding that
-            # this request must wait behind older queued requests.
-            advance_claim_queue_on_demand(only_when_stock_hint=True)
         requested = max(1, count)
         request_id = secrets.token_hex(8)
         now = now_ts()
@@ -3717,6 +3805,7 @@ class TokenDb:
             )
             if queued_created:
                 refresh_queue_meta_runtime(self)
+            wake_queue_pump()
             invalidate_dashboard_cache(user_id=user_id)
             invalidate_admin_cache()
             return queued_result
@@ -3793,6 +3882,7 @@ class TokenDb:
             )
             if queued_created:
                 refresh_queue_meta_runtime(self)
+            wake_queue_pump()
         if result.get("granted"):
             user = self.get_user(user_id)
             if user:
@@ -4499,6 +4589,18 @@ def set_user_api_key_summary_snapshot(user_id: int, payload: dict[str, Any]) -> 
     return normalized
 
 
+def get_user_runtime_snapshot(user_id: int) -> dict[str, Any]:
+    upload_results = refresh_user_upload_results_memory(user_id)
+    return {
+        "quota": get_user_quota_snapshot(user_id),
+        "claims": get_user_claim_summary_snapshot(user_id),
+        "api_keys": {
+            "summary": get_user_api_key_summary_snapshot(user_id),
+        },
+        "upload_results": build_upload_results_summary_payload(upload_results),
+    }
+
+
 def get_default_upload_results_snapshot() -> dict[str, Any]:
     return {
         "batch_id": None,
@@ -4561,6 +4663,15 @@ def set_user_upload_results_snapshot(user_id: int, payload: dict[str, Any]) -> d
     return _set_cached_snapshot(key, normalized, get_cache_upload_results_ttl())
 
 
+def build_upload_results_summary_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = payload or {}
+    return {
+        "batch_id": source.get("batch_id"),
+        "created_at": source.get("created_at"),
+        "summary": dict(source.get("summary") or get_default_upload_results_snapshot()["summary"]),
+    }
+
+
 def get_cached_user_queue_snapshot(user_id: int) -> dict[str, Any] | None:
     key = build_user_queue_cache_key(user_id)
     return _get_cached_snapshot(key)
@@ -4588,11 +4699,22 @@ def build_user_queue_snapshot_payload(
 
 def set_user_queue_snapshot(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     key = build_user_queue_cache_key(user_id)
-    return _set_cached_snapshot(key, payload, get_cache_queue_snapshot_ttl())
+    previous = _get_cached_snapshot(key)
+    normalized = _set_cached_snapshot(key, payload, get_cache_queue_snapshot_ttl())
+    if previous != normalized:
+        _QUEUE_STATUS_EVENTS.notify(int(user_id))
+    return normalized
 
 
 def refresh_queue_meta_runtime(db_handle: "TokenDb") -> None:
     refresh_queue_total_snapshot(db_handle)
+
+
+def wake_queue_pump() -> None:
+    global _QUEUE_PUMP_WAKE_SEQ
+    with _QUEUE_PUMP_COND:
+        _QUEUE_PUMP_WAKE_SEQ += 1
+        _QUEUE_PUMP_COND.notify()
 
 
 def refresh_user_queue_snapshots(user_ids: list[int]) -> None:
@@ -5258,7 +5380,10 @@ _SYSTEM_STATUS_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _CACHE_TTL_SEC = 5.0
 _QUEUE_PUMP_THREAD: threading.Thread | None = None
 _QUEUE_PUMP_STOP = threading.Event()
+_QUEUE_PUMP_COND = threading.Condition()
+_QUEUE_PUMP_WAKE_SEQ = 0
 _QUEUE_PUMP_INTERVAL_SEC = 5.0
+_QUEUE_STATUS_EVENTS = QueueStatusEventBroker()
 _TOKEN_IMPORT_THREAD: threading.Thread | None = None
 _TOKEN_IMPORT_STOP = threading.Event()
 _TOKEN_IMPORT_QUEUE: queue.Queue[tuple[str, int, str]] = queue.Queue()
@@ -5383,6 +5508,7 @@ def _cache_fresh(ts: float, ttl_sec: float | None = None) -> bool:
 
 def _queue_pump_loop() -> None:
     first_iteration = True
+    last_wake_seq = 0
     while not _QUEUE_PUMP_STOP.is_set():
         try:
             if first_iteration or claim_queue.has_pending_queue(db):
@@ -5390,7 +5516,12 @@ def _queue_pump_loop() -> None:
         except Exception:
             pass
         first_iteration = False
-        _QUEUE_PUMP_STOP.wait(timeout=_QUEUE_PUMP_INTERVAL_SEC)
+        with _QUEUE_PUMP_COND:
+            _QUEUE_PUMP_COND.wait_for(
+                lambda: _QUEUE_PUMP_STOP.is_set() or _QUEUE_PUMP_WAKE_SEQ != last_wake_seq,
+                timeout=_QUEUE_PUMP_INTERVAL_SEC,
+            )
+            last_wake_seq = _QUEUE_PUMP_WAKE_SEQ
 
 
 def _cleanup_internal_token_writes(now: float | None = None) -> None:
@@ -6365,6 +6496,9 @@ async def lifespan(_: FastAPI):
     startup_log(f"application startup finished in {time.perf_counter() - startup_begin:.3f}s")
 
     _QUEUE_PUMP_STOP.clear()
+    global _QUEUE_PUMP_WAKE_SEQ
+    with _QUEUE_PUMP_COND:
+        _QUEUE_PUMP_WAKE_SEQ = 0
     _TOKEN_IMPORT_STOP.clear()
     _UPLOAD_TASK_STOP.clear()
     _HIDE_CLAIMS_STOP.clear()
@@ -6412,6 +6546,9 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         _QUEUE_PUMP_STOP.set()
+        with _QUEUE_PUMP_COND:
+            _QUEUE_PUMP_WAKE_SEQ += 1
+            _QUEUE_PUMP_COND.notify_all()
         _TOKEN_IMPORT_STOP.set()
         _UPLOAD_TASK_STOP.set()
         _HIDE_CLAIMS_STOP.set()
@@ -6795,32 +6932,55 @@ def get_me_upload_results(request: Request) -> dict[str, Any]:
     return refresh_user_upload_results_memory(session["user_id"])
 
 
-@app.get("/dashboard/leaderboard")
-def get_dashboard_leaderboard(
-    request: Request,
-    window: str | None = Query(default="24h"),
-    limit: int = Query(default=10, ge=1, le=10),
-) -> dict[str, Any]:
-    require_session_user(request)
-    window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
-    limit = min(limit, 10)
-    key = build_dashboard_cache_key("dashboard-leaderboard", window_sec, limit)
-    return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_leaderboard(window_sec, limit))
-
-
-@app.get("/dashboard/summary")
-def get_dashboard_summary(
-    request: Request,
-    window: str | None = Query(default="7d"),
-    bucket: str | None = Query(default="1h"),
-    leaderboard_window: str | None = Query(default="24h"),
-    leaderboard_limit: int = Query(default=10, ge=1, le=10),
-    recent_limit: int = Query(default=10, ge=1, le=10),
-    contributor_limit: int = Query(default=10, ge=1, le=10),
-    recent_contributor_limit: int = Query(default=10, ge=1, le=10),
-) -> dict[str, Any]:
+@app.get("/me/runtime-snapshot")
+def get_me_runtime_snapshot(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
-    user_id = session["user_id"]
+    return get_user_runtime_snapshot(session["user_id"])
+
+
+@app.get("/me/bootstrap")
+def get_me_bootstrap(request: Request) -> dict[str, Any]:
+    session = require_session_user(request)
+    return get_user_bootstrap_snapshot(
+        session["user_id"],
+        is_admin=bool(session["is_admin"]),
+    )
+
+
+@app.get("/me/queue-stream")
+async def get_me_queue_stream(request: Request) -> StreamingResponse:
+    session = require_session_user(request)
+    user_id = int(session["user_id"])
+
+    async def event_generator() -> Any:
+        async for chunk in stream_user_queue_events(user_id):
+            if await request.is_disconnected():
+                break
+            yield chunk
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+def get_dashboard_summary_payload(
+    user_id: int,
+    *,
+    window: str | None = "7d",
+    bucket: str | None = "1h",
+    leaderboard_window: str | None = "24h",
+    leaderboard_limit: int = 10,
+    recent_limit: int = 10,
+    contributor_limit: int = 10,
+    recent_contributor_limit: int = 10,
+) -> dict[str, Any]:
     leaderboard_window_sec = parse_window_to_seconds(
         leaderboard_window, 24 * 3600, max_seconds=7 * 24 * 3600
     )
@@ -6841,6 +7001,7 @@ def get_dashboard_summary(
         recent_contributor_limit,
         user_id=user_id,
     )
+
     def _load_summary() -> dict[str, Any]:
         full_stats = _DASHBOARD_CACHE.get_stats(user_id)
         stats = {
@@ -6870,7 +7031,84 @@ def get_dashboard_summary(
             "trends": trends,
             "system": system,
         }
+
     return cache_json(key, get_cache_dashboard_ttl(), _load_summary)
+
+
+def get_user_bootstrap_snapshot(user_id: int, *, is_admin: bool) -> dict[str, Any]:
+    upload_results = refresh_user_upload_results_memory(user_id)
+    return {
+        "profile": get_user_profile_snapshot(user_id, is_admin=is_admin),
+        "dashboard": get_dashboard_summary_payload(user_id),
+        "queue_status": get_current_user_queue_status_snapshot(user_id),
+        "upload_results": build_upload_results_summary_payload(upload_results),
+    }
+
+
+def format_sse_event(event: str, payload: dict[str, Any]) -> bytes:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {body}\n\n".encode("utf-8")
+
+
+async def stream_user_queue_events(user_id: int) -> Any:
+    subscription, last_version = _QUEUE_STATUS_EVENTS.subscribe(
+        user_id,
+        asyncio.get_running_loop(),
+    )
+    try:
+        initial_payload = get_current_user_queue_status_snapshot(user_id)
+        yield format_sse_event("queue_status", initial_payload)
+        keepalive_sec = max(10.0, _QUEUE_PUMP_INTERVAL_SEC * 3)
+        while True:
+            try:
+                version = await asyncio.wait_for(subscription.queue.get(), timeout=keepalive_sec)
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+                continue
+            if version <= last_version:
+                continue
+            last_version = version
+            payload = get_current_user_queue_status_snapshot(user_id)
+            yield format_sse_event("queue_status", payload)
+    finally:
+        _QUEUE_STATUS_EVENTS.unsubscribe(subscription)
+
+
+@app.get("/dashboard/leaderboard")
+def get_dashboard_leaderboard(
+    request: Request,
+    window: str | None = Query(default="24h"),
+    limit: int = Query(default=10, ge=1, le=10),
+) -> dict[str, Any]:
+    require_session_user(request)
+    window_sec = parse_window_to_seconds(window, 24 * 3600, max_seconds=7 * 24 * 3600)
+    limit = min(limit, 10)
+    key = build_dashboard_cache_key("dashboard-leaderboard", window_sec, limit)
+    return cache_json(key, get_cache_dashboard_ttl(), lambda: _DASHBOARD_CACHE.get_leaderboard(window_sec, limit))
+
+
+@app.get("/dashboard/summary")
+def get_dashboard_summary(
+    request: Request,
+    window: str | None = Query(default="7d"),
+    bucket: str | None = Query(default="1h"),
+    leaderboard_window: str | None = Query(default="24h"),
+    leaderboard_limit: int = Query(default=10, ge=1, le=10),
+    recent_limit: int = Query(default=10, ge=1, le=10),
+    contributor_limit: int = Query(default=10, ge=1, le=10),
+    recent_contributor_limit: int = Query(default=10, ge=1, le=10),
+) -> dict[str, Any]:
+    session = require_session_user(request)
+    return get_dashboard_summary_payload(
+        session["user_id"],
+        window=window,
+        bucket=bucket,
+        leaderboard_window=leaderboard_window,
+        leaderboard_limit=leaderboard_limit,
+        recent_limit=recent_limit,
+        contributor_limit=contributor_limit,
+        recent_contributor_limit=recent_contributor_limit,
+    )
 
 
 @app.get("/dashboard/recent-claims")
@@ -7161,7 +7399,6 @@ def list_claims(request: Request) -> dict[str, Any]:
 @app.get("/me/queue-status")
 def get_queue_status(request: Request) -> dict[str, Any]:
     session = require_session_user(request)
-    advance_claim_queue_on_demand(only_when_stock_hint=True)
     payload = get_current_user_queue_status_snapshot(session["user_id"])
     if get_cached_user_queue_snapshot(session["user_id"]) is None:
         return set_user_queue_snapshot(session["user_id"], payload)

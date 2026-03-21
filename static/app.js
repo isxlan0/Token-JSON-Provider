@@ -1,3 +1,6 @@
+import { createLeaderSyncController } from "./app/leader-sync.js?v=20260322e";
+import { createSummarySyncController } from "./app/summary-sync.js?v=20260322e";
+
 const state = {
   user: null,
   quota: null,
@@ -11,7 +14,6 @@ const state = {
   claimResults: [],
   claimSelected: new Set(),
   claimMultiMode: false,
-  refreshTimer: null,
   refreshing: false,
   queueStatus: null,
   queueSticky: false,
@@ -25,17 +27,60 @@ const state = {
   lastClaimTotal: null,
   claimsInitialized: false,
   skipNextClaimModal: false,
-  refreshCounter: 0,
   pendingHiddenClaimIds: new Set(),
   isClaimSubmitting: false,
   isClaimQueued: false,
   uploadPolicy: null,
   uploadQueue: [],
   uploadResults: [],
+  uploadResultsSummary: null,
+  uploadResultsLoaded: false,
   uploadHistory: [],
   isUploading: false,
   activeTab: "data",
+  queueStream: null,
+  queuePollTimer: null,
+  queuePollFailureCount: 0,
+  queuePollingActive: false,
+  uploadPollTimer: null,
+  uploadPollFailureCount: 0,
+  uploadResultsDirty: false,
+  lowFrequencyTimer: null,
+  claimsRequestTimer: null,
+  claimsDirty: false,
+  claimsLoadPromise: null,
+  claimsLoadShouldBroadcast: false,
+  visibilityHidden: document.visibilityState !== "visible",
+  tabId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  broadcastChannel: null,
+  crossTabBusMode: "none",
+  lastCrossTabMessageId: null,
+  currentLeader: null,
+  isPollingLeader: false,
+  leaderHeartbeatTimer: null,
+  leaderMonitorTimer: null,
+  leaderProbeTimer: null,
+  leaderRetryTimer: null,
+  leaderCandidate: null,
+  leaderCandidatePeers: new Map(),
+  lastLowFrequencyAt: 0,
 };
+
+const LOW_FREQUENCY_REFRESH_MS = 60000;
+const QUEUE_POLL_FAST_MS = 3000;
+const QUEUE_POLL_MAX_BACKOFF_MS = 120000;
+const LEADER_HEARTBEAT_MS = 10000;
+const LEADER_STALE_MS = 30000;
+const LEADER_PROBE_WAIT_MS = 400;
+const CLAIMS_REFRESH_DEBOUNCE_MS = 100;
+const LEADERSHIP_REASON_PRIORITY = Object.freeze({
+  background: 0,
+  visible: 0,
+  manual: 1,
+  "claim-view": 1,
+  "claim-queue": 1,
+  upload: 2,
+});
 
 const elements = {
   loadingScreen: document.getElementById("loading-screen"),
@@ -169,13 +214,24 @@ function switchTab(name) {
     headerTitle.textContent = map[name] || "数据面板";
   }
 
-  if (name === "claim" || name === "upload") {
-    refreshAll();
-  }
   if (name === "keys") {
     ensureApiKeysLoaded().catch((error) => {
       if (!handleAccessError(error)) {
         console.error("加载 API Keys 失败", error);
+      }
+    });
+  }
+  if (name === "claim") {
+    ensureClaimsLoaded().catch((error) => {
+      if (!handleAccessError(error)) {
+        console.error("加载领取记录失败", error);
+      }
+    });
+  }
+  if (name === "upload" && shouldLoadUploadResultsDetails()) {
+    loadUploadResultsSnapshot().catch((error) => {
+      if (!handleAccessError(error)) {
+        console.error("刷新上传结果失败", error);
       }
     });
   }
@@ -191,8 +247,192 @@ function setLoginMessage(message = "", tone = "error") {
   }
 }
 
-async function loadClaims() {
-  const payload = await fetchJson("/me/claims");
+const summarySync = createSummarySyncController({
+  getTabId: () => state.tabId,
+  getCurrentLeader: () => state.currentLeader,
+  hasCrossTabCoordination: () => hasCrossTabCoordination(),
+  isLeaderTab: () => state.isPollingLeader && state.currentLeader?.tabId === state.tabId,
+  canPerformPrimaryRefreshWork: () => canPerformPrimaryRefreshWork(),
+  requestLeadership: (...args) => claimPollingLeadership(...args),
+  broadcastMessage: (...args) => broadcastMessage(...args),
+  fetchJson,
+  handleAccessError,
+  applyRuntimeSnapshot,
+  applyDashboardSummary,
+});
+
+const leaderSync = createLeaderSyncController({
+  state,
+  constants: {
+    LEADER_HEARTBEAT_MS,
+    LEADER_STALE_MS,
+    LEADER_PROBE_WAIT_MS,
+    LEADERSHIP_REASON_PRIORITY,
+  },
+  shouldRunBackgroundRefresh,
+  onLeaderStatusChange: handleLeaderStatusChange,
+  onLeaderChanged: handleLeaderChanged,
+  onMessage: handleCrossTabMessage,
+  onTransportFailure: handleBroadcastTransportFailure,
+  onTransportReset: handleBroadcastTransportReset,
+});
+
+function hasCrossTabCoordination() {
+  return leaderSync.hasCrossTabCoordination();
+}
+
+function getLeadershipPriority(reason = "background") {
+  return leaderSync.getLeadershipPriority(reason);
+}
+
+function broadcastMessage(type, payload) {
+  return leaderSync.broadcastMessage(type, payload);
+}
+
+function releasePollingLeadership(reason = "release") {
+  return leaderSync.releasePollingLeadership(reason);
+}
+
+function claimPollingLeadership(force = false, options = {}) {
+  return leaderSync.claimPollingLeadership(force, options);
+}
+
+function takePollingLeadership(reason = "manual") {
+  return leaderSync.takePollingLeadership(reason);
+}
+
+function initBroadcastChannel() {
+  return leaderSync.initBroadcastChannel();
+}
+
+function disposeLeaderSync() {
+  return leaderSync.dispose();
+}
+
+function getDefaultUploadResultsSummary() {
+  return {
+    total: 0,
+    accepted: 0,
+    duplicates: 0,
+    invalid: 0,
+    rejected: 0,
+    db_busy: 0,
+    queued: 0,
+    processing: 0,
+  };
+}
+
+function normalizeUploadResultsSummary(summary) {
+  return {
+    ...getDefaultUploadResultsSummary(),
+    ...(summary || {}),
+  };
+}
+
+function renderUploadSummary(summary = {}) {
+  const normalized = normalizeUploadResultsSummary(summary);
+  elements.uploadSummary.textContent =
+    `本次共处理 ${normalized.total ?? 0} 个文件，成功 ${normalized.accepted ?? 0} 个，重复 ${normalized.duplicates ?? 0} 个` +
+    `${normalized.queued ? `，排队中 ${normalized.queued} 个` : ""}` +
+    `${normalized.processing ? `，处理中 ${normalized.processing} 个` : ""}` +
+    `${normalized.db_busy ? `，数据库繁忙 ${normalized.db_busy} 个` : ""}。`;
+  if ((normalized.total ?? 0) > 0) {
+    elements.uploadSummary.classList.remove("hidden");
+  } else {
+    elements.uploadSummary.classList.add("hidden");
+  }
+}
+
+function buildUploadResultsBroadcastPayload(payload) {
+  return {
+    batch_id: payload?.batch_id || null,
+    created_at: payload?.created_at || null,
+    summary: normalizeUploadResultsSummary(payload?.summary),
+  };
+}
+
+function applyUploadResultsSummaryPayload(payload) {
+  const normalized = buildUploadResultsBroadcastPayload(payload);
+  state.uploadResultsSummary = normalized.summary;
+  if (state.activeTab === "upload") {
+    renderUploadSummary(normalized.summary);
+  }
+  syncUploadResultsPolling();
+}
+
+function shouldLoadUploadResultsDetails() {
+  return !state.uploadResultsLoaded || state.uploadResultsDirty || shouldPollUploadResults();
+}
+
+function broadcastUploadResultsChanged(payload) {
+  broadcastMessage("upload_results_changed", buildUploadResultsBroadcastPayload(payload));
+}
+
+function broadcastClaimsPayload(payload) {
+  broadcastMessage("claims_payload", payload || { items: [] });
+}
+
+function clearClaimsRequestTimer() {
+  if (state.claimsRequestTimer) {
+    clearTimeout(state.claimsRequestTimer);
+    state.claimsRequestTimer = null;
+  }
+}
+
+function shouldRefreshClaimsDetails() {
+  return !state.visibilityHidden && state.activeTab === "claim";
+}
+
+function requestClaimsRefreshFromLeader(reason = "claims-sync") {
+  if (!hasCrossTabCoordination() || canPerformPrimaryRefreshWork()) {
+    return false;
+  }
+  broadcastMessage("claims_refresh_requested", {
+    reason,
+    sentAt: Date.now(),
+  });
+  return true;
+}
+
+function canFetchClaimsDirectly() {
+  return !hasCrossTabCoordination() || (
+    state.isPollingLeader &&
+    state.currentLeader?.tabId === state.tabId
+  );
+}
+
+function scheduleLeaderClaimsRefresh(reason = "claims-sync", delayMs = CLAIMS_REFRESH_DEBOUNCE_MS) {
+  if (!canFetchClaimsDirectly()) {
+    return;
+  }
+  if (state.claimsLoadPromise) {
+    state.claimsLoadShouldBroadcast = state.claimsLoadShouldBroadcast || hasCrossTabCoordination();
+    return;
+  }
+  if (state.claimsRequestTimer) {
+    return;
+  }
+  state.claimsRequestTimer = setTimeout(async () => {
+    state.claimsRequestTimer = null;
+    if (!canFetchClaimsDirectly()) {
+      return;
+    }
+    try {
+      await refreshClaimsByLeader(reason, { requestLeader: false });
+    } catch (error) {
+      if (!handleAccessError(error)) {
+        console.error("刷新领取记录失败", error);
+      }
+    }
+  }, Math.max(0, delayMs));
+}
+
+function applyUploadResultsChanged(payload) {
+  state.uploadResultsDirty = true;
+  applyUploadResultsSummaryPayload(payload);
+}
+
+function applyClaimsPayload(payload) {
   const hiddenIds = state.pendingHiddenClaimIds || new Set();
   const serverIds = new Set((payload.items || []).map((item) => item.claim_id));
   Array.from(hiddenIds).forEach((id) => {
@@ -211,16 +451,128 @@ async function loadClaims() {
   }
   state.skipNextClaimModal = false;
   state.lastClaimTotal = total;
+  state.claimsDirty = false;
   state.claimsInitialized = true;
   state.claimResults = items;
   state.claimSelected.clear();
+  state.claims = {
+    ...(state.claims || {}),
+    total,
+  };
+  renderMyClaims();
   renderClaimResults();
+}
+
+async function loadClaimsInternal(options = {}) {
+  const shouldBroadcast = Boolean(options.broadcast && hasCrossTabCoordination());
+  if (state.claimsLoadPromise) {
+    if (shouldBroadcast) {
+      state.claimsLoadShouldBroadcast = true;
+    }
+    return state.claimsLoadPromise;
+  }
+  state.claimsLoadShouldBroadcast = shouldBroadcast;
+  state.claimsLoadPromise = (async () => {
+    const payload = await fetchJson("/me/claims");
+    applyClaimsPayload(payload || {});
+    if (state.claimsLoadShouldBroadcast) {
+      broadcastClaimsPayload(payload || {});
+    }
+    return payload;
+  })();
+  try {
+    return await state.claimsLoadPromise;
+  } finally {
+    state.claimsLoadPromise = null;
+    state.claimsLoadShouldBroadcast = false;
+  }
+}
+
+async function refreshClaimsByLeader(reason = "claims-sync", options = {}) {
+  const requestLeader = options.requestLeader !== false;
+  state.claimsDirty = true;
+  if (canFetchClaimsDirectly()) {
+    return loadClaimsInternal({
+      broadcast: options.broadcast !== false && hasCrossTabCoordination(),
+      reason,
+    });
+  }
+  if (requestLeader) {
+    requestClaimsRefreshFromLeader(reason);
+    claimPollingLeadership(false, { reason });
+  }
+  return null;
+}
+
+function applyRuntimeSnapshot(payload) {
+  if (!payload) {
+    return;
+  }
+  if (payload.quota) {
+    state.quota = payload.quota;
+    renderQuota();
+  }
+  if (payload.claims) {
+    state.claims = payload.claims;
+    renderMyClaims();
+  }
+  if (payload.api_keys?.summary) {
+    applyApiKeySummary(payload.api_keys.summary);
+    if (state.activeTab === "keys") {
+      renderApiKeys();
+    }
+  }
+  if (payload.upload_results?.summary) {
+    applyUploadResultsSummaryPayload(payload.upload_results);
+  }
+}
+
+function applyDashboardSummary(summary) {
+  state.stats = summary?.stats || null;
+  state.leaderboard = summary?.leaderboard?.items || [];
+  state.recentClaims = summary?.recent?.items || [];
+  state.contributorLeaderboard = summary?.contributors?.items || [];
+  state.recentContributors = summary?.recent_contributors?.items || [];
+  state.trends = summary?.trends?.series || [];
+  state.trendsMeta = summary?.trends
+    ? { window: summary.trends.window, bucket: summary.trends.bucket }
+    : null;
+  state.systemStatus = summary?.system || null;
+  renderStats();
+  renderLeaderboard();
+  renderRecentClaims();
+  renderContributorLeaderboard();
+  renderRecentContributors();
+  renderSystemStatus();
+  renderTrends();
+}
+
+function applyBootstrapPayload(payload) {
+  resetCrossTabSummaryState("bootstrap");
+  const profile = payload?.profile || {};
+  state.user = profile.user || null;
+  state.quota = profile.quota || null;
+  state.claims = profile.claims || null;
+  state.uploadPolicy = profile.uploads || null;
+  state.uploadResults = [];
+  state.uploadHistory = [];
+  state.uploadResultsLoaded = false;
+  state.uploadResultsDirty = false;
+  applyApiKeySummary(profile.api_keys || {});
+  applyQueueStatusPayload(payload?.queue_status || { queued: false });
+  renderUser();
+  renderQuota();
+  renderMyClaims();
+  renderUploadPolicy();
+  applyDashboardSummary(payload?.dashboard || {});
+  renderUploadResults();
+  applyUploadResultsSummaryPayload(payload?.upload_results || {});
 }
 
 async function loadQueueStatus() {
   const payload = await fetchJson("/me/queue-status");
-  state.queueStatus = payload;
-  renderQueueStatus();
+  handleQueueStatusPayload(payload || {});
+  return payload;
 }
 
 
@@ -249,10 +601,11 @@ function renderQueueStatus() {
   const total = status.total_queued ?? "-";
   const available = status.available_tokens ?? "-";
   const remaining = status.remaining ?? status.requested ?? "-";
+  const modeLabel = state.queueStream ? "实时推送" : "低频补偿刷新";
   elements.claimSummary.textContent =
     `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。` +
     `当前可领取库存 ${available} 次，库存会优先发给前面排队用户。` +
-    "系统每隔 5 秒自动刷新。";
+    `当前使用${modeLabel}同步状态。`;
   elements.claimSummary.classList.remove("hidden");
   state.queueSticky = true;
 }
@@ -295,10 +648,7 @@ function handleAccessError(error) {
     };
     state.user = bannedUser;
     renderBannedUser(bannedUser);
-    if (state.refreshTimer) {
-      clearInterval(state.refreshTimer);
-      state.refreshTimer = null;
-    }
+    stopAllBackgroundActivity("access-denied");
     showScreen("banned");
     return true;
   }
@@ -587,31 +937,8 @@ function renderTrends() {
   elements.trendSummary.textContent = `最近 ${days || 1} 天：累计 ${total} 次认领，峰值为每小时 ${peak} 次。`;
 }
 
-async function loadDashboardSummary() {
-  try {
-    const summary = await fetchJson(
-      "/dashboard/summary?window=7d&bucket=1h&leaderboard_window=24h&leaderboard_limit=10&recent_limit=10&contributor_limit=10&recent_contributor_limit=10"
-    );
-    state.stats = summary.stats || null;
-    state.leaderboard = summary.leaderboard?.items || [];
-    state.recentClaims = summary.recent?.items || [];
-    state.contributorLeaderboard = summary.contributors?.items || [];
-    state.recentContributors = summary.recent_contributors?.items || [];
-    state.trends = summary.trends?.series || [];
-    state.trendsMeta = summary.trends
-      ? { window: summary.trends.window, bucket: summary.trends.bucket }
-      : null;
-    state.systemStatus = summary.system || null;
-  } catch (error) {
-    return;
-  }
-  renderStats();
-  renderLeaderboard();
-  renderRecentClaims();
-  renderContributorLeaderboard();
-  renderRecentContributors();
-  renderSystemStatus();
-  renderTrends();
+async function loadDashboardSummary(options = {}) {
+  return summarySync.loadDashboardSummary(options);
 }
 
 function formatKeyStatus(status) {
@@ -851,25 +1178,21 @@ function renderUploadResults() {
 }
 
 function applyUploadResultsPayload(payload) {
+  state.uploadResultsDirty = false;
+  state.uploadResultsLoaded = true;
   state.uploadResults = payload.items || [];
   state.uploadHistory = [];
+  applyUploadResultsSummaryPayload(payload);
   renderUploadResults();
-  const summary = payload.summary || {};
-  elements.uploadSummary.textContent =
-    `本次共处理 ${summary.total ?? 0} 个文件，成功 ${summary.accepted ?? 0} 个，重复 ${summary.duplicates ?? 0} 个` +
-    `${summary.queued ? `，排队中 ${summary.queued} 个` : ""}` +
-    `${summary.processing ? `，处理中 ${summary.processing} 个` : ""}` +
-    `${summary.db_busy ? `，数据库繁忙 ${summary.db_busy} 个` : ""}。`;
-  if ((summary.total ?? 0) > 0) {
-    elements.uploadSummary.classList.remove("hidden");
-  } else {
-    elements.uploadSummary.classList.add("hidden");
-  }
 }
 
-async function loadUploadResultsSnapshot() {
+async function loadUploadResultsSnapshot(options = {}) {
   const payload = await fetchJson("/me/uploads/results");
   applyUploadResultsPayload(payload || {});
+  if (options.broadcast) {
+    broadcastUploadResultsChanged(payload || {});
+  }
+  return payload;
 }
 
 function setUploadSubmitting(submitting) {
@@ -927,6 +1250,9 @@ async function uploadTokens() {
       body: JSON.stringify({ files }),
     });
     applyUploadResultsPayload(payload || {});
+    takePollingLeadership("upload");
+    broadcastUploadResultsChanged(payload || {});
+    syncUploadResultsPolling();
     const retryIndexes = new Set(
       state.uploadResults
         .filter((item) => item.status === "db_busy" && Number.isInteger(item.request_index))
@@ -939,7 +1265,7 @@ async function uploadTokens() {
     }
     renderUploadSelected();
     const followUpResults = await Promise.allSettled([
-      loadDashboardSummary(),
+      refreshSummariesByLeader("upload-success"),
       loadUploadResultsSnapshot(),
     ]);
     followUpResults.forEach((result) => {
@@ -976,12 +1302,18 @@ async function removeSelectedClaims() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ claim_ids: ids }),
+  }).then(() => {
+    refreshClaimsByLeader("claims-hidden").catch((error) => {
+      state.claimsDirty = true;
+      if (!handleAccessError(error)) {
+        console.error("刷新领取记录失败", error);
+      }
+    });
   }).catch((error) => {
     ids.forEach((id) => state.pendingHiddenClaimIds.delete(id));
     elements.claimError.textContent = error.message;
     elements.claimError.classList.remove("hidden");
-    loadClaimSummary().catch(() => {});
-    loadClaims().catch(() => {});
+    refreshClaimsByLeader("claims-hide-recover").catch(() => {});
   });
 }
 
@@ -1086,12 +1418,18 @@ function renderClaimResults() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ claim_ids: [item.claim_id] }),
+        }).then(() => {
+          refreshClaimsByLeader("claims-hidden").catch((error) => {
+            state.claimsDirty = true;
+            if (!handleAccessError(error)) {
+              console.error("刷新领取记录失败", error);
+            }
+          });
         }).catch((error) => {
           state.pendingHiddenClaimIds.delete(item.claim_id);
           elements.claimError.textContent = error.message;
           elements.claimError.classList.remove("hidden");
-          loadClaimSummary().catch(() => {});
-          loadClaims().catch(() => {});
+          refreshClaimsByLeader("claims-hide-recover").catch(() => {});
         });
       }
     });
@@ -1100,38 +1438,30 @@ function renderClaimResults() {
 }
 
 async function loadDashboard() {
-  const me = await fetchJson("/me");
-  state.user = me.user;
-  state.quota = me.quota;
-  state.claims = me.claims;
-  state.uploadPolicy = me.uploads || null;
-  applyApiKeySummary(me.api_keys || {});
-  renderUser();
-  renderQuota();
-  renderMyClaims();
-  renderUploadPolicy();
+  const bootstrap = await fetchJson("/me/bootstrap");
+  applyBootstrapPayload(bootstrap || {});
+  return bootstrap;
 }
 
-async function loadQuotaSummary() {
-  const quota = await fetchJson("/me/quota");
-  state.quota = quota;
-  renderQuota();
-}
-
-async function loadClaimSummary() {
-  const claims = await fetchJson("/me/claims-summary");
-  state.claims = claims;
-  renderMyClaims();
-}
-
-async function loadApiKeySummary() {
-  const summary = await fetchJson("/me/api-key-summary");
-  applyApiKeySummary(summary || {});
+async function loadRuntimeSnapshot(options = {}) {
+  return summarySync.loadRuntimeSnapshot(options);
 }
 
 async function loadApiKeys() {
   const keys = await fetchJson("/me/api-keys");
   applyApiKeysPayload(keys);
+}
+
+async function ensureClaimsLoaded(force = false) {
+  if (!force && state.claimsInitialized && !state.claimsDirty) {
+    renderClaimResults();
+    return;
+  }
+  if (!shouldRefreshClaimsDetails()) {
+    state.claimsDirty = true;
+    return;
+  }
+  await refreshClaimsByLeader(force ? "claim-view" : "claims-view");
 }
 
 async function ensureApiKeysLoaded(force = false) {
@@ -1154,6 +1484,14 @@ async function createApiKey() {
   elements.apiKeyName.value = "";
 
   applyApiKeysPayload(apiKeys);
+  applyRuntimeSnapshot({
+    api_keys: {
+      summary: {
+        limit: apiKeys?.limit || 0,
+        active: apiKeys?.active || 0,
+      },
+    },
+  });
   const displayKey = apiKeys?.items?.[0]?.token || "-";
   elements.apiKeyCreated.textContent = `已创建 Key：${displayKey}`;
   elements.apiKeyCreated.classList.remove("hidden");
@@ -1162,6 +1500,14 @@ async function createApiKey() {
 async function revokeApiKey(keyId) {
   const apiKeys = await fetchJson(`/me/api-keys/${keyId}/revoke`, { method: "POST" });
   applyApiKeysPayload(apiKeys);
+  applyRuntimeSnapshot({
+    api_keys: {
+      summary: {
+        limit: apiKeys?.limit || 0,
+        active: apiKeys?.active || 0,
+      },
+    },
+  });
 }
 
 async function claimTokens() {
@@ -1191,7 +1537,7 @@ async function claimTokens() {
     if (result.granted && result.granted > 0) {
       state.skipNextClaimModal = true;
     }
-    await loadClaims();
+    await refreshClaimsByLeader("claim-success");
     state.quota = result.quota || state.quota;
     renderQuota();
     if (result.granted && result.granted > 0) {
@@ -1211,13 +1557,13 @@ async function claimTokens() {
     }
     if (result.queued) {
       setClaimQueued(true);
-      state.queueStatus = {
+      takePollingLeadership("claim-queue");
+      handleQueueStatusPayload({
         queued: true,
         position: result.queue_position,
         remaining: result.queue_remaining,
         requested: result.requested,
-      };
-      renderQueueStatus();
+      }, { source: "action" });
     } else {
       setClaimQueued(false);
       state.queueStatus = { queued: false };
@@ -1229,7 +1575,16 @@ async function claimTokens() {
       }
     }
     renderClaimResults();
-    await loadQueueStatus();
+    const followUpTasks = [refreshSummariesByLeader("claim-success")];
+    if (result.queued) {
+      followUpTasks.push(loadQueueStatus());
+    }
+    const followUpResults = await Promise.allSettled(followUpTasks);
+    followUpResults.forEach((followUpResult) => {
+      if (followUpResult.status === "rejected") {
+        handleAccessError(followUpResult.reason);
+      }
+    });
   } catch (error) {
     setClaimQueued(false);
     elements.claimSummary.classList.add("hidden");
@@ -1266,12 +1621,18 @@ async function clearClaimResults() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ claim_ids: ids }),
+    }).then(() => {
+      refreshClaimsByLeader("claims-hidden").catch((error) => {
+        state.claimsDirty = true;
+        if (!handleAccessError(error)) {
+          console.error("刷新领取记录失败", error);
+        }
+      });
     }).catch((error) => {
       ids.forEach((id) => state.pendingHiddenClaimIds.delete(id));
       elements.claimError.textContent = error.message;
       elements.claimError.classList.remove("hidden");
-      loadClaimSummary().catch(() => {});
-      loadClaims().catch(() => {});
+      refreshClaimsByLeader("claims-hide-recover").catch(() => {});
     });
   }
 }
@@ -1282,58 +1643,364 @@ async function logout() {
   } catch (error) {
     console.error("退出登录失败", error);
   }
-  if (state.refreshTimer) {
-    clearInterval(state.refreshTimer);
-    state.refreshTimer = null;
-  }
+  releasePollingLeadership("logout");
+  stopAllBackgroundActivity("logout");
   showScreen("login");
 }
 
-async function refreshAll() {
-  if (state.refreshing) {
+function shouldRunBackgroundRefresh() {
+  return !state.visibilityHidden && !elements.appScreen.classList.contains("hidden");
+}
+
+function canPerformPrimaryRefreshWork() {
+  return !hasCrossTabCoordination() || state.isPollingLeader;
+}
+
+function resetCrossTabSummaryState(reason = "reset") {
+  summarySync.resetSessionState(reason);
+}
+
+function applyRuntimeSnapshotEnvelope(payload, options = {}) {
+  return summarySync.applyRuntimeSnapshotEnvelope(payload, options);
+}
+
+function applyDashboardSummaryEnvelope(payload, options = {}) {
+  return summarySync.applyDashboardSummaryEnvelope(payload, options);
+}
+
+function flushSummaryRefreshRequests() {
+  return summarySync.flushSummaryRefreshRequests();
+}
+
+function refreshSummariesByLeader(reason = "summary-sync", options = {}) {
+  return summarySync.refreshSummariesByLeader(reason, options);
+}
+
+function handleLeaderStatusChange(change = {}) {
+  if (change.isLeader) {
+    if (!change.wasLeader) {
+      scheduleLowFrequencyRefresh(0);
+      if (state.claimsDirty || (shouldRefreshClaimsDetails() && !state.claimsInitialized)) {
+        scheduleLeaderClaimsRefresh("leader-acquired", 0);
+      }
+    }
+    summarySync.handleLeaderStatusChange(change);
+    syncUploadResultsPolling();
+    syncQueueRealtimeTransport();
+    return;
+  }
+  summarySync.handleLeaderStatusChange(change);
+  stopLowFrequencyRefresh();
+  clearUploadResultsPoller();
+  stopQueueRealtime();
+  clearClaimsRequestTimer();
+}
+
+function handleLeaderChanged(change = {}) {
+  summarySync.handleLeaderChanged(change);
+}
+
+function handleBroadcastTransportFailure() {
+  summarySync.resetTransportState();
+}
+
+function handleBroadcastTransportReset() {
+  summarySync.resetTransportState();
+}
+
+function handleCrossTabMessage(message) {
+  if (message.type === "dashboard_summary") {
+    applyDashboardSummaryEnvelope(message.payload || {}, { requireVersion: true });
+    return;
+  }
+  if (message.type === "runtime_snapshot") {
+    applyRuntimeSnapshotEnvelope(message.payload || {}, { requireVersion: true });
+    return;
+  }
+  if (message.type === "queue_status") {
+    handleQueueStatusPayload(message.payload || { queued: false }, { broadcast: false, source: "broadcast" });
+    return;
+  }
+  if (message.type === "upload_results_changed") {
+    applyUploadResultsChanged(message.payload || {});
+    return;
+  }
+  if (message.type === "claims_payload") {
+    applyClaimsPayload(message.payload || {});
+    return;
+  }
+  if (message.type === "claims_refresh_requested") {
+    state.claimsDirty = true;
+    if (state.isPollingLeader && state.currentLeader?.tabId === state.tabId) {
+      scheduleLeaderClaimsRefresh("claims-requested", CLAIMS_REFRESH_DEBOUNCE_MS);
+    }
+    return;
+  }
+  if (message.type === "summary_refresh_requested") {
+    summarySync.handleSummaryRefreshRequested(message.payload || {}, message);
+  }
+}
+
+
+
+
+function stopLowFrequencyRefresh() {
+  if (state.lowFrequencyTimer) {
+    clearTimeout(state.lowFrequencyTimer);
+    state.lowFrequencyTimer = null;
+  }
+}
+
+function scheduleLowFrequencyRefresh(delayMs = LOW_FREQUENCY_REFRESH_MS) {
+  stopLowFrequencyRefresh();
+  if (!canPerformPrimaryRefreshWork() || !shouldRunBackgroundRefresh()) {
+    return;
+  }
+  state.lowFrequencyTimer = setTimeout(() => {
+    runLowFrequencyRefresh().catch((error) => {
+      if (!handleAccessError(error)) {
+        scheduleLowFrequencyRefresh(LOW_FREQUENCY_REFRESH_MS);
+      }
+    });
+  }, Math.max(0, delayMs));
+}
+
+async function runLowFrequencyRefresh() {
+  if (!canPerformPrimaryRefreshWork() || !shouldRunBackgroundRefresh() || state.refreshing) {
     return;
   }
   state.refreshing = true;
   try {
-    state.refreshCounter += 1;
-    const shouldRefreshClaims = state.refreshCounter % 4 === 0;
-    const results = await Promise.allSettled([
-      loadDashboardSummary(),
-      loadQueueStatus(),
-      loadQuotaSummary(),
-      loadApiKeySummary(),
-      loadUploadResultsSnapshot(),
-      ...(shouldRefreshClaims ? [loadClaimSummary(), loadClaims()] : []),
+    const [runtimeResult, dashboardResult] = await Promise.allSettled([
+      loadRuntimeSnapshot({ broadcast: true }),
+      loadDashboardSummary({ broadcast: true }),
     ]);
-    const accessHandled = results.some((result) => {
-      if (result.status !== "rejected") {
-        return false;
-      }
-      return handleAccessError(result.reason);
-    });
-    if (accessHandled) {
+    if (runtimeResult.status === "rejected" && handleAccessError(runtimeResult.reason)) {
       return;
     }
-    if (shouldRefreshClaims) {
-      // ignore refresh errors
+    if (dashboardResult.status === "rejected" && handleAccessError(dashboardResult.reason)) {
+      return;
     }
-  } catch (error) {
-    if (!handleAccessError(error)) {
-      // ignore refresh errors
-    }
+    state.lastLowFrequencyAt = Date.now();
   } finally {
     state.refreshing = false;
+    scheduleLowFrequencyRefresh(LOW_FREQUENCY_REFRESH_MS);
   }
 }
 
-function startAutoRefresh() {
-  if (state.refreshTimer) {
-    clearInterval(state.refreshTimer);
+function clearQueuePollTimer() {
+  if (state.queuePollTimer) {
+    clearTimeout(state.queuePollTimer);
+    state.queuePollTimer = null;
   }
-  state.refreshTimer = setInterval(refreshAll, 5000);
+  state.queuePollingActive = false;
+}
+
+function closeQueueStream() {
+  if (state.queueStream) {
+    state.queueStream.close();
+    state.queueStream = null;
+  }
+}
+
+function stopQueueRealtime() {
+  closeQueueStream();
+  clearQueuePollTimer();
+  state.queuePollingActive = false;
+}
+
+function canUseLeaderQueueTransport() {
+  return Boolean(canPerformPrimaryRefreshWork() && !state.visibilityHidden && state.queueStatus?.queued);
+}
+
+function applyQueueStatusPayload(payload) {
+  state.queueStatus = payload || { queued: false };
+  renderQueueStatus();
+}
+
+function broadcastQueueStatus(payload, options = {}) {
+  if (options.broadcast === false) {
+    return;
+  }
+  broadcastMessage("queue_status", payload);
+}
+
+function handleQueueExitTransition(wasQueued, nextQueued, options = {}) {
+  if (!wasQueued || nextQueued || options.silentRefresh) {
+    return;
+  }
+  if (options.source === "broadcast" || !canPerformPrimaryRefreshWork()) {
+    return;
+  }
+  Promise.allSettled([
+    refreshSummariesByLeader("queue-exit", { requestLeader: false }),
+    refreshClaimsByLeader("queue-exit", { requestLeader: false }),
+  ]).then((results) => {
+    results.forEach((result) => {
+      if (result.status === "rejected") {
+        handleAccessError(result.reason);
+      }
+    });
+  });
+}
+
+function syncQueueRealtimeTransport() {
+  if (!canUseLeaderQueueTransport()) {
+    stopQueueRealtime();
+    return;
+  }
+  if (state.queueStream || state.queuePollingActive) {
+    return;
+  }
+  startQueueRealtime();
+}
+
+function scheduleQueuePoll(delayMs) {
+  clearQueuePollTimer();
+  if (!canUseLeaderQueueTransport()) {
+    return;
+  }
+  state.queuePollingActive = true;
+  state.queuePollTimer = setTimeout(() => {
+    pollQueueStatus().catch((error) => {
+      if (!handleAccessError(error)) {
+        const backoff = Math.min(
+          QUEUE_POLL_MAX_BACKOFF_MS,
+          QUEUE_POLL_FAST_MS * (2 ** Math.max(0, state.queuePollFailureCount))
+        );
+        scheduleQueuePoll(backoff);
+      }
+    });
+  }, Math.max(0, delayMs));
+}
+
+function handleQueueStatusPayload(payload, options = {}) {
+  const wasQueued = Boolean(state.queueStatus?.queued);
+  applyQueueStatusPayload(payload || { queued: false });
+  broadcastQueueStatus(state.queueStatus, options);
+  syncQueueRealtimeTransport();
+  handleQueueExitTransition(wasQueued, Boolean(state.queueStatus?.queued), options);
+}
+
+async function pollQueueStatus() {
+  if (!canUseLeaderQueueTransport()) {
+    stopQueueRealtime();
+    return;
+  }
+  const payload = await fetchJson("/me/queue-status");
+  state.queuePollFailureCount = 0;
+  state.queuePollingActive = false;
+  handleQueueStatusPayload(payload || {});
+  if (payload?.queued) {
+    scheduleQueuePoll(QUEUE_POLL_FAST_MS);
+  }
+}
+
+function startQueueFallbackPolling(immediate = false) {
+  closeQueueStream();
+  state.queuePollingActive = false;
+  if (!canUseLeaderQueueTransport()) {
+    return;
+  }
+  const delay = immediate
+    ? 0
+    : Math.min(
+      QUEUE_POLL_MAX_BACKOFF_MS,
+      QUEUE_POLL_FAST_MS * (2 ** Math.max(0, state.queuePollFailureCount))
+    );
+  scheduleQueuePoll(delay);
+}
+
+function startQueueRealtime() {
+  if (!canUseLeaderQueueTransport()) {
+    stopQueueRealtime();
+    return;
+  }
+  if (typeof EventSource === "undefined") {
+    startQueueFallbackPolling(true);
+    return;
+  }
+  if (state.queueStream) {
+    return;
+  }
+  clearQueuePollTimer();
+  const stream = new EventSource("/me/queue-stream");
+  state.queueStream = stream;
+  stream.addEventListener("queue_status", (event) => {
+    try {
+      const payload = JSON.parse(event.data || "{}");
+      state.queuePollFailureCount = 0;
+      handleQueueStatusPayload(payload || {});
+    } catch (error) {
+      console.error("解析队列事件失败", error);
+    }
+  });
+  stream.onerror = () => {
+    if (state.queueStream !== stream) {
+      return;
+    }
+    closeQueueStream();
+    state.queuePollFailureCount += 1;
+    startQueueFallbackPolling(false);
+  };
+}
+
+function clearUploadResultsPoller() {
+  if (state.uploadPollTimer) {
+    clearTimeout(state.uploadPollTimer);
+    state.uploadPollTimer = null;
+  }
+}
+
+function shouldPollUploadResults() {
+  const summary = state.uploadResultsSummary || {};
+  return (summary.queued || 0) > 0 || (summary.processing || 0) > 0;
+}
+
+function syncUploadResultsPolling() {
+  clearUploadResultsPoller();
+  if (state.visibilityHidden || !canPerformPrimaryRefreshWork() || !shouldPollUploadResults()) {
+    return;
+  }
+  const delay = Math.min(
+    QUEUE_POLL_MAX_BACKOFF_MS,
+    QUEUE_POLL_FAST_MS * (2 ** Math.max(0, state.uploadPollFailureCount))
+  );
+  state.uploadPollTimer = setTimeout(async () => {
+    try {
+      await loadUploadResultsSnapshot({ broadcast: true });
+      state.uploadPollFailureCount = 0;
+    } catch (error) {
+      state.uploadPollFailureCount += 1;
+      if (handleAccessError(error)) {
+        return;
+      }
+    }
+    syncUploadResultsPolling();
+  }, delay);
+}
+
+function stopAllBackgroundActivity(reason = "stop") {
+  if (state.isPollingLeader) {
+    releasePollingLeadership(reason);
+  }
+  disposeLeaderSync();
+  stopLowFrequencyRefresh();
+  stopQueueRealtime();
+  clearUploadResultsPoller();
+  clearClaimsRequestTimer();
+  resetCrossTabSummaryState(reason);
 }
 
 function bindEvents() {
+  initBroadcastChannel();
+  if (!state.leaderMonitorTimer) {
+    state.leaderMonitorTimer = setInterval(() => {
+      if (!state.isPollingLeader) {
+        claimPollingLeadership();
+      }
+    }, LEADER_HEARTBEAT_MS);
+  }
   if (elements.loginBtn) {
     elements.loginBtn.addEventListener("click", () => {
       window.location.href = "/auth/linuxdo/login";
@@ -1433,6 +2100,32 @@ function bindEvents() {
       }
     });
   }
+  document.addEventListener("visibilitychange", () => {
+    state.visibilityHidden = document.visibilityState !== "visible";
+    if (state.visibilityHidden) {
+      releasePollingLeadership("hidden");
+      stopLowFrequencyRefresh();
+      stopQueueRealtime();
+      clearUploadResultsPoller();
+      clearClaimsRequestTimer();
+      return;
+    }
+    claimPollingLeadership();
+    if (state.activeTab === "claim") {
+      ensureClaimsLoaded(true).catch(() => {});
+    }
+    syncQueueRealtimeTransport();
+    syncUploadResultsPolling();
+  });
+  window.addEventListener("beforeunload", () => {
+    releasePollingLeadership("unload");
+    if (state.leaderMonitorTimer) {
+      clearInterval(state.leaderMonitorTimer);
+      state.leaderMonitorTimer = null;
+    }
+    disposeLeaderSync();
+    stopAllBackgroundActivity("unload");
+  });
 }
 
 async function init() {
@@ -1449,10 +2142,7 @@ async function init() {
     applyDocsBaseUrl();
     const status = await fetchJson("/auth/status");
     if (!status.authenticated) {
-      if (state.refreshTimer) {
-        clearInterval(state.refreshTimer);
-        state.refreshTimer = null;
-      }
+      stopAllBackgroundActivity("unauthenticated");
       showScreen("login");
       if (authError) {
         setLoginMessage(`登录失败：${authError}`, "error");
@@ -1463,22 +2153,15 @@ async function init() {
       showScreen("banned");
     } else {
       showScreen("app");
+      await loadDashboard();
       switchTab("data");
-      await Promise.all([
-        loadDashboard(),
-        loadDashboardSummary(),
-        loadClaims(),
-        loadQueueStatus(),
-        loadUploadResultsSnapshot(),
-      ]);
-      startAutoRefresh();
+      claimPollingLeadership();
+      syncQueueRealtimeTransport();
+      syncUploadResultsPolling();
     }
   } catch (error) {
     if (error.status === 401) {
-      if (state.refreshTimer) {
-        clearInterval(state.refreshTimer);
-        state.refreshTimer = null;
-      }
+      stopAllBackgroundActivity("auth-expired");
       showScreen("login");
       if (authError) {
         setLoginMessage(`登录失败：${authError}`, "error");
