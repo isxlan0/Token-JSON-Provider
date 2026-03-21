@@ -1953,34 +1953,27 @@ async function downloadClaimFile(item, trigger = null) {
 
 async function downloadAllClaims() {
   hideClaimErrorMessage();
-  if (!state.claimsInitialized && !state.claimResults.length) {
-    try {
-      await ensureClaimsLoaded();
-    } catch (error) {
-      if (!handleAccessError(error)) {
-        showClaimErrorMessage(error.message || "加载领取记录失败。");
-      }
-      return;
-    }
-  }
-
-  const items = Array.isArray(state.claimResults) ? state.claimResults.filter(Boolean) : [];
-  if (!items.length) {
-    showClaimErrorMessage("当前没有可下载的账号。");
-    return;
-  }
-
-  setClaimDownloadAllBusy(true, items.length);
+  const previousSkipNextClaimModal = state.skipNextClaimModal;
+  setClaimDownloadAllBusy(true);
   try {
+    state.skipNextClaimModal = true;
     try {
-      const payload = buildClaimsArchiveDownload(items);
-      triggerBrowserDownload(payload.blob, payload.filename);
-    } catch (directArchiveError) {
-      await downloadFileWithValidation("/me/claims/archive", {
-        expectedContentType: "application/zip",
-        fallbackFilename: `claimed-${formatArchiveTimestamp(new Date())}.zip`,
+      await loadClaimsInternal({
+        broadcast: hasCrossTabCoordination(),
       });
+    } catch (error) {
+      state.skipNextClaimModal = previousSkipNextClaimModal;
+      throw error;
     }
+
+    const items = Array.isArray(state.claimResults) ? state.claimResults.filter(Boolean) : [];
+    if (!items.length) {
+      throw new Error("当前没有可下载的账号。");
+    }
+
+    setClaimDownloadAllBusy(true, items.length);
+    const payload = buildClaimsArchiveDownload(items);
+    triggerBrowserDownload(payload.blob, payload.filename);
   } catch (error) {
     if (!handleAccessError(error)) {
       showClaimErrorMessage(error.message || "下载账号归档失败。");
