@@ -2,43 +2,57 @@ package claim
 
 import "sync"
 
-type queueStatusEventBroker struct {
+type userEventBroker struct {
 	mu           sync.Mutex
 	nextID       int
-	entriesByUID map[int64]*queueStatusEventEntry
+	entriesByUID map[int64]*userEventEntry
 }
 
-type queueStatusEventEntry struct {
+type userEventEntry struct {
 	version       int
-	subscriptions map[int]*queueStatusSubscription
+	subscriptions map[int]*userEventSubscription
 }
 
-type queueStatusSubscription struct {
+type userEventSubscription struct {
 	userID int64
 	id     int
 	ch     chan int
 }
 
-func newQueueStatusEventBroker() *queueStatusEventBroker {
-	return &queueStatusEventBroker{
-		entriesByUID: make(map[int64]*queueStatusEventEntry),
+type queueStatusEventBroker = userEventBroker
+type queueStatusSubscription = userEventSubscription
+
+type uploadResultsEventBroker = userEventBroker
+type uploadResultsSubscription = userEventSubscription
+
+func newUserEventBroker() *userEventBroker {
+	return &userEventBroker{
+		entriesByUID: make(map[int64]*userEventEntry),
 	}
 }
 
-func (b *queueStatusEventBroker) subscribe(userID int64) (*queueStatusSubscription, int) {
+func newQueueStatusEventBroker() *queueStatusEventBroker {
+	return newUserEventBroker()
+}
+
+func newUploadResultsEventBroker() *uploadResultsEventBroker {
+	return newUserEventBroker()
+}
+
+func (b *userEventBroker) subscribe(userID int64) (*userEventSubscription, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	entry := b.entriesByUID[userID]
 	if entry == nil {
-		entry = &queueStatusEventEntry{
-			subscriptions: make(map[int]*queueStatusSubscription),
+		entry = &userEventEntry{
+			subscriptions: make(map[int]*userEventSubscription),
 		}
 		b.entriesByUID[userID] = entry
 	}
 
 	b.nextID++
-	subscription := &queueStatusSubscription{
+	subscription := &userEventSubscription{
 		userID: userID,
 		id:     b.nextID,
 		ch:     make(chan int, 1),
@@ -47,7 +61,7 @@ func (b *queueStatusEventBroker) subscribe(userID int64) (*queueStatusSubscripti
 	return subscription, entry.version
 }
 
-func (b *queueStatusEventBroker) unsubscribe(subscription *queueStatusSubscription) {
+func (b *userEventBroker) unsubscribe(subscription *userEventSubscription) {
 	if subscription == nil {
 		return
 	}
@@ -65,7 +79,7 @@ func (b *queueStatusEventBroker) unsubscribe(subscription *queueStatusSubscripti
 	}
 }
 
-func (b *queueStatusEventBroker) notify(userID int64) int {
+func (b *userEventBroker) notify(userID int64) int {
 	b.mu.Lock()
 	entry := b.entriesByUID[userID]
 	if entry == nil || len(entry.subscriptions) == 0 {
@@ -74,7 +88,7 @@ func (b *queueStatusEventBroker) notify(userID int64) int {
 	}
 	entry.version++
 	version := entry.version
-	subscriptions := make([]*queueStatusSubscription, 0, len(entry.subscriptions))
+	subscriptions := make([]*userEventSubscription, 0, len(entry.subscriptions))
 	for _, subscription := range entry.subscriptions {
 		subscriptions = append(subscriptions, subscription)
 	}

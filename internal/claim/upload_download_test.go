@@ -144,6 +144,141 @@ func TestDuplicateUploadSubmissionReceivesFinalStatusFromPendingTask(t *testing.
 	}
 }
 
+func TestQueueUploadBatchRefreshesQueuedPositionsWithinSameBatch(t *testing.T) {
+	service, store := newClaimTestService(t)
+
+	userID := insertTestUser(t, store, "2003", "queue-refresh")
+
+	taskOne := uploadTask{
+		BatchID:         "batch-queue-refresh",
+		UserID:          userID,
+		RequestIndex:    0,
+		FileName:        "first.json",
+		AccountID:       "acct-queue-1",
+		AccessTokenHash: hashTokenValue("token-queue-1"),
+	}
+	taskTwo := uploadTask{
+		BatchID:         "batch-queue-refresh",
+		UserID:          userID,
+		RequestIndex:    1,
+		FileName:        "second.json",
+		AccountID:       "acct-queue-2",
+		AccessTokenHash: hashTokenValue("token-queue-2"),
+	}
+
+	if existing, _ := service.reserveUploadTask(taskOne); existing != nil {
+		t.Fatalf("expected first reserved task to be unique, got %#v", existing)
+	}
+	if existing, _ := service.reserveUploadTask(taskTwo); existing != nil {
+		t.Fatalf("expected second reserved task to be unique, got %#v", existing)
+	}
+
+	initialItems := service.refreshPendingUploadResultItems([]map[string]any{
+		{
+			"request_index": 0,
+			"file_name":     "first.json",
+			"account_id":    "acct-queue-1",
+		},
+		{
+			"request_index": 1,
+			"file_name":     "second.json",
+			"account_id":    "acct-queue-2",
+		},
+	})
+	service.setUploadSnapshot(userID, uploadSnapshot{
+		BatchID:   taskOne.BatchID,
+		CreatedAt: isoformatNow(),
+		Items:     initialItems,
+	})
+
+	payload := service.GetUploadResults(userID)
+	items := payload["items"].([]map[string]any)
+	if got := intFromAny(items[0]["queue_position"]); got != 1 {
+		t.Fatalf("expected first item queue position 1, got %#v", items[0])
+	}
+	if got := intFromAny(items[0]["queue_total"]); got != 2 {
+		t.Fatalf("expected first item queue total 2, got %#v", items[0])
+	}
+	if got := intFromAny(items[1]["queue_position"]); got != 2 {
+		t.Fatalf("expected second item queue position 2, got %#v", items[1])
+	}
+	if got := intFromAny(items[1]["queue_total"]); got != 2 {
+		t.Fatalf("expected second item queue total 2, got %#v", items[1])
+	}
+
+	service.markUploadTaskProcessing(taskOne)
+
+	payload = service.GetUploadResults(userID)
+	items = payload["items"].([]map[string]any)
+	if got := items[0]["status"]; got != "processing" {
+		t.Fatalf("expected first item to enter processing, got %#v", items[0])
+	}
+	if got := items[1]["status"]; got != "queued" {
+		t.Fatalf("expected second item to remain queued, got %#v", items[1])
+	}
+	if got := intFromAny(items[1]["queue_position"]); got != 1 {
+		t.Fatalf("expected second item queue position to refresh to 1, got %#v", items[1])
+	}
+	if got := intFromAny(items[1]["queue_total"]); got != 1 {
+		t.Fatalf("expected second item queue total to refresh to 1, got %#v", items[1])
+	}
+}
+
+func TestUploadProgressIncludesTimelineEvents(t *testing.T) {
+	service, store := newClaimTestService(t)
+	probe := newBlockingProbe()
+	service.probe = probe
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.Start(ctx)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	userID := insertTestUser(t, store, "2004", "timeline-uploader")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "2004",
+			Username:   "timeline-uploader",
+			Name:       "Timeline Uploader",
+			TrustLevel: 2,
+		},
+	}
+
+	files := []uploadFileInput{{
+		Name:          "timeline.json",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(`{"account_id":"acct-timeline","access_token":"token-timeline","refresh_token":"refresh-timeline"}`)),
+	}}
+
+	if _, err := service.QueueUploadBatch(context.Background(), requestContext, files); err != nil {
+		t.Fatalf("queue upload batch: %v", err)
+	}
+
+	probe.waitUntilStarted(t)
+
+	payload := service.GetUploadResults(userID)
+	items := payload["items"].([]map[string]any)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 upload item, got %#v", payload)
+	}
+	item := items[0]
+	if got := item["stage"]; got != "probing" {
+		t.Fatalf("expected stage probing while probe is running, got %#v", item)
+	}
+	events, ok := item["events"].([]map[string]any)
+	if !ok || len(events) < 3 {
+		t.Fatalf("expected upload timeline events, got %#v", item["events"])
+	}
+	last := events[len(events)-1]
+	if got := last["label"]; got != "开始测试" {
+		t.Fatalf("expected latest timeline event to be 开始测试, got %#v", last)
+	}
+
+	probe.release()
+}
+
 func TestClaimDownloadAccessSummaryHonorsHiddenAndOtherVisibleClaims(t *testing.T) {
 	service, store := newClaimTestService(t)
 	ctx := context.Background()

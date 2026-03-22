@@ -51,6 +51,7 @@ type Service struct {
 	systemIndexUpdatedAt string
 
 	queueEvents     *queueStatusEventBroker
+	uploadEvents    *uploadResultsEventBroker
 	hideClaimsCh    chan hideClaimsTask
 	uploadTaskCh    chan uploadTask
 	uploadMu        sync.Mutex
@@ -206,6 +207,7 @@ func NewService(cfg config.Config, store *database.Store, authService *auth.Serv
 		wakeCh:               make(chan struct{}, 1),
 		systemIndexUpdatedAt: isoformatNow(),
 		queueEvents:          newQueueStatusEventBroker(),
+		uploadEvents:         newUploadResultsEventBroker(),
 		hideClaimsCh:         make(chan hideClaimsTask, 256),
 		uploadTaskCh:         make(chan uploadTask, 128),
 		uploadSnapshots:      make(map[int64]uploadSnapshot),

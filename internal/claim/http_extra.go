@@ -96,6 +96,72 @@ func (s *Service) getQueueStream(c echo.Context) error {
 	}
 }
 
+func (s *Service) getUploadResultsStream(c echo.Context) error {
+	requestContext, ok := auth.RequestContextFromEcho(c)
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
+	}
+
+	response := c.Response()
+	response.Header().Set(echo.HeaderContentType, "text/event-stream")
+	response.Header().Set(echo.HeaderCacheControl, "no-cache")
+	response.Header().Set("Connection", "keep-alive")
+	response.Header().Set("X-Accel-Buffering", "no")
+	response.WriteHeader(http.StatusOK)
+
+	flusher, ok := response.Writer.(http.Flusher)
+	if !ok {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Streaming unsupported.")
+	}
+
+	subscription, lastVersion := s.uploadEvents.subscribe(requestContext.UserID)
+	defer s.uploadEvents.unsubscribe(subscription)
+
+	writeResults := func() error {
+		payload := s.GetUploadResults(requestContext.UserID)
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := response.Write([]byte("event: upload_results\ndata: " + string(body) + "\n\n")); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	if err := writeResults(); err != nil {
+		return err
+	}
+
+	keepAliveSec := 10 * time.Second
+	if queuePumpInterval*3 > keepAliveSec {
+		keepAliveSec = queuePumpInterval * 3
+	}
+	keepAliveTicker := time.NewTicker(keepAliveSec)
+	defer keepAliveTicker.Stop()
+
+	for {
+		select {
+		case <-c.Request().Context().Done():
+			return nil
+		case version := <-subscription.ch:
+			if version == lastVersion {
+				continue
+			}
+			lastVersion = version
+			if err := writeResults(); err != nil {
+				return nil
+			}
+		case <-keepAliveTicker.C:
+			if _, err := response.Write([]byte(": keepalive\n\n")); err != nil {
+				return nil
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 func (s *Service) uploadTokens(c echo.Context) error {
 	if err := s.requireWebUploadRequest(c); err != nil {
 		return err

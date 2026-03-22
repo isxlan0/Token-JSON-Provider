@@ -34,6 +34,7 @@ func (s *Service) RegisterRoutes(e *echo.Echo) {
 	me.GET("/queue-status", s.getQueueStatus)
 	me.GET("/queue-stream", s.getQueueStream)
 	me.GET("/uploads/results", s.getUploadResults)
+	me.GET("/uploads/stream", s.getUploadResultsStream)
 	me.POST("/uploads/tokens", s.uploadTokens)
 	me.POST("/claim", s.claimBySession)
 

@@ -39,6 +39,7 @@ const state = {
   isUploading: false,
   activeTab: "data",
   queueStream: null,
+  uploadStream: null,
   queuePollTimer: null,
   queuePollFailureCount: 0,
   queuePollingActive: false,
@@ -331,11 +332,25 @@ function normalizeUploadResultsSummary(summary) {
 
 function renderUploadSummary(summary = {}) {
   const normalized = normalizeUploadResultsSummary(summary);
-  elements.uploadSummary.textContent =
-    `本次共处理 ${normalized.total ?? 0} 个文件，成功 ${normalized.accepted ?? 0} 个，重复 ${normalized.duplicates ?? 0} 个` +
-    `${normalized.queued ? `，排队中 ${normalized.queued} 个` : ""}` +
-    `${normalized.processing ? `，处理中 ${normalized.processing} 个` : ""}` +
-    `${normalized.db_busy ? `，数据库繁忙 ${normalized.db_busy} 个` : ""}。`;
+  const parts = [
+    `本次共处理 ${normalized.total ?? 0} 个文件`,
+    `成功 ${normalized.accepted ?? 0} 个`,
+    `重复 ${normalized.duplicates ?? 0} 个`,
+  ];
+  if (normalized.queued) {
+    parts.push(`等待中 ${normalized.queued} 个`);
+  }
+  if (normalized.processing) {
+    parts.push(`测试或入库中 ${normalized.processing} 个`);
+  }
+  if (normalized.db_busy) {
+    parts.push(`数据库繁忙 ${normalized.db_busy} 个`);
+  }
+  let message = `${parts.join("，")}。`;
+  if ((normalized.queued ?? 0) > 0 || (normalized.processing ?? 0) > 0) {
+    message += ` 当前使用${state.uploadStream ? "实时推送" : "自动刷新"}同步上传进度。`;
+  }
+  elements.uploadSummary.textContent = message;
   if ((normalized.total ?? 0) > 0) {
     elements.uploadSummary.classList.remove("hidden");
   } else {
@@ -348,6 +363,9 @@ function buildUploadResultsBroadcastPayload(payload) {
     batch_id: payload?.batch_id || null,
     created_at: payload?.created_at || null,
     summary: normalizeUploadResultsSummary(payload?.summary),
+    items: Array.isArray(payload?.items) ? payload.items : null,
+    history: Array.isArray(payload?.history) ? payload.history : [],
+    queue_status: payload?.queue_status || null,
   };
 }
 
@@ -357,7 +375,7 @@ function applyUploadResultsSummaryPayload(payload) {
   if (state.activeTab === "upload") {
     renderUploadSummary(normalized.summary);
   }
-  syncUploadResultsPolling();
+  syncUploadResultsTransport();
 }
 
 function shouldLoadUploadResultsDetails() {
@@ -428,6 +446,10 @@ function scheduleLeaderClaimsRefresh(reason = "claims-sync", delayMs = CLAIMS_RE
 }
 
 function applyUploadResultsChanged(payload) {
+  if (Array.isArray(payload?.items)) {
+    applyUploadResultsPayload(payload);
+    return;
+  }
   state.uploadResultsDirty = true;
   applyUploadResultsSummaryPayload(payload);
 }
@@ -969,7 +991,7 @@ function handleAccessError(error) {
       ...(error.payload.user || {}),
       ban_reason: error.payload.ban.reason,
       ban_expires_at: error.payload.ban.expires_at,
-      is_admin: Boolean(state.user?.is_admin),
+      is_admin: Boolean(error.payload.user?.is_admin ?? state.user?.is_admin),
     };
     state.user = bannedUser;
     renderBannedUser(bannedUser);
@@ -1534,6 +1556,39 @@ function uploadStatusLabel(status) {
   return map[status] || status || "-";
 }
 
+function normalizeUploadEvents(events) {
+  if (!Array.isArray(events)) {
+    return [];
+  }
+  return events.filter((event) => event && typeof event === "object");
+}
+
+function currentUploadStageLabel(item = {}) {
+  return item.stage_label || uploadStatusLabel(item.status);
+}
+
+function buildUploadProgressMeta(item = {}) {
+  const meta = [];
+  const queuePosition = Number(item.queue_position);
+  const queueTotal = Number(item.queue_total);
+  if (
+    item.status === "queued" &&
+    Number.isFinite(queuePosition) &&
+    queuePosition > 0 &&
+    Number.isFinite(queueTotal) &&
+    queueTotal > 0
+  ) {
+    meta.push(`等待 ${queuePosition}/${queueTotal}`);
+  }
+  if (item.updated_at) {
+    meta.push(`更新于 ${formatDateTime(item.updated_at)}`);
+  }
+  if (item.account_id) {
+    meta.push(`账号 ${item.account_id}`);
+  }
+  return meta;
+}
+
 function renderUploadResults() {
   const list = elements.uploadResults;
   if (!list) {
@@ -1548,15 +1603,40 @@ function renderUploadResults() {
     return;
   }
   state.uploadResults.forEach((item) => {
+    const stageLabel = currentUploadStageLabel(item);
+    const detail = item.detail || item.reason || "-";
+    const events = normalizeUploadEvents(item.events).slice(-4);
+    const meta = buildUploadProgressMeta(item);
     const row = document.createElement("div");
     row.className = "upload-result-item";
     row.innerHTML = `
       <div class="upload-result-main">
-        <div class="upload-selected-name">${escapeHtml(item.file_name || "-")}</div>
-        <div class="upload-selected-meta">${escapeHtml(item.reason || "-")}</div>
-      </div>
-      <div class="upload-result-status is-${item.status}">
-        <span>${uploadStatusLabel(item.status)}</span>
+        <div class="upload-result-header">
+          <div class="grow">
+            <div class="upload-selected-name">${escapeHtml(item.file_name || "-")}</div>
+            <div class="upload-result-stage">${escapeHtml(stageLabel)}</div>
+          </div>
+          <div class="upload-result-status is-${item.status}">
+            <span>${uploadStatusLabel(item.status)}</span>
+          </div>
+        </div>
+        <div class="upload-selected-meta">${escapeHtml(detail)}</div>
+        ${meta.length ? `
+          <div class="upload-result-meta-row">
+            ${meta.map((entry) => `<span class="upload-result-meta-chip">${escapeHtml(entry)}</span>`).join("")}
+          </div>
+        ` : ""}
+        ${events.length ? `
+          <div class="upload-result-events">
+            ${events.map((event) => `
+              <div class="upload-result-event">
+                <div class="upload-result-event-label">${escapeHtml(event.label || event.stage || "-")}</div>
+                <div class="upload-result-event-detail">${escapeHtml(event.detail || "-")}</div>
+                <div class="upload-result-event-time">${escapeHtml(event.at ? formatDateTime(event.at) : "-")}</div>
+              </div>
+            `).join("")}
+          </div>
+        ` : ""}
       </div>
     `;
     list.appendChild(row);
@@ -1567,7 +1647,7 @@ function applyUploadResultsPayload(payload) {
   state.uploadResultsDirty = false;
   state.uploadResultsLoaded = true;
   state.uploadResults = payload.items || [];
-  state.uploadHistory = [];
+  state.uploadHistory = payload.history || [];
   applyUploadResultsSummaryPayload(payload);
   renderUploadResults();
 }
@@ -1638,7 +1718,7 @@ async function uploadTokens() {
     applyUploadResultsPayload(payload || {});
     takePollingLeadership("upload");
     broadcastUploadResultsChanged(payload || {});
-    syncUploadResultsPolling();
+    syncUploadResultsTransport();
     const retryIndexes = new Set(
       state.uploadResults
         .filter((item) => item.status === "db_busy" && Number.isInteger(item.request_index))
@@ -2126,12 +2206,13 @@ function handleLeaderStatusChange(change = {}) {
       }
     }
     summarySync.handleLeaderStatusChange(change);
-    syncUploadResultsPolling();
+    syncUploadResultsTransport();
     syncQueueRealtimeTransport();
     return;
   }
   summarySync.handleLeaderStatusChange(change);
   stopLowFrequencyRefresh();
+  closeUploadResultsStream();
   clearUploadResultsPoller();
   stopQueueRealtime();
   clearClaimsRequestTimer();
@@ -2393,14 +2474,73 @@ function clearUploadResultsPoller() {
   }
 }
 
+function closeUploadResultsStream() {
+  if (state.uploadStream) {
+    state.uploadStream.close();
+    state.uploadStream = null;
+  }
+}
+
 function shouldPollUploadResults() {
   const summary = state.uploadResultsSummary || {};
   return (summary.queued || 0) > 0 || (summary.processing || 0) > 0;
 }
 
+function canUseLeaderUploadTransport() {
+  return !state.visibilityHidden && canPerformPrimaryRefreshWork() && shouldPollUploadResults();
+}
+
+function startUploadResultsStream() {
+  if (!canUseLeaderUploadTransport()) {
+    closeUploadResultsStream();
+    return false;
+  }
+  if (typeof EventSource === "undefined") {
+    closeUploadResultsStream();
+    return false;
+  }
+  if (state.uploadStream) {
+    return true;
+  }
+  clearUploadResultsPoller();
+  const stream = new EventSource("/me/uploads/stream");
+  state.uploadStream = stream;
+  stream.addEventListener("upload_results", (event) => {
+    try {
+      const payload = JSON.parse(event.data || "{}");
+      state.uploadPollFailureCount = 0;
+      applyUploadResultsPayload(payload || {});
+      broadcastUploadResultsChanged(payload || {});
+    } catch (error) {
+      console.error("解析上传进度事件失败", error);
+    }
+  });
+  stream.onerror = () => {
+    if (state.uploadStream !== stream) {
+      return;
+    }
+    closeUploadResultsStream();
+    state.uploadPollFailureCount += 1;
+    syncUploadResultsPolling();
+  };
+  return true;
+}
+
+function syncUploadResultsTransport() {
+  if (!canUseLeaderUploadTransport()) {
+    closeUploadResultsStream();
+    clearUploadResultsPoller();
+    return;
+  }
+  if (startUploadResultsStream()) {
+    return;
+  }
+  syncUploadResultsPolling();
+}
+
 function syncUploadResultsPolling() {
   clearUploadResultsPoller();
-  if (state.visibilityHidden || !canPerformPrimaryRefreshWork() || !shouldPollUploadResults()) {
+  if (!canUseLeaderUploadTransport() || state.uploadStream) {
     return;
   }
   const delay = Math.min(
@@ -2428,6 +2568,7 @@ function stopAllBackgroundActivity(reason = "stop") {
   disposeLeaderSync();
   stopLowFrequencyRefresh();
   stopQueueRealtime();
+  closeUploadResultsStream();
   clearUploadResultsPoller();
   clearClaimsRequestTimer();
   resetCrossTabSummaryState(reason);
@@ -2547,6 +2688,7 @@ function bindEvents() {
       releasePollingLeadership("hidden");
       stopLowFrequencyRefresh();
       stopQueueRealtime();
+      closeUploadResultsStream();
       clearUploadResultsPoller();
       clearClaimsRequestTimer();
       return;
@@ -2556,7 +2698,7 @@ function bindEvents() {
       ensureClaimsLoaded(true).catch(() => {});
     }
     syncQueueRealtimeTransport();
-    syncUploadResultsPolling();
+    syncUploadResultsTransport();
   });
   window.addEventListener("beforeunload", () => {
     releasePollingLeadership("unload");
@@ -2581,25 +2723,12 @@ async function init() {
 
   try {
     applyDocsBaseUrl();
-    const status = await fetchJson("/auth/status");
-    if (!status.authenticated) {
-      stopAllBackgroundActivity("unauthenticated");
-      showScreen("login");
-      if (authError) {
-        setLoginMessage(`登录失败：${authError}`, "error");
-      }
-    } else if (status.user?.is_banned) {
-      state.user = status.user;
-      renderBannedUser(status.user);
-      showScreen("banned");
-    } else {
-      showScreen("app");
-      await loadDashboard();
-      switchTab("data");
-      claimPollingLeadership();
-      syncQueueRealtimeTransport();
-      syncUploadResultsPolling();
-    }
+    await loadDashboard();
+    showScreen("app");
+    switchTab("data");
+    claimPollingLeadership();
+    syncQueueRealtimeTransport();
+    syncUploadResultsTransport();
   } catch (error) {
     if (error.status === 401) {
       stopAllBackgroundActivity("auth-expired");

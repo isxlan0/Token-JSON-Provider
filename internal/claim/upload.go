@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,7 +51,14 @@ type uploadPendingRecord struct {
 	AccountID       string
 	AccessTokenHash string
 	Status          string
+	Reason          string
+	Stage           string
+	StageLabel      string
+	Detail          string
+	UpdatedAt       string
 	QueuePosition   int
+	QueueTotal      int
+	Events          []map[string]any
 	Watchers        []uploadWatcher
 }
 
@@ -66,6 +74,18 @@ type uploadWatcher struct {
 	UserID       int64
 	BatchID      string
 	RequestIndex int
+}
+
+type uploadStateSpec struct {
+	Status        string
+	Reason        string
+	Stage         string
+	StageLabel    string
+	Detail        string
+	AccountID     string
+	QueuePosition int
+	QueueTotal    int
+	RecordEvent   bool
 }
 
 func (s *Service) GetUploadResults(userID int64) map[string]any {
@@ -129,12 +149,14 @@ func (s *Service) QueueUploadBatch(ctx context.Context, requestContext *auth.Req
 			if invalid, ok := err.(invalidUploadFileError); ok {
 				status = invalid.uploadStatus()
 			}
-			results = append(results, map[string]any{
-				"request_index": index,
-				"file_name":     fileName,
-				"status":        status,
-				"reason":        err.Error(),
-			})
+			results = append(results, newUploadResultItem(index, fileName, "", buildUploadStatePatch(uploadStateSpec{
+				Status:      status,
+				Reason:      err.Error(),
+				Stage:       status,
+				StageLabel:  "文件校验失败",
+				Detail:      err.Error(),
+				RecordEvent: true,
+			})))
 			continue
 		}
 
@@ -153,36 +175,24 @@ func (s *Service) QueueUploadBatch(ctx context.Context, requestContext *auth.Req
 
 		existing, position := s.reserveUploadTask(task)
 		if existing != nil {
-			status := existing.Status
-			reason := "账号正在处理中，请稍候刷新结果。"
-			if status == "queued" {
-				reason = "账号已在上传队列中，请勿重复提交。"
-			}
-
-			item := map[string]any{
-				"request_index": index,
-				"file_name":     fileName,
-				"status":        status,
-				"reason":        reason,
-				"account_id":    normalizedUploadString(normalized, "account_id"),
-			}
-			if existing.QueuePosition > 0 {
-				item["queue_position"] = existing.QueuePosition
-			}
-			results = append(results, item)
+			results = append(results, existing.snapshotItem(index, fileName, normalizedUploadString(normalized, "account_id")))
 			continue
 		}
 
-		results = append(results, map[string]any{
-			"request_index":  index,
-			"file_name":      fileName,
-			"status":         "queued",
-			"reason":         "已进入上传队列。",
-			"account_id":     normalizedUploadString(normalized, "account_id"),
-			"queue_position": position,
-		})
+		results = append(results, newUploadResultItem(index, fileName, normalizedUploadString(normalized, "account_id"), buildUploadStatePatch(uploadStateSpec{
+			Status:        "queued",
+			Reason:        "已进入上传队列。",
+			Stage:         "queued",
+			StageLabel:    "等待开始",
+			Detail:        formatUploadQueueDetail(position, position),
+			AccountID:     normalizedUploadString(normalized, "account_id"),
+			QueuePosition: position,
+			QueueTotal:    position,
+			RecordEvent:   true,
+		})))
 		tasks = append(tasks, task)
 	}
+	results = s.refreshPendingUploadResultItems(results)
 
 	payload := uploadSnapshot{
 		BatchID:   batchID,
@@ -221,26 +231,40 @@ func (s *Service) uploadWorkerLoop(ctx context.Context) {
 }
 
 func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
-	resultItem := map[string]any{
-		"status": "probe_failed",
-		"reason": "后台处理失败，请稍后重试",
-	}
+	resultItem := buildUploadStatePatch(uploadStateSpec{
+		Status:      "probe_failed",
+		Reason:      "后台处理失败，请稍后重试",
+		Stage:       "processing_failed",
+		StageLabel:  "处理失败",
+		Detail:      "后台处理异常，本次文件尚未成功入库。",
+		AccountID:   task.AccountID,
+		RecordEvent: true,
+	})
 
 	conflict, err := s.getUploadedTokenConflict(ctx, task.AccountID, task.AccessTokenHash)
 	switch {
 	case err != nil && isDatabaseBusyError(err):
-		resultItem = map[string]any{
-			"status": "db_busy",
-			"reason": "数据库正忙，本文件尚未处理，请稍后重试。",
-		}
+		resultItem = buildUploadStatePatch(uploadStateSpec{
+			Status:      "db_busy",
+			Reason:      "数据库正忙，本文件尚未处理，请稍后重试。",
+			Stage:       "db_busy",
+			StageLabel:  "数据库繁忙",
+			Detail:      "数据库仍在处理其他任务，本次文件暂未入库。",
+			AccountID:   task.AccountID,
+			RecordEvent: true,
+		})
 	case err != nil:
 		s.logger.Error("check upload conflict", "error", err, "account_id", task.AccountID)
 	case conflict != nil:
-		resultItem = map[string]any{
-			"status":     "duplicate",
-			"reason":     "账号已存在于历史库存中",
-			"account_id": task.AccountID,
-		}
+		resultItem = buildUploadStatePatch(uploadStateSpec{
+			Status:      "duplicate",
+			Reason:      "账号已存在于历史库存中",
+			Stage:       "duplicate",
+			StageLabel:  "库存已存在",
+			Detail:      "该账号已在历史库存中，跳过重复入库。",
+			AccountID:   task.AccountID,
+			RecordEvent: true,
+		})
 	default:
 		var tokenContent map[string]any
 		if err := json.Unmarshal([]byte(task.ContentJSON), &tokenContent); err != nil {
@@ -248,18 +272,38 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 			break
 		}
 
+		s.pushUploadTaskProgress(task, buildUploadStatePatch(uploadStateSpec{
+			Status:      "processing",
+			Reason:      "正在测试账号可用性。",
+			Stage:       "probing",
+			StageLabel:  "开始测试",
+			Detail:      "正在调用探活接口验证账号状态，请稍候。",
+			AccountID:   task.AccountID,
+			RecordEvent: true,
+		}))
+
 		probeResult := s.probe.Submit(tokenContent, s.cfg.Probe.TimeoutSec+s.cfg.Probe.DelaySec+5.0)
 		switch {
 		case probeResult.IsBanned():
-			resultItem = map[string]any{
-				"status": "banned_401",
-				"reason": "账号已失效或被上游封禁",
-			}
+			resultItem = buildUploadStatePatch(uploadStateSpec{
+				Status:      "banned_401",
+				Reason:      "账号已失效或被上游封禁",
+				Stage:       "probe_rejected",
+				StageLabel:  "测试返回 401",
+				Detail:      formatUploadProbeFailureDetail(probeResult.HTTPStatus, probeResult.Detail, "账号已失效或被上游封禁。"),
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			})
 		case probeResult.Detail == "probe_queue_timeout":
-			resultItem = map[string]any{
-				"status": "probe_timeout",
-				"reason": "账号探活超时，请稍后重试",
-			}
+			resultItem = buildUploadStatePatch(uploadStateSpec{
+				Status:      "probe_timeout",
+				Reason:      "账号探活超时，请稍后重试",
+				Stage:       "probe_timeout",
+				StageLabel:  "测试超时",
+				Detail:      "探活任务等待超时，本次文件未入库。",
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			})
 		case probeResult.Status != "ok":
 			reason := "账号探活失败"
 			if probeResult.HTTPStatus != nil {
@@ -267,17 +311,42 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 			} else if strings.TrimSpace(probeResult.Detail) != "" {
 				reason = fmt.Sprintf("账号探活请求异常（%s）", probeResult.Detail)
 			}
-			resultItem = map[string]any{
-				"status": "probe_failed",
-				"reason": reason,
-			}
+			resultItem = buildUploadStatePatch(uploadStateSpec{
+				Status:      "probe_failed",
+				Reason:      reason,
+				Stage:       "probe_failed",
+				StageLabel:  "测试失败",
+				Detail:      formatUploadProbeFailureDetail(probeResult.HTTPStatus, probeResult.Detail, reason),
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			})
 		default:
+			s.pushUploadTaskProgress(task, buildUploadStatePatch(uploadStateSpec{
+				Status:      "processing",
+				Reason:      "账号测试通过，准备入库。",
+				Stage:       "probe_ok",
+				StageLabel:  "测试通过",
+				Detail:      "探活返回正常，准备写入库存。",
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			}))
+
 			uploadedAtTS := time.Now().Unix()
 			targetName, nameErr := buildUploadedFileName(task.AccountID, uploadedAtTS)
 			if nameErr != nil {
 				s.logger.Error("build upload filename", "error", nameErr, "account_id", task.AccountID)
 				break
 			}
+
+			s.pushUploadTaskProgress(task, buildUploadStatePatch(uploadStateSpec{
+				Status:      "processing",
+				Reason:      "正在写入库存，请稍候。",
+				Stage:       "storing",
+				StageLabel:  "写入库存",
+				Detail:      "测试已通过，正在落盘并登记数据库。",
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			}))
 
 			s.markInternalTokenWrite(targetName)
 			absolutePath, relativePath, writeErr := writeUploadedTokenFile(targetName, task.ContentJSON)
@@ -300,31 +369,49 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 				_ = os.Remove(absolutePath)
 				switch {
 				case errors.Is(createErr, errUploadDuplicate):
-					resultItem = map[string]any{
-						"status":     "duplicate",
-						"reason":     "账号已存在于历史库存中",
-						"account_id": task.AccountID,
-					}
+					resultItem = buildUploadStatePatch(uploadStateSpec{
+						Status:      "duplicate",
+						Reason:      "账号已存在于历史库存中",
+						Stage:       "duplicate",
+						StageLabel:  "库存已存在",
+						Detail:      "账号在写入数据库时发现重复，未重复入库。",
+						AccountID:   task.AccountID,
+						RecordEvent: true,
+					})
 				case errors.Is(createErr, errUploadRateLimited):
-					resultItem = map[string]any{
-						"status": "rate_limited",
-						"reason": "当前小时上传额度不足",
-					}
+					resultItem = buildUploadStatePatch(uploadStateSpec{
+						Status:      "rate_limited",
+						Reason:      "当前小时上传额度不足",
+						Stage:       "rate_limited",
+						StageLabel:  "额度不足",
+						Detail:      "测试已通过，但当前小时上传额度已用尽。",
+						AccountID:   task.AccountID,
+						RecordEvent: true,
+					})
 				case isDatabaseBusyError(createErr):
-					resultItem = map[string]any{
-						"status": "db_busy",
-						"reason": "数据库正忙，本文件尚未处理，请稍后重试。",
-					}
+					resultItem = buildUploadStatePatch(uploadStateSpec{
+						Status:      "db_busy",
+						Reason:      "数据库正忙，本文件尚未处理，请稍后重试。",
+						Stage:       "db_busy",
+						StageLabel:  "数据库繁忙",
+						Detail:      "文件已生成，但数据库暂时繁忙，未完成入库登记。",
+						AccountID:   task.AccountID,
+						RecordEvent: true,
+					})
 				default:
 					s.logger.Error("create uploaded token", "error", createErr, "file_name", targetName)
 				}
 			} else {
-				resultItem = map[string]any{
-					"status":     "accepted",
-					"reason":     "校验通过，已加入可领取库存",
-					"token_id":   created.TokenID,
-					"account_id": created.AccountID,
-				}
+				resultItem = buildUploadStatePatch(uploadStateSpec{
+					Status:      "accepted",
+					Reason:      "校验通过，已加入可领取库存",
+					Stage:       "accepted",
+					StageLabel:  "入库成功",
+					Detail:      fmt.Sprintf("测试通过并完成入库，库存文件 %s 已可供后续领取。", created.FileName),
+					AccountID:   created.AccountID,
+					RecordEvent: true,
+				})
+				resultItem["token_id"] = created.TokenID
 				userIDCopy := task.UserID
 				s.invalidateUserCache(task.UserID)
 				s.invalidateDashboardCache(&userIDCopy)
@@ -351,8 +438,7 @@ func (s *Service) reserveUploadTask(task uploadTask) (*uploadPendingRecord, int)
 	existing := s.findPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
 	if existing != nil {
 		s.registerUploadWatcherLocked(existing, watcher)
-		copied := *existing
-		return &copied, 0
+		return clonePendingUploadRecord(existing), 0
 	}
 
 	s.uploadQueued++
@@ -362,11 +448,21 @@ func (s *Service) reserveUploadTask(task uploadTask) (*uploadPendingRecord, int)
 		FileName:        task.FileName,
 		AccountID:       task.AccountID,
 		AccessTokenHash: task.AccessTokenHash,
-		Status:          "queued",
-		QueuePosition:   s.uploadQueued,
 		Watchers:        []uploadWatcher{watcher},
 	}
+	s.applyUploadPendingPatchLocked(pending, buildUploadStatePatch(uploadStateSpec{
+		Status:        "queued",
+		Reason:        "已进入上传队列。",
+		Stage:         "queued",
+		StageLabel:    "等待开始",
+		Detail:        formatUploadQueueDetail(s.uploadQueued, s.uploadQueued),
+		AccountID:     task.AccountID,
+		QueuePosition: s.uploadQueued,
+		QueueTotal:    s.uploadQueued,
+		RecordEvent:   true,
+	}))
 	s.setPendingUploadTaskLocked(pending)
+	s.syncQueuedUploadStateLocked()
 	return nil, pending.QueuePosition
 }
 
@@ -375,17 +471,32 @@ func (s *Service) markUploadTaskProcessing(task uploadTask) {
 	defer s.uploadMu.Unlock()
 
 	pending := s.findPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
+	patch := buildUploadStatePatch(uploadStateSpec{
+		Status:      "processing",
+		Reason:      "已轮到当前文件，准备开始测试。",
+		Stage:       "processing",
+		StageLabel:  "开始处理",
+		Detail:      "已从上传队列取出，马上开始探活测试。",
+		AccountID:   task.AccountID,
+		RecordEvent: true,
+	})
 	if pending != nil && pending.Status == "queued" {
 		s.uploadQueued = maxInt(0, s.uploadQueued-1)
-		pending.Status = "processing"
-		pending.QueuePosition = 0
+		s.applyUploadPendingPatchLocked(pending, patch)
+		s.syncQueuedUploadStateLocked()
+		s.updateUploadWatchersLocked(pending, patch)
+		return
 	}
+	s.updateUploadSnapshotItemLocked(task.UserID, task.BatchID, task.RequestIndex, patch)
+}
 
-	patch := map[string]any{
-		"status": "processing",
-		"reason": "正在处理，请稍候刷新结果。",
-	}
+func (s *Service) pushUploadTaskProgress(task uploadTask, patch map[string]any) {
+	s.uploadMu.Lock()
+	defer s.uploadMu.Unlock()
+
+	pending := s.findPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
 	if pending != nil {
+		s.applyUploadPendingPatchLocked(pending, patch)
 		s.updateUploadWatchersLocked(pending, patch)
 		return
 	}
@@ -398,6 +509,7 @@ func (s *Service) completeUploadTask(task uploadTask, patch map[string]any) {
 
 	pending := s.findPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
 	if pending != nil {
+		s.applyUploadPendingPatchLocked(pending, patch)
 		s.updateUploadWatchersLocked(pending, patch)
 	} else {
 		s.updateUploadSnapshotItemLocked(task.UserID, task.BatchID, task.RequestIndex, patch)
@@ -422,9 +534,7 @@ func (s *Service) updateUploadSnapshotItemLocked(userID int64, batchID string, r
 	for _, item := range snapshot.Items {
 		updated := cloneAnyMap(item)
 		if intFromAny(updated["request_index"]) == requestIndex {
-			for key, value := range patch {
-				updated[key] = value
-			}
+			updated = applyUploadItemPatch(updated, patch)
 		}
 		nextItems = append(nextItems, updated)
 	}
@@ -462,6 +572,86 @@ func (s *Service) updateUploadWatchersLocked(item *uploadPendingRecord, patch ma
 	for _, watcher := range item.Watchers {
 		s.updateUploadSnapshotItemLocked(watcher.UserID, watcher.BatchID, watcher.RequestIndex, patch)
 	}
+}
+
+func (s *Service) applyUploadPendingPatchLocked(item *uploadPendingRecord, patch map[string]any) {
+	if item == nil {
+		return
+	}
+
+	if status, ok := patch["status"].(string); ok {
+		item.Status = status
+	}
+	if reason, ok := patch["reason"].(string); ok {
+		item.Reason = reason
+	}
+	if stage, ok := patch["stage"].(string); ok {
+		item.Stage = stage
+	}
+	if stageLabel, ok := patch["stage_label"].(string); ok {
+		item.StageLabel = stageLabel
+	}
+	if detail, ok := patch["detail"].(string); ok {
+		item.Detail = detail
+	}
+	if updatedAt, ok := patch["updated_at"].(string); ok {
+		item.UpdatedAt = updatedAt
+	}
+	if queuePosition, ok := patch["queue_position"]; ok {
+		item.QueuePosition = maxInt(0, intFromAny(queuePosition))
+	}
+	if queueTotal, ok := patch["queue_total"]; ok {
+		item.QueueTotal = maxInt(0, intFromAny(queueTotal))
+	}
+	item.Events = appendUploadItemEvent(item.Events, patch["event"])
+}
+
+func (s *Service) syncQueuedUploadStateLocked() {
+	queuedItems := s.uniqueQueuedUploadRecordsLocked()
+	total := len(queuedItems)
+	for index, item := range queuedItems {
+		position := index + 1
+		item.QueuePosition = position
+		item.QueueTotal = total
+		patch := buildUploadStatePatch(uploadStateSpec{
+			Status:        "queued",
+			Reason:        "已进入上传队列。",
+			Stage:         "queued",
+			StageLabel:    "等待开始",
+			Detail:        formatUploadQueueDetail(position, total),
+			AccountID:     item.AccountID,
+			QueuePosition: position,
+			QueueTotal:    total,
+			RecordEvent:   false,
+		})
+		s.applyUploadPendingPatchLocked(item, patch)
+		s.updateUploadWatchersLocked(item, patch)
+	}
+}
+
+func (s *Service) uniqueQueuedUploadRecordsLocked() []*uploadPendingRecord {
+	seen := make(map[*uploadPendingRecord]struct{})
+	items := make([]*uploadPendingRecord, 0, len(s.uploadPending))
+	for _, item := range s.uploadPending {
+		if item == nil || item.Status != "queued" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		items = append(items, item)
+	}
+	sort.SliceStable(items, func(left int, right int) bool {
+		if items[left].QueuePosition == items[right].QueuePosition {
+			if items[left].BatchID == items[right].BatchID {
+				return items[left].RequestIndex < items[right].RequestIndex
+			}
+			return items[left].BatchID < items[right].BatchID
+		}
+		return items[left].QueuePosition < items[right].QueuePosition
+	})
+	return items
 }
 
 func (s *Service) clearPendingUploadTaskLocked(accountID string, accessTokenHash string) {
@@ -784,15 +974,236 @@ func cloneUploadSnapshot(snapshot uploadSnapshot) uploadSnapshot {
 	}
 }
 
-func (s *Service) persistUploadSnapshotLocked(userID int64) {
-	if s.cache == nil {
-		return
+func clonePendingUploadRecord(item *uploadPendingRecord) *uploadPendingRecord {
+	if item == nil {
+		return nil
 	}
+	copied := *item
+	copied.Events = cloneAnyMapSlice(item.Events)
+	copied.Watchers = append([]uploadWatcher(nil), item.Watchers...)
+	return &copied
+}
+
+func (item *uploadPendingRecord) snapshotItem(requestIndex int, fileName string, accountID string) map[string]any {
+	if item == nil {
+		return newUploadResultItem(requestIndex, fileName, accountID, nil)
+	}
+	base := map[string]any{
+		"request_index":  requestIndex,
+		"file_name":      fileName,
+		"account_id":     firstNonEmpty(strings.TrimSpace(accountID), item.AccountID),
+		"status":         item.Status,
+		"reason":         item.Reason,
+		"stage":          item.Stage,
+		"stage_label":    item.StageLabel,
+		"detail":         item.Detail,
+		"updated_at":     item.UpdatedAt,
+		"queue_position": item.QueuePosition,
+		"queue_total":    item.QueueTotal,
+		"events":         cloneAnyMapSlice(item.Events),
+	}
+	return applyUploadItemPatch(base, nil)
+}
+
+func newUploadResultItem(requestIndex int, fileName string, accountID string, patch map[string]any) map[string]any {
+	base := map[string]any{
+		"request_index": requestIndex,
+		"file_name":     fileName,
+	}
+	if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+		base["account_id"] = trimmed
+	}
+	return applyUploadItemPatch(base, patch)
+}
+
+func applyUploadItemPatch(item map[string]any, patch map[string]any) map[string]any {
+	updated := cloneAnyMap(item)
+	if updated == nil {
+		updated = make(map[string]any)
+	}
+	updated["events"] = cloneAnyMapSlice(eventSliceFromAny(updated["events"]))
+	if patch == nil {
+		return updated
+	}
+	for key, value := range patch {
+		if key == "event" {
+			continue
+		}
+		updated[key] = value
+	}
+	updated["events"] = appendUploadItemEvent(eventSliceFromAny(updated["events"]), patch["event"])
+	return updated
+}
+
+func buildUploadStatePatch(spec uploadStateSpec) map[string]any {
+	reason := strings.TrimSpace(spec.Reason)
+	detail := strings.TrimSpace(spec.Detail)
+	if detail == "" {
+		detail = reason
+	}
+	stageLabel := strings.TrimSpace(spec.StageLabel)
+	if stageLabel == "" {
+		stageLabel = uploadStageLabelFromStatus(spec.Status)
+	}
+	updatedAt := isoformatNow()
+
+	patch := map[string]any{
+		"status":         strings.TrimSpace(spec.Status),
+		"reason":         reason,
+		"stage":          strings.TrimSpace(spec.Stage),
+		"stage_label":    stageLabel,
+		"detail":         detail,
+		"updated_at":     updatedAt,
+		"queue_position": maxInt(0, spec.QueuePosition),
+		"queue_total":    maxInt(0, spec.QueueTotal),
+	}
+	if trimmed := strings.TrimSpace(spec.AccountID); trimmed != "" {
+		patch["account_id"] = trimmed
+	}
+	if spec.RecordEvent {
+		patch["event"] = map[string]any{
+			"stage":  strings.TrimSpace(spec.Stage),
+			"label":  stageLabel,
+			"detail": detail,
+			"status": strings.TrimSpace(spec.Status),
+			"at":     updatedAt,
+		}
+	}
+	return patch
+}
+
+func uploadStageLabelFromStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "queued":
+		return "等待开始"
+	case "processing":
+		return "处理中"
+	case "accepted":
+		return "入库成功"
+	case "duplicate":
+		return "库存已存在"
+	case "invalid_json", "missing_fields", "invalid_file", "file_too_large":
+		return "文件校验失败"
+	case "banned_401":
+		return "账号失效"
+	case "probe_timeout":
+		return "测试超时"
+	case "probe_failed":
+		return "测试失败"
+	case "rate_limited":
+		return "额度不足"
+	case "db_busy":
+		return "数据库繁忙"
+	default:
+		return "处理中"
+	}
+}
+
+func formatUploadQueueDetail(position int, total int) string {
+	position = maxInt(0, position)
+	total = maxInt(0, total)
+	switch {
+	case total <= 0:
+		return "等待队列调度，轮到后会自动开始测试。"
+	case position <= 1:
+		return fmt.Sprintf("等待 %d/%d，前面没有其他文件，马上开始测试。", maxInt(1, position), total)
+	default:
+		return fmt.Sprintf("等待 %d/%d，前面还有 %d 个文件，轮到后会自动开始测试。", position, total, maxInt(0, position-1))
+	}
+}
+
+func formatUploadProbeFailureDetail(httpStatus *int, detail string, fallback string) string {
+	normalizedDetail := compactUploadDetail(detail)
+	switch {
+	case httpStatus != nil && normalizedDetail != "":
+		return fmt.Sprintf("测试返回 HTTP %d：%s", *httpStatus, normalizedDetail)
+	case httpStatus != nil:
+		return fmt.Sprintf("测试返回 HTTP %d。", *httpStatus)
+	case normalizedDetail != "":
+		return fmt.Sprintf("测试返回：%s", normalizedDetail)
+	default:
+		return strings.TrimSpace(fallback)
+	}
+}
+
+func compactUploadDetail(detail string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(detail)), " ")
+	if normalized == "" {
+		return ""
+	}
+	const maxDetailLength = 120
+	if len(normalized) <= maxDetailLength {
+		return normalized
+	}
+	return normalized[:maxDetailLength] + "..."
+}
+
+func eventSliceFromAny(value any) []map[string]any {
+	switch typed := value.(type) {
+	case nil:
+		return []map[string]any{}
+	case []map[string]any:
+		return cloneAnyMapSlice(typed)
+	case []any:
+		items := make([]map[string]any, 0, len(typed))
+		for _, entry := range typed {
+			if mapped, ok := entry.(map[string]any); ok {
+				items = append(items, cloneAnyMap(mapped))
+			}
+		}
+		return items
+	default:
+		return []map[string]any{}
+	}
+}
+
+func appendUploadItemEvent(events []map[string]any, rawEvent any) []map[string]any {
+	event, ok := rawEvent.(map[string]any)
+	if !ok || len(event) == 0 {
+		return cloneAnyMapSlice(events)
+	}
+	clonedEvents := cloneAnyMapSlice(events)
+	nextEvent := cloneAnyMap(event)
+	if len(clonedEvents) > 0 {
+		last := clonedEvents[len(clonedEvents)-1]
+		if fmt.Sprint(last["stage"]) == fmt.Sprint(nextEvent["stage"]) &&
+			fmt.Sprint(last["label"]) == fmt.Sprint(nextEvent["label"]) &&
+			fmt.Sprint(last["detail"]) == fmt.Sprint(nextEvent["detail"]) {
+			return clonedEvents
+		}
+	}
+	return append(clonedEvents, nextEvent)
+}
+
+func (s *Service) refreshPendingUploadResultItems(items []map[string]any) []map[string]any {
+	s.uploadMu.Lock()
+	defer s.uploadMu.Unlock()
+
+	refreshed := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		requestIndex := intFromAny(item["request_index"])
+		fileName := strings.TrimSpace(fmt.Sprint(item["file_name"]))
+		accountID := strings.TrimSpace(fmt.Sprint(item["account_id"]))
+		if pending := s.findPendingUploadTaskLocked(accountID, ""); pending != nil {
+			refreshed = append(refreshed, pending.snapshotItem(requestIndex, fileName, accountID))
+			continue
+		}
+		refreshed = append(refreshed, applyUploadItemPatch(item, nil))
+	}
+	return refreshed
+}
+
+func (s *Service) persistUploadSnapshotLocked(userID int64) {
 	snapshot, ok := s.uploadSnapshots[userID]
 	if !ok {
 		return
 	}
-	s.cache.SetJSON(s.userUploadResultsCacheKey(userID), snapshot.payload(), s.uploadResultsTTL())
+	if s.cache != nil {
+		s.cache.SetJSON(s.userUploadResultsCacheKey(userID), snapshot.payload(), s.uploadResultsTTL())
+	}
+	if s.uploadEvents != nil {
+		s.uploadEvents.notify(userID)
+	}
 }
 
 func cloneAnyMapSlice(items []map[string]any) []map[string]any {

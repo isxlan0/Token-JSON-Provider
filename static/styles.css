@@ -1170,6 +1170,10 @@ body {
   box-shadow: var(--shadow-sm);
 }
 
+.upload-result-item {
+  align-items: stretch;
+}
+
 .upload-selected-name {
   font-weight: 700;
   color: var(--text-main);
@@ -1184,6 +1188,75 @@ body {
 
 .upload-result-main {
   min-width: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.upload-result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.upload-result-stage {
+  margin-top: 0.18rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #4338ca;
+}
+
+.upload-result-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.upload-result-meta-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.24rem 0.55rem;
+  border-radius: var(--radius-full);
+  background: #f8fafc;
+  border: 1px solid var(--border-base);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.upload-result-events {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.55rem;
+}
+
+.upload-result-event {
+  padding: 0.7rem 0.78rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-base);
+  background: #f8fafc;
+}
+
+.upload-result-event-label {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.upload-result-event-detail {
+  margin-top: 0.22rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.upload-result-event-time {
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  color: var(--text-dim);
 }
 
 .upload-result-status {
@@ -1198,13 +1271,25 @@ body {
   font-weight: 700;
 }
 
+.upload-result-status.is-queued {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.upload-result-status.is-processing {
+  background: #eef2ff;
+  color: #4338ca;
+}
+
 .upload-result-status.is-accepted {
   background: #ecfdf5;
   color: #15803d;
 }
 
 .upload-result-status.is-duplicate,
-.upload-result-status.is-rate_limited {
+.upload-result-status.is-rate_limited,
+.upload-result-status.is-db_busy,
+.upload-result-status.is-probe_timeout {
   background: #fff7ed;
   color: #c2410c;
 }
