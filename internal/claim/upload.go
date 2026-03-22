@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -418,6 +419,7 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 				s.invalidateAdminCache()
 				s.notifyQueueUsers(ctx, task.UserID)
 				s.wakeQueuePump()
+				s.primeUserReadCaches(ctx, task.UserID)
 			}
 		}
 	}
@@ -1198,8 +1200,16 @@ func (s *Service) persistUploadSnapshotLocked(userID int64) {
 	if !ok {
 		return
 	}
+	payload := snapshot.payload()
 	if s.cache != nil {
-		s.cache.SetJSON(s.userUploadResultsCacheKey(userID), snapshot.payload(), s.uploadResultsTTL())
+		key := s.userUploadResultsCacheKey(userID)
+		var previous map[string]any
+		changed := !s.cache.GetJSON(key, &previous) || !reflect.DeepEqual(previous, payload)
+		if changed {
+			s.cache.BumpScope("user-upload-results", userID)
+			key = s.userUploadResultsCacheKey(userID)
+		}
+		s.cache.SetJSON(key, payload, s.uploadResultsTTL())
 	}
 	if s.uploadEvents != nil {
 		s.uploadEvents.notify(userID)

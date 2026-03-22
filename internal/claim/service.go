@@ -246,6 +246,7 @@ func (s *Service) Start(ctx context.Context) {
 		s.goWorker(func() { s.hideClaimsWorkerLoop(ctx) })
 		s.goWorker(func() { s.tokenImportLoop(ctx) })
 		s.goWorker(func() { s.tokenWatchLoop(ctx) })
+		s.goWorker(func() { s.warmReadCaches(ctx) })
 	})
 }
 
@@ -389,6 +390,7 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 		s.invalidateDashboardCache(&userIDCopy)
 		s.notifyQueueUsers(ctx, userID)
 		s.wakeQueuePump()
+		s.primeUserReadCaches(ctx, userID)
 		return initial.Queued, nil
 	}
 
@@ -426,6 +428,7 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 		s.invalidateDashboardCache(&userIDCopy)
 		s.notifyQueueUsers(ctx, userID)
 		s.wakeQueuePump()
+		s.primeUserReadCaches(ctx, userID)
 		return queued, nil
 	}
 
@@ -447,6 +450,7 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 	s.invalidateDashboardCache(&userIDCopy)
 	s.invalidateAdminCache()
 	s.notifyQueueUsers(ctx, userID)
+	s.primeUserReadCaches(ctx, userID)
 	return result, nil
 }
 
@@ -521,6 +525,7 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 		s.invalidateDashboardCache(&userIDCopy)
 		s.invalidateAdminCache()
 		s.notifyQueueUsers(ctx, row.UserID)
+		s.primeUserReadCaches(ctx, row.UserID)
 	}
 
 	return nil
@@ -641,30 +646,6 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 			"summary": apiKeys,
 		},
 		UploadResults: buildUploadResultsSummaryPayload(s.GetUploadResults(userID)),
-	}, nil
-}
-
-func (s *Service) GetBootstrap(ctx context.Context, requestContext *auth.RequestContext) (map[string]any, error) {
-	profile, err := s.GetProfile(ctx, requestContext)
-	if err != nil {
-		return nil, err
-	}
-
-	dashboard, err := s.GetDashboardSummary(ctx, requestContext.UserID, "7d", "1h")
-	if err != nil {
-		return nil, err
-	}
-
-	queueStatus, err := s.GetQueueStatus(ctx, requestContext.UserID)
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]any{
-		"profile":        profile,
-		"dashboard":      dashboard,
-		"queue_status":   queueStatus,
-		"upload_results": buildUploadResultsSummaryPayload(s.GetUploadResults(requestContext.UserID)),
 	}, nil
 }
 

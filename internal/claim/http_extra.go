@@ -183,6 +183,7 @@ func (s *Service) uploadTokens(c echo.Context) error {
 	if err != nil {
 		return mapDatabaseBusyError(c, err)
 	}
+	s.primeUserReadCaches(c.Request().Context(), requestContext.UserID)
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -238,15 +239,25 @@ func (s *Service) getAdminMe(c echo.Context) error {
 	return c.JSON(http.StatusOK, payload)
 }
 
+func (s *Service) getAdminBootstrap(c echo.Context) error {
+	requestContext, ok := auth.RequestContextFromEcho(c)
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
+	}
+
+	payload, err := s.GetAdminBootstrap(c.Request().Context(), requestContext)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, payload)
+}
+
 func (s *Service) adminListUsers(c echo.Context) error {
 	search := c.QueryParam("search")
 	banStatus := c.QueryParam("ban_status")
 	limit := parseBoundedInt(c.QueryParam("limit"), 100, 1, 200)
 	offset := parseBoundedInt(c.QueryParam("offset"), 0, 0, 1<<30)
-	cacheKey := s.adminCacheKey("admin-users", strings.ToLower(strings.TrimSpace(search)), strings.ToLower(strings.TrimSpace(banStatus)), limit, offset)
-	payload, err := runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.AdminTTL, func() (map[string]any, error) {
-		return s.ListUsersForAdmin(c.Request().Context(), search, banStatus, limit, offset)
-	})
+	payload, err := s.cachedAdminUsersPage(c.Request().Context(), search, banStatus, limit, offset)
 	if err != nil {
 		return err
 	}
@@ -304,6 +315,7 @@ func (s *Service) adminBanUser(c echo.Context) error {
 	s.invalidateUserCache(targetUser.ID)
 	s.invalidateUserQueueCache(targetUser.ID)
 	s.invalidateAdminCache()
+	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, map[string]any{"ok": true, "ban": ban})
 }
 
@@ -325,8 +337,10 @@ func (s *Service) adminUnbanUser(c echo.Context) error {
 		if targetUser != nil {
 			s.invalidateUserCache(targetUser.ID)
 			s.invalidateUserQueueCache(targetUser.ID)
+			s.primeUserReadCaches(c.Request().Context(), targetUser.ID)
 		}
 		s.invalidateAdminCache()
+		s.primeAdminDefaultReadCaches(c.Request().Context())
 	}
 	return c.JSON(http.StatusOK, map[string]any{"ok": changed})
 }
@@ -336,10 +350,7 @@ func (s *Service) adminListBans(c echo.Context) error {
 	search := c.QueryParam("search")
 	limit := parseBoundedInt(c.QueryParam("limit"), 100, 1, 200)
 	offset := parseBoundedInt(c.QueryParam("offset"), 0, 0, 1<<30)
-	cacheKey := s.adminCacheKey("admin-bans", strings.ToLower(strings.TrimSpace(statusFilter)), strings.ToLower(strings.TrimSpace(search)), limit, offset)
-	payload, err := runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.AdminTTL, func() (map[string]any, error) {
-		return s.ListBans(c.Request().Context(), statusFilter, search, limit, offset)
-	})
+	payload, err := s.cachedAdminBansPage(c.Request().Context(), statusFilter, search, limit, offset)
 	if err != nil {
 		return err
 	}
@@ -351,10 +362,7 @@ func (s *Service) adminListTokens(c echo.Context) error {
 	statusFilter := c.QueryParam("status")
 	limit := parseBoundedInt(c.QueryParam("limit"), 200, 1, 500)
 	offset := parseBoundedInt(c.QueryParam("offset"), 0, 0, 1<<30)
-	cacheKey := s.adminCacheKey("admin-tokens", strings.ToLower(strings.TrimSpace(search)), strings.ToLower(strings.TrimSpace(statusFilter)), limit, offset)
-	payload, err := runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.AdminTTL, func() (map[string]any, error) {
-		return s.ListTokensForAdmin(c.Request().Context(), search, statusFilter, limit, offset)
-	})
+	payload, err := s.cachedAdminTokensPage(c.Request().Context(), search, statusFilter, limit, offset)
 	if err != nil {
 		return err
 	}
@@ -382,6 +390,7 @@ func (s *Service) adminSetTokenEnabled(c echo.Context, enabled bool) error {
 	if item == nil {
 		return echo.NewHTTPError(http.StatusNotFound, "Token not found.")
 	}
+	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, map[string]any{"ok": true, "item": item})
 }
 
@@ -398,6 +407,7 @@ func (s *Service) adminCleanupExhaustedTokens(c echo.Context) error {
 		return mapDatabaseBusyError(c, err)
 	}
 	result["ok"] = true
+	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, result)
 }
 

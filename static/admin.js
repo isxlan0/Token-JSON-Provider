@@ -536,9 +536,36 @@ async function loadPolicy() {
   renderPolicy();
 }
 
+function applyPagedAdminPayload(targetKey, pageState, payload, render) {
+  state[targetKey] = payload?.items || [];
+  pageState.total = payload?.total || 0;
+  pageState.limit = payload?.limit || pageState.limit;
+  pageState.offset = payload?.offset || 0;
+  render();
+}
+
+function applyAdminBootstrapPayload(payload) {
+  state.me = payload?.me || null;
+  state.user = state.me?.user || null;
+  state.policy = payload?.policy || state.me?.policy || null;
+  renderAuthSummary();
+  renderPolicySummary();
+
+  applyPagedAdminPayload("users", state.usersPage, payload?.users || {}, renderUsers);
+  applyPagedAdminPayload("bans", state.bansPage, payload?.bans || {}, renderBans);
+  applyPagedAdminPayload("tokens", state.tokensPage, payload?.tokens || {}, renderTokens);
+  renderPolicy();
+}
+
 async function loadAdminBootstrap() {
-  await loadAdminMe();
-  await Promise.all([loadUsers(true), loadBans(true), loadTokens(true), loadPolicy()]);
+  state.usersPage.offset = 0;
+  state.bansPage.offset = 0;
+  state.tokensPage.offset = 0;
+  state.usersPage.limit = Number.parseInt(elements.userLimit.value, 10) || state.usersPage.limit || 50;
+  state.bansPage.limit = Number.parseInt(elements.banLimit.value, 10) || state.bansPage.limit || 50;
+  state.tokensPage.limit = Number.parseInt(elements.tokenLimit.value, 10) || state.tokensPage.limit || 50;
+  const payload = await fetchJson("/admin/bootstrap");
+  applyAdminBootstrapPayload(payload || {});
 }
 
 async function cleanupExhaustedTokens(mode) {

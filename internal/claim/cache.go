@@ -78,6 +78,31 @@ func (s *Service) userUploadResultsCacheKey(userID int64) string {
 	return s.snapshotCacheKey("user-upload-results", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-upload-results", userID)))
 }
 
+func (s *Service) userBootstrapCacheKey(userID int64, isAdmin bool) string {
+	return s.snapshotCacheKey(
+		"user-bootstrap",
+		userID,
+		boolToFlag(isAdmin),
+		fmt.Sprintf("pv%d", s.cacheScopeVersion("user-profile", userID)),
+		fmt.Sprintf("dv%d", s.cacheScopeVersion("dashboard")),
+		fmt.Sprintf("duv%d", s.cacheScopeVersion("dashboard-user", userID)),
+		fmt.Sprintf("qv%d", s.cacheScopeVersion("user-queue", userID)),
+		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
+	)
+}
+
+func (s *Service) adminBootstrapCacheKey(userID int64) string {
+	return s.snapshotCacheKey(
+		"admin-bootstrap",
+		userID,
+		fmt.Sprintf("av%d", s.cacheScopeVersion("admin")),
+		fmt.Sprintf("upv%d", s.cacheScopeVersion("user-profile", userID)),
+		defaultAdminUsersLimit,
+		defaultAdminBansLimit,
+		defaultAdminTokensLimit,
+	)
+}
+
 func (s *Service) claimsListCacheKey(userID int64) string {
 	return runtimecache.BuildCacheKey("me-claims", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-claims", userID)))
 }
@@ -255,8 +280,13 @@ func (s *Service) setQueueStatusSnapshot(userID int64, payload queueStatusPayloa
 	key := s.userQueueCacheKey(userID)
 	var previous queueStatusPayload
 	hadPrevious := s.cache.GetJSON(key, &previous)
+	changed := !hadPrevious || !reflect.DeepEqual(previous, payload)
+	if changed {
+		s.cache.BumpScope("user-queue", userID)
+		key = s.userQueueCacheKey(userID)
+	}
 	s.cache.SetJSON(key, payload, s.queueSnapshotTTL())
-	if !hadPrevious || !reflect.DeepEqual(previous, payload) {
+	if changed {
 		s.queueEvents.notify(userID)
 	}
 	return payload

@@ -97,7 +97,7 @@
   </style>
   <link rel="modulepreload" href="/assets/app/leader-sync.js?v=20260322f">
   <link rel="modulepreload" href="/assets/app/summary-sync.js?v=20260322f">
-  <link rel="stylesheet" href="/assets/styles.css?v=20260322k">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260322m">
   <script type="module" src="/assets/app.js?v=20260322k"></script>
 </head>
 
@@ -243,13 +243,15 @@
       <header class="top-header">
         <div class="header-title" id="header-title">数据面板</div>
         <div class="header-actions">
-          <div class="status-badge online">
-            <div class="dot"></div>
-            <span id="summary-origin" class="mono">来源：-</span>
-          </div>
-          <div class="status-badge">
-            <div class="dot"></div>
-            <span id="auth-summary" class="mono">未登录</span>
+          <div class="header-status-group">
+            <div class="status-badge online">
+              <div class="dot"></div>
+              <span id="summary-origin" class="mono status-badge-text">来源：-</span>
+            </div>
+            <div class="status-badge">
+              <div class="dot"></div>
+              <span id="auth-summary" class="mono status-badge-text">未登录</span>
+            </div>
           </div>
           <button id="logout-btn" class="btn btn-ghost" type="button" title="退出登录">
             退出登录

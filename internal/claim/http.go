@@ -50,6 +50,7 @@ func (s *Service) RegisterRoutes(e *echo.Echo) {
 	dashboard.GET("/stats", s.getDashboardStatsRoute)
 
 	admin := e.Group("/admin", s.auth.RequireAdminMiddleware)
+	admin.GET("/bootstrap", s.getAdminBootstrap)
 	admin.GET("/me", s.getAdminMe)
 	admin.GET("/users", s.adminListUsers)
 	admin.GET("/users/:linuxdo_user_id", s.adminGetUserDetail)

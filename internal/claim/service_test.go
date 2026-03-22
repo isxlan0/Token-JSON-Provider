@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"token-atlas/internal/auth"
 	"token-atlas/internal/config"
 	"token-atlas/internal/database"
 	proberuntime "token-atlas/internal/probe"
+	"token-atlas/internal/runtimecache"
 )
 
 func TestClaimTokensDirectGrant(t *testing.T) {
@@ -102,6 +104,112 @@ func TestServiceStopWaitsForWorkersToExit(t *testing.T) {
 	defer stopCancel()
 	if err := service.Stop(stopCtx); err != nil {
 		t.Fatalf("stop service: %v", err)
+	}
+}
+
+func TestBootstrapCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "1003", "bootstrap-user")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "1003",
+			Username:   "bootstrap-user",
+			Name:       "bootstrap-user",
+			TrustLevel: 2,
+		},
+	}
+
+	first, err := service.GetBootstrap(ctx, requestContext)
+	if err != nil {
+		t.Fatalf("get first bootstrap: %v", err)
+	}
+	firstUpload, ok := first["upload_results"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected first upload payload: %#v", first["upload_results"])
+	}
+	if firstUpload["batch_id"] != nil {
+		t.Fatalf("expected empty batch id before upload snapshot, got %#v", firstUpload["batch_id"])
+	}
+
+	service.setUploadSnapshot(userID, uploadSnapshot{
+		BatchID:   "batch-1",
+		CreatedAt: "2026-03-22T00:00:00Z",
+		Items: []map[string]any{
+			{
+				"request_index": 1,
+				"file_name":     "demo.json",
+				"status":        "queued",
+				"reason":        "等待处理",
+			},
+		},
+		History:     []map[string]any{},
+		QueueStatus: map[string]any{"queued": 1},
+	})
+
+	second, err := service.GetBootstrap(ctx, requestContext)
+	if err != nil {
+		t.Fatalf("get second bootstrap: %v", err)
+	}
+	secondUpload, ok := second["upload_results"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected second upload payload: %#v", second["upload_results"])
+	}
+	if secondUpload["batch_id"] != "batch-1" {
+		t.Fatalf("expected refreshed upload batch id, got %#v", secondUpload["batch_id"])
+	}
+}
+
+func TestAdminBootstrapIncludesDefaultDatasets(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	adminUserID := insertTestUser(t, store, "9001", "admin-user")
+	insertTestUser(t, store, "9002", "normal-user")
+	insertTestToken(t, store, "admin-bootstrap.json", `{"access_token":"admin-bootstrap","refresh_token":"admin-bootstrap-r","account_id":"acct-admin-bootstrap"}`, 0, 1)
+
+	payload, err := service.GetAdminBootstrap(ctx, &auth.RequestContext{
+		UserID: adminUserID,
+		User: auth.UserPayload{
+			ID:         "9001",
+			Username:   "admin-user",
+			Name:       "Admin User",
+			TrustLevel: 4,
+			IsAdmin:    true,
+		},
+		IsAdmin: true,
+	})
+	if err != nil {
+		t.Fatalf("get admin bootstrap: %v", err)
+	}
+
+	me, ok := payload["me"].(map[string]any)
+	if !ok || me["user"] == nil {
+		t.Fatalf("admin bootstrap missing me payload: %#v", payload["me"])
+	}
+
+	users, ok := payload["users"].(map[string]any)
+	if !ok || users["limit"] != defaultAdminUsersLimit {
+		t.Fatalf("admin bootstrap users payload unexpected: %#v", payload["users"])
+	}
+
+	bans, ok := payload["bans"].(map[string]any)
+	if !ok || bans["limit"] != defaultAdminBansLimit {
+		t.Fatalf("admin bootstrap bans payload unexpected: %#v", payload["bans"])
+	}
+
+	tokens, ok := payload["tokens"].(map[string]any)
+	if !ok || tokens["limit"] != defaultAdminTokensLimit {
+		t.Fatalf("admin bootstrap tokens payload unexpected: %#v", payload["tokens"])
+	}
+
+	policy, ok := payload["policy"].(map[string]any)
+	if !ok || policy["system"] == nil {
+		t.Fatalf("admin bootstrap policy payload unexpected: %#v", payload["policy"])
 	}
 }
 

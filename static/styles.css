@@ -366,25 +366,43 @@ body {
 }
 
 .top-header {
-  height: 64px;
+  min-height: 64px;
   background-color: white;
   border-bottom: 1px solid var(--border-base);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 1.5rem;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  flex-wrap: wrap;
 }
 
 .header-title {
   font-size: 1.125rem;
   font-weight: 700;
   color: var(--text-main);
+  flex: 1 1 12rem;
+  min-width: 0;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 1.5rem;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  flex: 1 1 24rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.header-status-group {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  flex: 1 1 18rem;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .status-badge {
@@ -397,12 +415,28 @@ body {
   border-radius: var(--radius-full);
   font-size: 0.75rem;
   color: var(--text-muted);
+  min-width: 0;
+  max-width: min(100%, 22rem);
+  flex: 0 1 auto;
+}
+
+.status-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.status-badge-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-badge.online .dot {
-  width: 6px; height: 6px;
   background-color: var(--success);
-  border-radius: 50%;
   box-shadow: 0 0 0 2px var(--success-soft);
 }
 
@@ -789,6 +823,10 @@ body {
   .sidebar { width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid var(--border-base); }
   .nav-menu { flex-direction: row; overflow-x: auto; padding: 0.75rem 1.5rem; }
   .nav-item { width: auto; white-space: nowrap; }
+  .top-header { align-items: flex-start; padding: 1rem 1.25rem; }
+  .header-actions { width: 100%; justify-content: space-between; }
+  .header-status-group { width: 100%; justify-content: flex-start; }
+  .status-badge { max-width: 100%; }
   .explorer-layout { grid-template-columns: 1fr; height: auto; }
   .list-pane { border-right: none; border-bottom: 1px solid var(--border-base); max-height: 300px; }
   .panel-toolbar { flex-direction: column; align-items: stretch; }

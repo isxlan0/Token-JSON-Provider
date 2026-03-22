@@ -17,7 +17,12 @@ import (
 )
 
 func (s *Service) GetAdminMe(ctx context.Context, requestContext *auth.RequestContext) (map[string]any, error) {
-	cacheKey := s.adminCacheKey("admin-me", requestContext.UserID)
+	cacheKey := s.snapshotCacheKey(
+		"admin-me",
+		requestContext.UserID,
+		fmt.Sprintf("av%d", s.cacheScopeVersion("admin")),
+		fmt.Sprintf("upv%d", s.cacheScopeVersion("user-profile", requestContext.UserID)),
+	)
 	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.AdminTTL, func() (map[string]any, error) {
 		policy, err := s.getInventoryPolicy(ctx)
 		if err != nil {
@@ -686,19 +691,21 @@ func (s *Service) CleanupExhaustedTokens(ctx context.Context, mode string) (map[
 }
 
 func (s *Service) GetAdminPolicy(ctx context.Context) (map[string]any, error) {
-	policy, err := s.getInventoryPolicy(ctx)
-	if err != nil {
-		return nil, err
-	}
+	return runtimecache.CacheJSON(s.cache, s.adminCacheKey("admin-policy"), s.cfg.Cache.AdminTTL, func() (map[string]any, error) {
+		policy, err := s.getInventoryPolicy(ctx)
+		if err != nil {
+			return nil, err
+		}
 
-	system, err := s.getSystemStatus(ctx)
-	if err != nil {
-		return nil, err
-	}
+		system, err := s.getSystemStatus(ctx)
+		if err != nil {
+			return nil, err
+		}
 
-	payload := buildAdminPolicyPayload(policy)
-	payload["system"] = system
-	return payload, nil
+		payload := buildAdminPolicyPayload(policy)
+		payload["system"] = system
+		return payload, nil
+	})
 }
 
 func buildAdminPolicyPayload(policy inventoryPolicy) map[string]any {
