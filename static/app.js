@@ -3,6 +3,7 @@ import { createSummarySyncController } from "./app/summary-sync.js?v=20260322f";
 
 const state = {
   user: null,
+  authErrorParam: "",
   quota: null,
   stats: null,
   apiKeysState: {
@@ -65,6 +66,7 @@ const state = {
   leaderCandidate: null,
   leaderCandidatePeers: new Map(),
   lastLowFrequencyAt: 0,
+  bootstrapPromise: null,
 };
 
 const LOW_FREQUENCY_REFRESH_MS = 60000;
@@ -85,6 +87,11 @@ const LEADERSHIP_REASON_PRIORITY = Object.freeze({
 
 const elements = {
   loadingScreen: document.getElementById("loading-screen"),
+  loadingSpinner: document.getElementById("loading-spinner"),
+  loadingTitle: document.getElementById("loading-title"),
+  loadingSubtitle: document.getElementById("loading-subtitle"),
+  loadingMessage: document.getElementById("loading-message"),
+  loadingRetryBtn: document.getElementById("loading-retry-btn"),
   loginScreen: document.getElementById("login-screen"),
   appScreen: document.getElementById("app-screen"),
   loginBtn: document.getElementById("linuxdo-login-btn"),
@@ -1909,6 +1916,62 @@ async function loadDashboard() {
   return bootstrap;
 }
 
+async function bootstrapAppShell() {
+  if (state.bootstrapPromise) {
+    return state.bootstrapPromise;
+  }
+
+  setLoadingState({
+    title: "正在加载",
+    subtitle: "正在请求数据面板并确认当前会话。",
+    message: "",
+    showRetry: false,
+    showSpinner: true,
+  });
+  showScreen("loading");
+
+  state.bootstrapPromise = (async () => {
+    try {
+      applyDocsBaseUrl();
+      await loadDashboard();
+      showScreen("app");
+      switchTab("data");
+      claimPollingLeadership();
+      syncQueueRealtimeTransport();
+      syncUploadResultsTransport();
+    } catch (error) {
+      if (error?.status === 401) {
+        stopAllBackgroundActivity("auth-expired");
+        showScreen("login");
+        setLoginMessage("", "error");
+        if (state.authErrorParam) {
+          setLoginMessage(`登录失败：${state.authErrorParam}`, "error");
+        }
+        return;
+      }
+      if (handleAccessError(error)) {
+        return;
+      }
+      setLoadingState({
+        title: "启动失败",
+        subtitle: "首屏数据加载失败，当前不会误判为未登录。",
+        message: describeBootstrapError(error),
+        tone: "error",
+        showRetry: true,
+        showSpinner: false,
+      });
+      showScreen("loading");
+    } finally {
+      state.bootstrapPromise = null;
+      if (elements.loadingRetryBtn) {
+        elements.loadingRetryBtn.disabled = false;
+      }
+    }
+  })();
+
+  return state.bootstrapPromise;
+}
+
 async function loadRuntimeSnapshot(options = {}) {
   return summarySync.loadRuntimeSnapshot(options);
 }
@@ -2474,6 +2537,54 @@ function clearUploadResultsPoller() {
   }
 }
 
+function setLoadingState({
+  title = "正在加载",
+  subtitle = "正在请求数据面板并确认当前会话。",
+  message = "",
+  tone = "error",
+  showRetry = false,
+  showSpinner = true,
+} = {}) {
+  if (elements.loadingTitle) {
+    elements.loadingTitle.textContent = title;
+  }
+  if (elements.loadingSubtitle) {
+    elements.loadingSubtitle.textContent = subtitle;
+  }
+  if (elements.loadingMessage) {
+    elements.loadingMessage.textContent = message;
+    elements.loadingMessage.dataset.tone = tone;
+    elements.loadingMessage.classList.toggle("hidden", !message);
+  }
+  if (elements.loadingSpinner) {
+    elements.loadingSpinner.classList.toggle("hidden", !showSpinner);
+  }
+  if (elements.loadingRetryBtn) {
+    elements.loadingRetryBtn.classList.toggle("hidden", !showRetry);
+    elements.loadingRetryBtn.disabled = Boolean(state.bootstrapPromise);
+  }
+}
+
+function describeBootstrapError(error, fallback = "无法加载数据面板，请稍后重试。") {
+  if (!error) {
+    return fallback;
+  }
+  const message = String(error.message || "").trim();
+  if (!message) {
+    return fallback;
+  }
+  const lower = message.toLowerCase();
+  if (
+    lower === "failed to fetch" ||
+    lower.includes("networkerror") ||
+    lower.includes("load failed") ||
+    lower.includes("network request failed")
+  ) {
+    return "无法连接服务器，请确认服务已启动且当前网络可访问。";
+  }
+  return message;
+}
+
 function closeUploadResultsStream() {
   if (state.uploadStream) {
     state.uploadStream.close();
@@ -2586,6 +2697,11 @@ function bindEvents() {
   if (elements.loginBtn) {
     elements.loginBtn.addEventListener("click", () => {
       window.location.href = "/auth/linuxdo/login";
+    });
+  }
+  if (elements.loadingRetryBtn) {
+    elements.loadingRetryBtn.addEventListener("click", () => {
+      bootstrapAppShell().catch(() => {});
     });
   }
   if (elements.logoutBtn) {
@@ -2716,35 +2832,15 @@ async function init() {
   renderUploadSelected();
   renderUploadResults();
   setUploadSubmitting(false);
-  showScreen("loading");
   elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
   const url = new URL(window.location.href);
-  const authError = url.searchParams.get("auth_error");
+  state.authErrorParam = url.searchParams.get("auth_error") || "";
+  await bootstrapAppShell();
 
-  try {
-    applyDocsBaseUrl();
-    await loadDashboard();
-    showScreen("app");
-    switchTab("data");
-    claimPollingLeadership();
-    syncQueueRealtimeTransport();
-    syncUploadResultsTransport();
-  } catch (error) {
-    if (error.status === 401) {
-      stopAllBackgroundActivity("auth-expired");
-      showScreen("login");
-      if (authError) {
-        setLoginMessage(`登录失败：${authError}`, "error");
-      }
-    } else if (!handleAccessError(error)) {
-      setLoginMessage(error.message, "error");
-      showScreen("login");
-    }
-  }
-
-  if (authError) {
+  if (state.authErrorParam) {
     url.searchParams.delete("auth_error");
     window.history.replaceState({}, document.title, `${url.pathname}${url.search}`);
+    state.authErrorParam = "";
   }
 }
 

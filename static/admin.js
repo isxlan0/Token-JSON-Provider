@@ -1,4 +1,6 @@
 const state = {
+  authErrorParam: "",
+  bootstrapPromise: null,
   user: null,
   me: null,
   users: [],
@@ -13,6 +15,12 @@ const state = {
 };
 
 const elements = {
+  loadingScreen: document.getElementById("admin-loading-screen"),
+  loadingSpinner: document.getElementById("admin-loading-spinner"),
+  loadingTitle: document.getElementById("admin-loading-title"),
+  loadingSubtitle: document.getElementById("admin-loading-subtitle"),
+  loadingMessage: document.getElementById("admin-loading-message"),
+  loadingRetryBtn: document.getElementById("admin-loading-retry-btn"),
   loginScreen: document.getElementById("admin-login-screen"),
   deniedScreen: document.getElementById("admin-denied-screen"),
   appScreen: document.getElementById("admin-app-screen"),
@@ -58,6 +66,7 @@ const elements = {
 };
 
 function showScreen(name) {
+  elements.loadingScreen.classList.toggle("hidden", name !== "loading");
   elements.loginScreen.classList.toggle("hidden", name !== "login");
   elements.deniedScreen.classList.toggle("hidden", name !== "denied");
   elements.appScreen.classList.toggle("hidden", name !== "app");
@@ -67,6 +76,44 @@ function setLoginMessage(message = "", tone = "error") {
   elements.loginMessage.textContent = message;
   elements.loginMessage.dataset.tone = tone;
   elements.loginMessage.classList.toggle("hidden", !message);
+}
+
+function setLoadingState({
+  title = "正在加载后台",
+  subtitle = "正在请求后台数据并确认管理员权限。",
+  message = "",
+  tone = "error",
+  showRetry = false,
+  showSpinner = true,
+} = {}) {
+  elements.loadingTitle.textContent = title;
+  elements.loadingSubtitle.textContent = subtitle;
+  elements.loadingMessage.textContent = message;
+  elements.loadingMessage.dataset.tone = tone;
+  elements.loadingMessage.classList.toggle("hidden", !message);
+  elements.loadingSpinner.classList.toggle("hidden", !showSpinner);
+  elements.loadingRetryBtn.classList.toggle("hidden", !showRetry);
+  elements.loadingRetryBtn.disabled = Boolean(state.bootstrapPromise);
+}
+
+function describeStartupError(error, fallback = "无法加载后台数据，请稍后重试。") {
+  if (!error) {
+    return fallback;
+  }
+  const message = String(error.message || "").trim();
+  if (!message) {
+    return fallback;
+  }
+  const lower = message.toLowerCase();
+  if (
+    lower === "failed to fetch" ||
+    lower.includes("networkerror") ||
+    lower.includes("load failed") ||
+    lower.includes("network request failed")
+  ) {
+    return "无法连接服务器，请确认服务已启动且当前网络可访问。";
+  }
+  return message;
 }
 
 function showNotice(message = "", tone = "success") {
@@ -489,6 +536,11 @@ async function loadPolicy() {
   renderPolicy();
 }
 
+async function loadAdminBootstrap() {
+  await loadAdminMe();
+  await Promise.all([loadUsers(true), loadBans(true), loadTokens(true), loadPolicy()]);
+}
+
 async function cleanupExhaustedTokens(mode) {
   const filesOnly = mode === "files_only";
   const confirmText = filesOnly
@@ -589,6 +641,9 @@ function bindEvents() {
   elements.loginBtn?.addEventListener("click", () => {
     window.location.href = "/auth/linuxdo/login?next=/admin";
   });
+  elements.loadingRetryBtn?.addEventListener("click", () => {
+    bootstrapAdminShell().catch(() => {});
+  });
   elements.logoutBtn?.addEventListener("click", logout);
   elements.deniedLogoutBtn?.addEventListener("click", logout);
   elements.tabUsers?.addEventListener("click", () => switchTab("users"));
@@ -611,39 +666,67 @@ function bindEvents() {
   elements.tokenLimit?.addEventListener("change", () => loadTokens(true));
 }
 
+async function bootstrapAdminShell() {
+  if (state.bootstrapPromise) {
+    return state.bootstrapPromise;
+  }
+
+  setLoadingState({
+    title: "正在加载后台",
+    subtitle: "正在请求后台数据并确认管理员权限。",
+    message: "",
+    showRetry: false,
+    showSpinner: true,
+  });
+  showScreen("loading");
+
+  state.bootstrapPromise = (async () => {
+    try {
+      await loadAdminBootstrap();
+      showScreen("app");
+      switchTab("users");
+    } catch (error) {
+      if (error?.status === 401) {
+        showScreen("login");
+        setLoginMessage("", "error");
+        if (state.authErrorParam) {
+          setLoginMessage(`登录失败：${state.authErrorParam}`, "error");
+        }
+        return;
+      }
+      if (error?.status === 403) {
+        elements.deniedMessage.textContent = error.message;
+        showScreen("denied");
+        return;
+      }
+      setLoadingState({
+        title: "后台启动失败",
+        subtitle: "首屏后台数据加载失败，当前不会误判为未登录。",
+        message: describeStartupError(error),
+        tone: "error",
+        showRetry: true,
+        showSpinner: false,
+      });
+      showScreen("loading");
+    } finally {
+      state.bootstrapPromise = null;
+      elements.loadingRetryBtn.disabled = false;
+    }
+  })();
+
+  return state.bootstrapPromise;
+}
+
 async function init() {
   bindEvents();
   const url = new URL(window.location.href);
-  const authError = url.searchParams.get("auth_error");
-  try {
-    const status = await fetchJson("/auth/status");
-    if (!status.authenticated) {
-      showScreen("login");
-      if (authError) {
-        setLoginMessage(`登录失败：${authError}`, "error");
-      }
-    } else if (!status.user?.is_admin) {
-      elements.deniedMessage.textContent = "当前账号不在 .env 管理员名单中，不能进入后台。";
-      showScreen("denied");
-    } else {
-      state.user = status.user;
-      showScreen("app");
-      switchTab("users");
-      await Promise.all([loadAdminMe(), loadUsers(true), loadBans(true), loadTokens(true), loadPolicy()]);
-    }
-  } catch (error) {
-    if (error.status === 403) {
-      elements.deniedMessage.textContent = error.message;
-      showScreen("denied");
-    } else {
-      showScreen("login");
-      setLoginMessage(error.message, "error");
-    }
-  }
+  state.authErrorParam = url.searchParams.get("auth_error") || "";
+  await bootstrapAdminShell();
 
-  if (authError) {
+  if (state.authErrorParam) {
     url.searchParams.delete("auth_error");
     window.history.replaceState({}, document.title, `${url.pathname}${url.search}`);
+    state.authErrorParam = "";
   }
 }
 
