@@ -70,6 +70,17 @@ func (s *Service) userAPIKeySummaryCacheKey(userID int64) string {
 	return s.snapshotCacheKey("user-apikey-summary", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-apikey-summary", userID)))
 }
 
+func (s *Service) userRuntimeSnapshotCacheKey(userID int64) string {
+	return s.snapshotCacheKey(
+		"user-runtime-snapshot",
+		userID,
+		fmt.Sprintf("qv%d", s.cacheScopeVersion("user-quota", userID)),
+		fmt.Sprintf("cv%d", s.cacheScopeVersion("user-claims-summary", userID)),
+		fmt.Sprintf("akv%d", s.cacheScopeVersion("user-apikey-summary", userID)),
+		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
+	)
+}
+
 func (s *Service) userQueueCacheKey(userID int64) string {
 	return s.snapshotCacheKey("user-queue", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-queue", userID)))
 }

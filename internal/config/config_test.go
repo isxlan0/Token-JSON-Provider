@@ -124,6 +124,37 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	}
 }
 
+func TestLoadFromPathUsesOneHourCacheDefaults(t *testing.T) {
+	unsetKnownEnvKeys(t)
+
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte(""), 0o644); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+
+	cfg, err := loadFromPath(envPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.Cache.DefaultTTL != 3600 {
+		t.Fatalf("unexpected cache default ttl: %d", cfg.Cache.DefaultTTL)
+	}
+	if cfg.Cache.MeTTL != 3600 {
+		t.Fatalf("unexpected me ttl: %d", cfg.Cache.MeTTL)
+	}
+	if cfg.Cache.ClaimsTTL != 3600 {
+		t.Fatalf("unexpected claims ttl: %d", cfg.Cache.ClaimsTTL)
+	}
+	if cfg.Cache.AdminTTL != 3600 {
+		t.Fatalf("unexpected admin ttl: %d", cfg.Cache.AdminTTL)
+	}
+	if cfg.Cache.DashboardTTL != 3600 {
+		t.Fatalf("unexpected dashboard ttl: %d", cfg.Cache.DashboardTTL)
+	}
+}
+
 func unsetKnownEnvKeys(t *testing.T) {
 	t.Helper()
 

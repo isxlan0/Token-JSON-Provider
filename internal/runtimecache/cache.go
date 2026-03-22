@@ -157,6 +157,15 @@ type AppCache struct {
 	mu          sync.RWMutex
 	backendName string
 	backend     backend
+
+	flightMu sync.Mutex
+	flights  map[string]*cacheFlight
+}
+
+type cacheFlight struct {
+	done   chan struct{}
+	result any
+	err    error
 }
 
 func New(ctx context.Context, cfg config.CacheConfig, logger *slog.Logger) *AppCache {
@@ -167,6 +176,7 @@ func New(ctx context.Context, cfg config.CacheConfig, logger *slog.Logger) *AppC
 	cache := &AppCache{
 		backendName: "memory",
 		backend:     newMemoryBackend(),
+		flights:     make(map[string]*cacheFlight),
 	}
 
 	mode := strings.ToLower(strings.TrimSpace(cfg.Backend))
@@ -258,6 +268,48 @@ func (c *AppCache) Incr(key string) int64 {
 	return value
 }
 
+func (c *AppCache) beginFlight(key string) (*cacheFlight, bool) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return &cacheFlight{done: make(chan struct{})}, true
+	}
+
+	c.flightMu.Lock()
+	defer c.flightMu.Unlock()
+
+	if c.flights == nil {
+		c.flights = make(map[string]*cacheFlight)
+	}
+	if flight, ok := c.flights[trimmed]; ok {
+		return flight, false
+	}
+
+	flight := &cacheFlight{done: make(chan struct{})}
+	c.flights[trimmed] = flight
+	return flight, true
+}
+
+func (c *AppCache) finishFlight(key string, flight *cacheFlight, result any, err error) {
+	if flight == nil {
+		return
+	}
+
+	flight.result = result
+	flight.err = err
+	close(flight.done)
+
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return
+	}
+
+	c.flightMu.Lock()
+	if current, ok := c.flights[trimmed]; ok && current == flight {
+		delete(c.flights, trimmed)
+	}
+	c.flightMu.Unlock()
+}
+
 func (c *AppCache) GetJSON(key string, target any) bool {
 	raw, ok := c.GetText(key)
 	if !ok {
@@ -329,6 +381,34 @@ func CacheJSON[T any](cache *AppCache, key string, ttlSec int, loader func() (T,
 		if cache.GetJSON(key, &cached) {
 			return cached, nil
 		}
+
+		flight, leader := cache.beginFlight(key)
+		if !leader {
+			<-flight.done
+			if flight.err != nil {
+				return zero, flight.err
+			}
+			value, ok := flight.result.(T)
+			if !ok {
+				return zero, fmt.Errorf("cache flight result type mismatch for key %q", key)
+			}
+			return value, nil
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				cache.finishFlight(key, flight, zero, fmt.Errorf("cache loader panic for key %q: %v", key, r))
+				panic(r)
+			}
+		}()
+
+		value, err := loader()
+		if err != nil {
+			cache.finishFlight(key, flight, zero, err)
+			return zero, err
+		}
+		cache.SetJSON(key, value, ttlSec)
+		cache.finishFlight(key, flight, value, nil)
+		return value, nil
 	}
 
 	value, err := loader()

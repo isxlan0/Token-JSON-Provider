@@ -130,6 +130,21 @@ func (s *Service) warmReadCaches(ctx context.Context) {
 	if _, err := s.getSystemStatus(ctx); err != nil {
 		s.logger.Warn("warm system cache", "error", err)
 	}
+	if _, err := s.getLeaderboard(ctx, 24*3600, 10); err != nil {
+		s.logger.Warn("warm leaderboard cache", "error", err)
+	}
+	if _, err := s.getRecentClaims(ctx, 10); err != nil {
+		s.logger.Warn("warm recent claims cache", "error", err)
+	}
+	if _, err := s.getContributorLeaderboard(ctx, 10); err != nil {
+		s.logger.Warn("warm contributor leaderboard cache", "error", err)
+	}
+	if _, err := s.getRecentContributors(ctx, 10); err != nil {
+		s.logger.Warn("warm recent contributors cache", "error", err)
+	}
+	if _, err := s.getClaimTrends(ctx, 7*24*3600, 3600); err != nil {
+		s.logger.Warn("warm claim trends cache", "error", err)
+	}
 	s.primeAdminDefaultReadCaches(ctx)
 
 	userIDs, err := s.listQueuedUserIDs(ctx)

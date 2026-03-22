@@ -624,29 +624,31 @@ func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestCo
 }
 
 func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtimeSnapshotPayload, error) {
-	quota, err := s.GetQuotaUsage(ctx, userID)
-	if err != nil {
-		return runtimeSnapshotPayload{}, err
-	}
+	return runtimecache.CacheJSON(s.cache, s.userRuntimeSnapshotCacheKey(userID), s.cfg.Cache.MeTTL, func() (runtimeSnapshotPayload, error) {
+		quota, err := s.GetQuotaUsage(ctx, userID)
+		if err != nil {
+			return runtimeSnapshotPayload{}, err
+		}
 
-	claims, err := s.GetUserClaimTotals(ctx, userID)
-	if err != nil {
-		return runtimeSnapshotPayload{}, err
-	}
+		claims, err := s.GetUserClaimTotals(ctx, userID)
+		if err != nil {
+			return runtimeSnapshotPayload{}, err
+		}
 
-	apiKeys, err := s.GetAPIKeySummary(ctx, userID)
-	if err != nil {
-		return runtimeSnapshotPayload{}, err
-	}
+		apiKeys, err := s.GetAPIKeySummary(ctx, userID)
+		if err != nil {
+			return runtimeSnapshotPayload{}, err
+		}
 
-	return runtimeSnapshotPayload{
-		Quota:  quota,
-		Claims: claims,
-		APIKeys: map[string]apiKeySummaryPayload{
-			"summary": apiKeys,
-		},
-		UploadResults: buildUploadResultsSummaryPayload(s.GetUploadResults(userID)),
-	}, nil
+		return runtimeSnapshotPayload{
+			Quota:  quota,
+			Claims: claims,
+			APIKeys: map[string]apiKeySummaryPayload{
+				"summary": apiKeys,
+			},
+			UploadResults: buildUploadResultsSummaryPayload(s.GetUploadResults(userID)),
+		}, nil
+	})
 }
 
 func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatusPayload, error) {

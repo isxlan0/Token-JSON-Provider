@@ -163,6 +163,45 @@ func TestBootstrapCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
 	}
 }
 
+func TestRuntimeSnapshotCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "1004", "runtime-user")
+
+	first, err := service.GetRuntimeSnapshot(ctx, userID)
+	if err != nil {
+		t.Fatalf("get first runtime snapshot: %v", err)
+	}
+	if first.UploadResults["batch_id"] != nil {
+		t.Fatalf("expected empty upload batch id before upload snapshot, got %#v", first.UploadResults["batch_id"])
+	}
+
+	service.setUploadSnapshot(userID, uploadSnapshot{
+		BatchID:   "runtime-batch-1",
+		CreatedAt: "2026-03-22T00:00:00Z",
+		Items: []map[string]any{
+			{
+				"request_index": 1,
+				"file_name":     "runtime.json",
+				"status":        "accepted",
+				"reason":        "已入库",
+			},
+		},
+		History:     []map[string]any{},
+		QueueStatus: map[string]any{"queued": 0},
+	})
+
+	second, err := service.GetRuntimeSnapshot(ctx, userID)
+	if err != nil {
+		t.Fatalf("get second runtime snapshot: %v", err)
+	}
+	if second.UploadResults["batch_id"] != "runtime-batch-1" {
+		t.Fatalf("expected refreshed runtime upload batch id, got %#v", second.UploadResults["batch_id"])
+	}
+}
+
 func TestAdminBootstrapIncludesDefaultDatasets(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)

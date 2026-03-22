@@ -2356,17 +2356,18 @@ async function runLowFrequencyRefresh() {
   }
   state.refreshing = true;
   try {
-    const [runtimeResult, dashboardResult] = await Promise.allSettled([
-      loadRuntimeSnapshot({ broadcast: true }),
-      loadDashboardSummary({ broadcast: true }),
-    ]);
-    if (runtimeResult.status === "rejected" && handleAccessError(runtimeResult.reason)) {
-      return;
-    }
-    if (dashboardResult.status === "rejected" && handleAccessError(dashboardResult.reason)) {
-      return;
-    }
+    const bootstrap = await summarySync.loadBootstrapBundle({ broadcast: true });
+    handleQueueStatusPayload(bootstrap?.queue_status || { queued: false }, {
+      broadcast: true,
+      source: "bootstrap",
+      silentRefresh: true,
+    });
     state.lastLowFrequencyAt = Date.now();
+  } catch (error) {
+    if (handleAccessError(error)) {
+      return;
+    }
+    throw error;
   } finally {
     state.refreshing = false;
     scheduleLowFrequencyRefresh(LOW_FREQUENCY_REFRESH_MS);

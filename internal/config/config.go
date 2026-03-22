@@ -239,12 +239,12 @@ func loadFromPath(path string) (Config, error) {
 			RedisUsername: source.cleanedString(envRedisUsername, ""),
 			RedisPassword: source.cleanedString(envRedisPassword, ""),
 			RedisPrefix:   source.cleanedString(envRedisPrefix, "token_index:"),
-			DefaultTTL:    maxInt(1, source.cleanedInt(envCacheDefaultTTL, 15)),
-			MeTTL:         maxInt(1, source.cleanedInt(envCacheMeTTL, 10)),
-			ClaimsTTL:     maxInt(1, source.cleanedInt(envCacheClaimsTTL, 15)),
-			AdminTTL:      maxInt(1, source.cleanedInt(envCacheAdminTTL, 20)),
+			DefaultTTL:    maxInt(1, source.cleanedInt(envCacheDefaultTTL, 3600)),
+			MeTTL:         maxInt(1, source.cleanedInt(envCacheMeTTL, 3600)),
+			ClaimsTTL:     maxInt(1, source.cleanedInt(envCacheClaimsTTL, 3600)),
+			AdminTTL:      maxInt(1, source.cleanedInt(envCacheAdminTTL, 3600)),
 			QueueTTL:      maxInt(1, source.cleanedInt(envCacheQueueTTL, 5)),
-			DashboardTTL:  maxInt(1, source.cleanedInt(envCacheDashboardTTL, 10)),
+			DashboardTTL:  maxInt(1, source.cleanedInt(envCacheDashboardTTL, 3600)),
 		},
 		Inventory: InventoryConfig{
 			Thresholds: ThresholdConfig{

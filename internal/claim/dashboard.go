@@ -187,95 +187,101 @@ func (s *Service) getRecentClaims(ctx context.Context, limit int) ([]map[string]
 }
 
 func (s *Service) getContributorLeaderboard(ctx context.Context, limit int) ([]map[string]any, error) {
-	rows, err := s.store.DB().QueryContext(ctx, `
-		SELECT provider_user_id,
-		       provider_username,
-		       provider_name,
-		       COUNT(*) AS cnt
-		FROM tokens
-		WHERE provider_user_id IS NOT NULL
-		  AND provider_user_id != ''
-		GROUP BY provider_user_id, provider_username, provider_name
-		ORDER BY cnt DESC, provider_username ASC, provider_user_id ASC
-		LIMIT ?
-	`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query contributor leaderboard: %w", err)
-	}
-	defer rows.Close()
-
-	items := make([]map[string]any, 0)
-	for rows.Next() {
-		var (
-			userID   string
-			username sql.NullString
-			name     sql.NullString
-			count    int
-		)
-		if err := rows.Scan(&userID, &username, &name, &count); err != nil {
-			return nil, fmt.Errorf("scan contributor leaderboard row: %w", err)
+	cacheKey := s.dashboardCacheKey("dashboard-contributors", nil, limit)
+	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() ([]map[string]any, error) {
+		rows, err := s.store.DB().QueryContext(ctx, `
+			SELECT provider_user_id,
+			       provider_username,
+			       provider_name,
+			       COUNT(*) AS cnt
+			FROM tokens
+			WHERE provider_user_id IS NOT NULL
+			  AND provider_user_id != ''
+			GROUP BY provider_user_id, provider_username, provider_name
+			ORDER BY cnt DESC, provider_username ASC, provider_user_id ASC
+			LIMIT ?
+		`, limit)
+		if err != nil {
+			return nil, fmt.Errorf("query contributor leaderboard: %w", err)
 		}
-		items = append(items, map[string]any{
-			"user_id":  userID,
-			"username": username.String,
-			"name":     firstNonEmpty(name.String, username.String, userID),
-			"count":    count,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate contributor leaderboard rows: %w", err)
-	}
-	return items, nil
+		defer rows.Close()
+
+		items := make([]map[string]any, 0)
+		for rows.Next() {
+			var (
+				userID   string
+				username sql.NullString
+				name     sql.NullString
+				count    int
+			)
+			if err := rows.Scan(&userID, &username, &name, &count); err != nil {
+				return nil, fmt.Errorf("scan contributor leaderboard row: %w", err)
+			}
+			items = append(items, map[string]any{
+				"user_id":  userID,
+				"username": username.String,
+				"name":     firstNonEmpty(name.String, username.String, userID),
+				"count":    count,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate contributor leaderboard rows: %w", err)
+		}
+		return items, nil
+	})
 }
 
 func (s *Service) getRecentContributors(ctx context.Context, limit int) ([]map[string]any, error) {
-	rows, err := s.store.DB().QueryContext(ctx, `
-		SELECT provider_user_id,
-		       provider_username,
-		       provider_name,
-		       COUNT(*) AS cnt,
-		       MAX(uploaded_at_ts) AS uploaded_at_ts
-		FROM tokens
-		WHERE provider_user_id IS NOT NULL
-		  AND provider_user_id != ''
-		GROUP BY provider_user_id, provider_username, provider_name
-		ORDER BY uploaded_at_ts DESC, provider_username ASC, provider_user_id ASC
-		LIMIT ?
-	`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query recent contributors: %w", err)
-	}
-	defer rows.Close()
+	cacheKey := s.dashboardCacheKey("dashboard-recent-contributors", nil, limit)
+	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() ([]map[string]any, error) {
+		rows, err := s.store.DB().QueryContext(ctx, `
+			SELECT provider_user_id,
+			       provider_username,
+			       provider_name,
+			       COUNT(*) AS cnt,
+			       MAX(uploaded_at_ts) AS uploaded_at_ts
+			FROM tokens
+			WHERE provider_user_id IS NOT NULL
+			  AND provider_user_id != ''
+			GROUP BY provider_user_id, provider_username, provider_name
+			ORDER BY uploaded_at_ts DESC, provider_username ASC, provider_user_id ASC
+			LIMIT ?
+		`, limit)
+		if err != nil {
+			return nil, fmt.Errorf("query recent contributors: %w", err)
+		}
+		defer rows.Close()
 
-	items := make([]map[string]any, 0)
-	for rows.Next() {
-		var (
-			userID     string
-			username   sql.NullString
-			name       sql.NullString
-			count      int
-			uploadedAt sql.NullInt64
-		)
-		if err := rows.Scan(&userID, &username, &name, &count, &uploadedAt); err != nil {
-			return nil, fmt.Errorf("scan recent contributor row: %w", err)
+		items := make([]map[string]any, 0)
+		for rows.Next() {
+			var (
+				userID     string
+				username   sql.NullString
+				name       sql.NullString
+				count      int
+				uploadedAt sql.NullInt64
+			)
+			if err := rows.Scan(&userID, &username, &name, &count, &uploadedAt); err != nil {
+				return nil, fmt.Errorf("scan recent contributor row: %w", err)
+			}
+
+			item := map[string]any{
+				"user_id":  userID,
+				"username": username.String,
+				"name":     firstNonEmpty(name.String, username.String, userID),
+				"count":    count,
+			}
+			if uploadedAt.Valid {
+				item["uploaded_at"] = isoformatFromTS(uploadedAt.Int64)
+			}
+			items = append(items, item)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate recent contributor rows: %w", err)
 		}
 
-		item := map[string]any{
-			"user_id":  userID,
-			"username": username.String,
-			"name":     firstNonEmpty(name.String, username.String, userID),
-			"count":    count,
-		}
-		if uploadedAt.Valid {
-			item["uploaded_at"] = isoformatFromTS(uploadedAt.Int64)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate recent contributor rows: %w", err)
-	}
-
-	return items, nil
+		return items, nil
+	})
 }
 
 func (s *Service) getClaimTrends(ctx context.Context, windowSeconds int, bucketSeconds int) ([]map[string]any, error) {

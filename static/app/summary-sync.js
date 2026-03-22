@@ -466,6 +466,18 @@ export function createSummarySyncController(deps) {
     });
   }
 
+  function buildRuntimeSnapshotFromBootstrap(payload = {}) {
+    const profile = payload?.profile || {};
+    return {
+      quota: profile?.quota || null,
+      claims: profile?.claims || {},
+      api_keys: {
+        summary: profile?.api_keys || {},
+      },
+      upload_results: payload?.upload_results || {},
+    };
+  }
+
   async function loadRuntimeSnapshot(options = {}) {
     const shouldBroadcast = Boolean(
       options.broadcast &&
@@ -526,6 +538,67 @@ export function createSummarySyncController(deps) {
     return summary;
   }
 
+  async function loadBootstrapBundle(options = {}) {
+    const shouldBroadcast = Boolean(
+      options.broadcast &&
+      hasCrossTabCoordination() &&
+      isLeaderTab()
+    );
+    const runtimeRequestIds = resolveEnvelopeRequestIds("runtime", {
+      requestIds: options.runtimeRequestIds ?? options.requestIds,
+      request_ids: options.runtime_request_ids,
+      attachPendingRequestIds: options.attachPendingRequestIds,
+    });
+    const dashboardRequestIds = resolveEnvelopeRequestIds("dashboard", {
+      requestIds: options.dashboardRequestIds ?? options.requestIds,
+      request_ids: options.dashboard_request_ids,
+      attachPendingRequestIds: options.attachPendingRequestIds,
+    });
+    const runtimeVersion = shouldBroadcast
+      ? buildSummaryVersionPayload(options.runtimeVersion ?? options.version ?? nextSummaryBroadcastVersion("runtime"))
+      : null;
+    const dashboardVersion = shouldBroadcast
+      ? buildSummaryVersionPayload(options.dashboardVersion ?? options.version ?? nextSummaryBroadcastVersion("dashboard"))
+      : null;
+    const bootstrap = await deps.fetchJson?.("/me/bootstrap");
+    const runtimeSnapshot = buildRuntimeSnapshotFromBootstrap(bootstrap || {});
+    const dashboardSummary = bootstrap?.dashboard || {};
+
+    if (shouldBroadcast || runtimeRequestIds.length || runtimeVersion) {
+      const runtimeEnvelope = {
+        snapshot: runtimeSnapshot,
+        ...buildRequestMetadata(runtimeRequestIds),
+      };
+      if (runtimeVersion) {
+        runtimeEnvelope.version = runtimeVersion;
+      }
+      applyRuntimeSnapshotEnvelope(runtimeEnvelope);
+      if (shouldBroadcast && isLeaderTab()) {
+        deps.broadcastMessage?.("runtime_snapshot", runtimeEnvelope);
+      }
+    } else {
+      deps.applyRuntimeSnapshot?.(runtimeSnapshot);
+    }
+
+    if (shouldBroadcast || dashboardRequestIds.length || dashboardVersion) {
+      const dashboardEnvelope = {
+        summary: dashboardSummary,
+        ...buildRequestMetadata(dashboardRequestIds),
+      };
+      if (dashboardVersion) {
+        dashboardEnvelope.version = dashboardVersion;
+      }
+      applyDashboardSummaryEnvelope(dashboardEnvelope);
+      if (shouldBroadcast && isLeaderTab()) {
+        deps.broadcastMessage?.("dashboard_summary", dashboardEnvelope);
+      }
+    } else {
+      deps.applyDashboardSummary?.(dashboardSummary);
+    }
+
+    return bootstrap || {};
+  }
+
   function buildSummaryRefreshBatch() {
     if (!canPerformPrimaryRefreshWork()) {
       return null;
@@ -575,7 +648,23 @@ export function createSummarySyncController(deps) {
     }
     state.summaryFlushPromise = (async () => {
       const tasks = [];
-      if (batch.runtimeRequestIds.length) {
+      if (batch.runtimeRequestIds.length && batch.dashboardRequestIds.length) {
+        tasks.push({
+          kind: "bootstrap",
+          requestIds: Array.from(new Set([
+            ...batch.runtimeRequestIds,
+            ...batch.dashboardRequestIds,
+          ])),
+          promise: loadBootstrapBundle({
+            broadcast: batch.shouldBroadcast,
+            runtimeVersion: batch.runtimeVersion,
+            dashboardVersion: batch.dashboardVersion,
+            runtimeRequestIds: batch.runtimeRequestIds,
+            dashboardRequestIds: batch.dashboardRequestIds,
+            attachPendingRequestIds: false,
+          }),
+        });
+      } else if (batch.runtimeRequestIds.length) {
         tasks.push({
           kind: "runtime",
           requestIds: batch.runtimeRequestIds,
@@ -718,6 +807,7 @@ export function createSummarySyncController(deps) {
   }
 
   return {
+    loadBootstrapBundle,
     loadRuntimeSnapshot,
     loadDashboardSummary,
     applyRuntimeSnapshotEnvelope,
