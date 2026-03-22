@@ -381,7 +381,7 @@ body {
   font-size: 1.125rem;
   font-weight: 700;
   color: var(--text-main);
-  flex: 1 1 12rem;
+  flex: 0 1 auto;
   min-width: 0;
 }
 
@@ -390,19 +390,22 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 0.75rem;
-  flex: 1 1 24rem;
+  flex: 0 1 auto;
+  margin-left: auto;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  max-width: 100%;
 }
 
 .header-status-group {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 0.75rem;
-  flex: 1 1 18rem;
+  gap: 0.5rem;
+  flex: 0 1 auto;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  max-width: 100%;
 }
 
 .status-badge {
@@ -429,6 +432,7 @@ body {
 }
 
 .status-badge-text {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -438,6 +442,55 @@ body {
 .status-badge.online .dot {
   background-color: var(--success);
   box-shadow: 0 0 0 2px var(--success-soft);
+}
+
+.origin-badge {
+  flex: 0 1 auto;
+  max-width: min(32rem, 42vw);
+}
+
+.origin-badge .status-badge-text {
+  max-width: min(28rem, 38vw);
+}
+
+.auth-method-badge {
+  flex: 0 0 auto;
+  max-width: none;
+}
+
+.username-badge {
+  flex: 0 1 auto;
+  max-width: 10rem;
+}
+
+.header-logout {
+  width: auto;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+@media (max-width: 1180px) {
+  .header-actions {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    margin-left: 0;
+  }
+
+  .header-status-group {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .origin-badge {
+    flex: 1 1 100%;
+    max-width: 100%;
+  }
+
+  .header-logout {
+    margin-left: auto;
+  }
 }
 
 .content-body {
@@ -824,9 +877,13 @@ body {
   .nav-menu { flex-direction: row; overflow-x: auto; padding: 0.75rem 1.5rem; }
   .nav-item { width: auto; white-space: nowrap; }
   .top-header { align-items: flex-start; padding: 1rem 1.25rem; }
-  .header-actions { width: 100%; justify-content: space-between; }
-  .header-status-group { width: 100%; justify-content: flex-start; }
+  .header-actions { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+  .header-status-group { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
   .status-badge { max-width: 100%; }
+  .origin-badge { flex: 1 1 100%; max-width: 100%; }
+  .origin-badge .status-badge-text { max-width: 100%; }
+  .auth-method-badge,
+  .username-badge { flex: 1 1 auto; max-width: 100%; }
   .explorer-layout { grid-template-columns: 1fr; height: auto; }
   .list-pane { border-right: none; border-bottom: 1px solid var(--border-base); max-height: 300px; }
   .panel-toolbar { flex-direction: column; align-items: stretch; }

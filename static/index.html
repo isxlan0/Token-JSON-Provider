@@ -96,9 +96,9 @@
     }
   </style>
   <link rel="modulepreload" href="/assets/app/leader-sync.js?v=20260322f">
-  <link rel="modulepreload" href="/assets/app/summary-sync.js?v=20260322f">
-  <link rel="stylesheet" href="/assets/styles.css?v=20260322m">
-  <script type="module" src="/assets/app.js?v=20260322k"></script>
+  <link rel="modulepreload" href="/assets/app/summary-sync.js?v=20260322g">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260322q">
+  <script type="module" src="/assets/app.js?v=20260322m"></script>
 </head>
 
 <body class="light-theme">
@@ -244,16 +244,20 @@
         <div class="header-title" id="header-title">数据面板</div>
         <div class="header-actions">
           <div class="header-status-group">
-            <div class="status-badge online">
+            <div class="status-badge online origin-badge">
               <div class="dot"></div>
-              <span id="summary-origin" class="mono status-badge-text">来源：-</span>
+              <span id="summary-origin" class="mono status-badge-text">API：-</span>
             </div>
-            <div class="status-badge">
+            <div class="status-badge auth-method-badge">
               <div class="dot"></div>
-              <span id="auth-summary" class="mono status-badge-text">未登录</span>
+              <span id="auth-method" class="mono status-badge-text">登录方式：-</span>
+            </div>
+            <div class="status-badge username-badge">
+              <div class="dot"></div>
+              <span id="auth-username" class="mono status-badge-text">用户名：-</span>
             </div>
           </div>
-          <button id="logout-btn" class="btn btn-ghost" type="button" title="退出登录">
+          <button id="logout-btn" class="btn btn-ghost header-logout" type="button" title="退出登录">
             退出登录
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round" style="margin-left:0.5rem;">

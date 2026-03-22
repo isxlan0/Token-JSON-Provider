@@ -1,5 +1,5 @@
 import { createLeaderSyncController } from "./app/leader-sync.js?v=20260322f";
-import { createSummarySyncController } from "./app/summary-sync.js?v=20260322f";
+import { createSummarySyncController } from "./app/summary-sync.js?v=20260322g";
 
 const state = {
   user: null,
@@ -103,7 +103,8 @@ const elements = {
   bannedLogoutBtn: document.getElementById("banned-logout-btn"),
   logoutBtn: document.getElementById("logout-btn"),
   summaryOrigin: document.getElementById("summary-origin"),
-  authSummary: document.getElementById("auth-summary"),
+  authMethod: document.getElementById("auth-method"),
+  authUsername: document.getElementById("auth-username"),
   tabData: document.getElementById("tab-data"),
   tabKeys: document.getElementById("tab-keys"),
   tabClaim: document.getElementById("tab-claim"),
@@ -1015,14 +1016,22 @@ function renderUser() {
     elements.userUsername.textContent = "-";
     elements.userId.textContent = "-";
     elements.userTrust.textContent = "-";
-    elements.authSummary.textContent = "未登录";
+    elements.authMethod.textContent = "登录方式：未登录";
+    elements.authMethod.title = "登录方式：未登录";
+    elements.authUsername.textContent = "用户名：-";
+    elements.authUsername.title = "用户名：-";
     return;
   }
   elements.userName.textContent = state.user.name || state.user.username;
   elements.userUsername.textContent = state.user.username || "-";
   elements.userId.textContent = state.user.id || "-";
   elements.userTrust.textContent = state.user.trust_level ?? "-";
-  elements.authSummary.textContent = `LinuxDo / ${state.user.name || state.user.username}`;
+  const authMethodText = "登录方式：LinuxDo";
+  const usernameText = `用户名：${state.user.name || state.user.username}`;
+  elements.authMethod.textContent = authMethodText;
+  elements.authMethod.title = authMethodText;
+  elements.authUsername.textContent = usernameText;
+  elements.authUsername.title = usernameText;
 }
 
 function renderQuota() {
@@ -2833,7 +2842,9 @@ async function init() {
   renderUploadSelected();
   renderUploadResults();
   setUploadSubmitting(false);
-  elements.summaryOrigin.textContent = `来源：${window.location.origin}`;
+  const originText = `API：${window.location.origin}`;
+  elements.summaryOrigin.textContent = originText;
+  elements.summaryOrigin.title = originText;
   const url = new URL(window.location.href);
   state.authErrorParam = url.searchParams.get("auth_error") || "";
   await bootstrapAppShell();
