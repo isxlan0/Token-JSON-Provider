@@ -20,18 +20,15 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 		return nil, err
 	}
 
-	paths, err := filepath.Glob(filepath.Join(s.tokenDirPath(), "*.json"))
+	entries, err := s.listTokenDirEntries()
 	if err != nil {
-		return nil, fmt.Errorf("glob token files: %w", err)
+		return nil, err
 	}
-	sort.Slice(paths, func(left int, right int) bool {
-		return strings.ToLower(filepath.Base(paths[left])) < strings.ToLower(filepath.Base(paths[right]))
-	})
 
-	existingNames := make(map[string]struct{}, len(paths))
+	existingNames := make(map[string]struct{}, len(entries))
 	imported := 0
-	for _, path := range paths {
-		fileName := filepath.Base(path)
+	for _, entry := range entries {
+		fileName := entry.Name()
 		existingNames[fileName] = struct{}{}
 		changed, err := s.importTokenFile(ctx, fileName)
 		if err != nil {
@@ -55,7 +52,7 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 	}
 
 	return map[string]int{
-		"total":       len(paths),
+		"total":       len(entries),
 		"imported":    imported,
 		"deactivated": deactivated,
 	}, nil

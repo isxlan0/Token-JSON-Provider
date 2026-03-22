@@ -2,7 +2,6 @@ package claim
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -117,7 +116,7 @@ func (s *Service) pollTokenDirectoryChanges(ctx context.Context, previous map[st
 }
 
 func (s *Service) listTokenFileStats() map[string]tokenFileStat {
-	entries, err := os.ReadDir(s.tokenDirPath())
+	entries, err := s.listTokenDirEntries()
 	if err != nil {
 		return map[string]tokenFileStat{}
 	}

@@ -18,6 +18,43 @@ func TestLoadTokenFilePayloadTreatsTruncatedJSONAsRetryable(t *testing.T) {
 	}
 }
 
+func TestReconcileTokenFilesImportsUppercaseJSONExtension(t *testing.T) {
+	service, store := newClaimTestService(t)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	if err := service.ensureTokenDir(); err != nil {
+		t.Fatalf("ensure token dir: %v", err)
+	}
+
+	fileName := "UPPER.JSON"
+	filePath := filepath.Join(service.tokenDirPath(), fileName)
+	content := `{"account_id":"acct-upper","access_token":"token-upper","refresh_token":"refresh-upper"}`
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write uppercase token file: %v", err)
+	}
+
+	summary, err := service.reconcileTokenFiles(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile token files: %v", err)
+	}
+	if summary["total"] != 1 || summary["imported"] != 1 {
+		t.Fatalf("unexpected reconcile summary: %+v", summary)
+	}
+
+	var (
+		count     int
+		accountID string
+	)
+	if err := store.DB().QueryRow(`SELECT COUNT(*), COALESCE(MIN(account_id), '') FROM tokens WHERE file_name = ?`, fileName).Scan(&count, &accountID); err != nil {
+		t.Fatalf("query imported uppercase token: %v", err)
+	}
+	if count != 1 || accountID != "acct-upper" {
+		t.Fatalf("unexpected imported uppercase token state: count=%d account_id=%q", count, accountID)
+	}
+}
+
 func TestTokenImportLoopRetriesUntilJSONWriteCompletes(t *testing.T) {
 	service, store := newClaimTestService(t)
 

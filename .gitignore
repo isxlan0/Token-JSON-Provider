@@ -10,10 +10,14 @@ __pycache__/
 .claude/
 *.db
 GptCodexApi/
+start.py
+start.bat
+start.sh
+tests/test_start_runtime.py
 bin/
 .vscode/
 token_atlas.db*
 .gocache/
 .gomodcache/
+.runtime/
 *.log
-日志.txt
