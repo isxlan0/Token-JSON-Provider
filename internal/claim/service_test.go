@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"token-atlas/internal/config"
 	"token-atlas/internal/database"
@@ -83,6 +84,24 @@ func TestQueuedClaimCanBeFulfilledByQueuePump(t *testing.T) {
 	}
 	if claims[0].FileName != "token-b.json" {
 		t.Fatalf("unexpected queued claim file: %q", claims[0].FileName)
+	}
+}
+
+func TestServiceStopWaitsForWorkersToExit(t *testing.T) {
+	service, _ := newClaimTestService(t)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	service.Start(ctx)
+
+	cancel()
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	if err := service.Stop(stopCtx); err != nil {
+		t.Fatalf("stop service: %v", err)
 	}
 }
 

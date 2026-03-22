@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -181,6 +182,43 @@ func TestMapDatabaseBusyErrorReturnsRetryAfterHeader(t *testing.T) {
 	}
 	if httpErr.Message != "数据库正忙，请稍后重试。" {
 		t.Fatalf("unexpected db busy message: %#v", httpErr.Message)
+	}
+}
+
+func TestRunWithDatabaseBusyRetryRetriesBusyErrors(t *testing.T) {
+	attempts := 0
+
+	value, err := runWithDatabaseBusyRetry(context.Background(), func() (int, error) {
+		attempts++
+		if attempts < 3 {
+			return 0, errors.New("database is locked (517)")
+		}
+		return 7, nil
+	})
+	if err != nil {
+		t.Fatalf("runWithDatabaseBusyRetry returned error: %v", err)
+	}
+	if value != 7 {
+		t.Fatalf("unexpected retry result: %d", value)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestRunWithDatabaseBusyRetryStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	started := time.Now()
+	_, err := runWithDatabaseBusyRetry(ctx, func() (int, error) {
+		return 0, errors.New("database is locked")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("canceled retry should stop promptly")
 	}
 }
 

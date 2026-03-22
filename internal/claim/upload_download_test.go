@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"token-atlas/internal/auth"
+	proberuntime "token-atlas/internal/probe"
 )
 
 func TestQueueUploadBatchAcceptsAndPreservesExtraFields(t *testing.T) {
@@ -76,6 +77,70 @@ func TestQueueUploadBatchAcceptsAndPreservesExtraFields(t *testing.T) {
 	extra, ok := payload["extra"].(map[string]any)
 	if !ok || extra["region"] != "hk" {
 		t.Fatalf("expected extra field to be preserved, got %#v", payload["extra"])
+	}
+}
+
+func TestDuplicateUploadSubmissionReceivesFinalStatusFromPendingTask(t *testing.T) {
+	service, store := newClaimTestService(t)
+	probe := newBlockingProbe()
+	service.probe = probe
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.Start(ctx)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	userID := insertTestUser(t, store, "2002", "duplicate-uploader")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "2002",
+			Username:   "duplicate-uploader",
+			Name:       "Duplicate Uploader",
+			TrustLevel: 2,
+		},
+	}
+
+	rawJSON := `{"account_id":"acct-duplicate","access_token":"token-duplicate","refresh_token":"refresh-duplicate"}`
+	files := []uploadFileInput{{
+		Name:          "duplicate.json",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(rawJSON)),
+	}}
+
+	first, err := service.QueueUploadBatch(context.Background(), requestContext, files)
+	if err != nil {
+		t.Fatalf("queue first upload batch: %v", err)
+	}
+	if got := first["summary"].(map[string]int)["queued"]; got != 1 {
+		t.Fatalf("expected first batch to queue 1 item, got %+v", first["summary"])
+	}
+
+	probe.waitUntilStarted(t)
+
+	second, err := service.QueueUploadBatch(context.Background(), requestContext, files)
+	if err != nil {
+		t.Fatalf("queue duplicate upload batch: %v", err)
+	}
+	secondItems := second["items"].([]map[string]any)
+	if got := secondItems[0]["status"]; got != "processing" && got != "queued" {
+		t.Fatalf("expected duplicate batch to attach to pending task, got status=%#v item=%#v", got, secondItems[0])
+	}
+
+	probe.release()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		payload := service.GetUploadResults(userID)
+		items := payload["items"].([]map[string]any)
+		if len(items) == 1 && items[0]["status"] == "accepted" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("duplicate batch did not receive final accepted status: %#v", payload)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -152,5 +217,53 @@ func pushTempWorkingDir(t *testing.T) func() {
 		if err := os.Chdir(originalWD); err != nil {
 			t.Fatalf("restore working directory: %v", err)
 		}
+	}
+}
+
+type blockingProbe struct {
+	started   chan struct{}
+	releaseCh chan struct{}
+}
+
+func newBlockingProbe() *blockingProbe {
+	return &blockingProbe{
+		started:   make(chan struct{}, 1),
+		releaseCh: make(chan struct{}),
+	}
+}
+
+func (p *blockingProbe) Start() {}
+
+func (p *blockingProbe) Stop() {
+	select {
+	case <-p.releaseCh:
+	default:
+		close(p.releaseCh)
+	}
+}
+
+func (p *blockingProbe) Submit(map[string]any, float64) proberuntime.Result {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	<-p.releaseCh
+	return proberuntime.Result{Status: "ok"}
+}
+
+func (p *blockingProbe) waitUntilStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("probe did not start in time")
+	}
+}
+
+func (p *blockingProbe) release() {
+	select {
+	case <-p.releaseCh:
+	default:
+		close(p.releaseCh)
 	}
 }

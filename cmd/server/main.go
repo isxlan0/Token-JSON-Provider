@@ -111,6 +111,9 @@ func run(logger *slog.Logger) error {
 		if err := e.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown server: %w", err)
 		}
+		if err := claimService.Stop(shutdownCtx); err != nil {
+			return fmt.Errorf("stop claim service: %w", err)
+		}
 
 		logger.Info("server stopped", "reason", ctx.Err())
 		return nil

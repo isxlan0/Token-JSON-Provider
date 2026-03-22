@@ -51,6 +51,7 @@ type uploadPendingRecord struct {
 	AccessTokenHash string
 	Status          string
 	QueuePosition   int
+	Watchers        []uploadWatcher
 }
 
 type uploadSnapshot struct {
@@ -59,6 +60,12 @@ type uploadSnapshot struct {
 	Items       []map[string]any
 	History     []map[string]any
 	QueueStatus map[string]any
+}
+
+type uploadWatcher struct {
+	UserID       int64
+	BatchID      string
+	RequestIndex int
 }
 
 func (s *Service) GetUploadResults(userID int64) map[string]any {
@@ -197,10 +204,16 @@ func (s *Service) QueueUploadBatch(ctx context.Context, requestContext *auth.Req
 
 func (s *Service) uploadWorkerLoop(ctx context.Context) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case task := <-s.uploadTaskCh:
+			if ctx.Err() != nil {
+				return
+			}
 			s.markUploadTaskProcessing(task)
 			s.processUploadTask(ctx, task)
 		}
@@ -329,8 +342,15 @@ func (s *Service) reserveUploadTask(task uploadTask) (*uploadPendingRecord, int)
 	s.uploadMu.Lock()
 	defer s.uploadMu.Unlock()
 
+	watcher := uploadWatcher{
+		UserID:       task.UserID,
+		BatchID:      task.BatchID,
+		RequestIndex: task.RequestIndex,
+	}
+
 	existing := s.findPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
 	if existing != nil {
+		s.registerUploadWatcherLocked(existing, watcher)
 		copied := *existing
 		return &copied, 0
 	}
@@ -344,6 +364,7 @@ func (s *Service) reserveUploadTask(task uploadTask) (*uploadPendingRecord, int)
 		AccessTokenHash: task.AccessTokenHash,
 		Status:          "queued",
 		QueuePosition:   s.uploadQueued,
+		Watchers:        []uploadWatcher{watcher},
 	}
 	s.setPendingUploadTaskLocked(pending)
 	return nil, pending.QueuePosition
@@ -360,18 +381,28 @@ func (s *Service) markUploadTaskProcessing(task uploadTask) {
 		pending.QueuePosition = 0
 	}
 
-	s.updateUploadSnapshotItemLocked(task.UserID, task.BatchID, task.RequestIndex, map[string]any{
+	patch := map[string]any{
 		"status": "processing",
 		"reason": "正在处理，请稍候刷新结果。",
-	})
+	}
+	if pending != nil {
+		s.updateUploadWatchersLocked(pending, patch)
+		return
+	}
+	s.updateUploadSnapshotItemLocked(task.UserID, task.BatchID, task.RequestIndex, patch)
 }
 
 func (s *Service) completeUploadTask(task uploadTask, patch map[string]any) {
 	s.uploadMu.Lock()
 	defer s.uploadMu.Unlock()
 
+	pending := s.findPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
+	if pending != nil {
+		s.updateUploadWatchersLocked(pending, patch)
+	} else {
+		s.updateUploadSnapshotItemLocked(task.UserID, task.BatchID, task.RequestIndex, patch)
+	}
 	s.clearPendingUploadTaskLocked(task.AccountID, task.AccessTokenHash)
-	s.updateUploadSnapshotItemLocked(task.UserID, task.BatchID, task.RequestIndex, patch)
 }
 
 func (s *Service) setUploadSnapshot(userID int64, snapshot uploadSnapshot) {
@@ -418,6 +449,21 @@ func (s *Service) setPendingUploadTaskLocked(item *uploadPendingRecord) {
 	}
 }
 
+func (s *Service) registerUploadWatcherLocked(item *uploadPendingRecord, watcher uploadWatcher) {
+	for _, existing := range item.Watchers {
+		if existing.UserID == watcher.UserID && existing.BatchID == watcher.BatchID && existing.RequestIndex == watcher.RequestIndex {
+			return
+		}
+	}
+	item.Watchers = append(item.Watchers, watcher)
+}
+
+func (s *Service) updateUploadWatchersLocked(item *uploadPendingRecord, patch map[string]any) {
+	for _, watcher := range item.Watchers {
+		s.updateUploadSnapshotItemLocked(watcher.UserID, watcher.BatchID, watcher.RequestIndex, patch)
+	}
+}
+
 func (s *Service) clearPendingUploadTaskLocked(accountID string, accessTokenHash string) {
 	for _, key := range pendingUploadKeys(accountID, accessTokenHash) {
 		delete(s.uploadPending, key)
@@ -425,43 +471,47 @@ func (s *Service) clearPendingUploadTaskLocked(accountID string, accessTokenHash
 }
 
 func (s *Service) countRecentSuccessfulUploads(ctx context.Context, userID int64) (int, error) {
-	return queryCount(ctx, s.store.DB(), `
-		SELECT COUNT(*)
-		FROM tokens
-		WHERE provider_user_id = ?
-		  AND uploaded_at_ts IS NOT NULL
-		  AND uploaded_at_ts >= ?
-	`, strconvFormatInt(userID), time.Now().Unix()-3600)
+	return runWithDatabaseBusyRetry(ctx, func() (int, error) {
+		return queryCount(ctx, s.store.DB(), `
+			SELECT COUNT(*)
+			FROM tokens
+			WHERE provider_user_id = ?
+			  AND uploaded_at_ts IS NOT NULL
+			  AND uploaded_at_ts >= ?
+		`, strconvFormatInt(userID), time.Now().Unix()-3600)
+	})
 }
 
 func (s *Service) getUploadedTokenConflict(ctx context.Context, accountID string, accessTokenHash string) (map[string]any, error) {
-	row := s.store.DB().QueryRowContext(ctx, `
-		SELECT id, account_id, access_token_hash, file_name
-		FROM tokens
-		WHERE account_id = ? OR access_token_hash = ?
-		ORDER BY id ASC
-		LIMIT 1
-	`, accountID, accessTokenHash)
+	return runWithDatabaseBusyRetry(ctx, func() (map[string]any, error) {
+		row := s.store.DB().QueryRowContext(ctx, `
+			SELECT id, account_id, access_token_hash, file_name
+			FROM tokens
+			WHERE account_id = ? OR access_token_hash = ?
+			ORDER BY id ASC
+			LIMIT 1
+		`, accountID, accessTokenHash)
 
-	var (
-		id              int64
-		conflictAccount sql.NullString
-		conflictHash    sql.NullString
-		fileName        string
-	)
-	if err := row.Scan(&id, &conflictAccount, &conflictHash, &fileName); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+		var (
+			id              int64
+			conflictAccount sql.NullString
+			conflictHash    sql.NullString
+			fileName        string
+		)
+		if err := row.Scan(&id, &conflictAccount, &conflictHash, &fileName); err != nil {
+			if err == sql.ErrNoRows {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("query upload conflict: %w", err)
 		}
-		return nil, fmt.Errorf("query upload conflict: %w", err)
-	}
 
-	return map[string]any{
-		"id":                id,
-		"account_id":        conflictAccount.String,
-		"access_token_hash": conflictHash.String,
-		"file_name":         fileName,
-	}, nil
+		return map[string]any{
+			"id":                id,
+			"account_id":        conflictAccount.String,
+			"access_token_hash": conflictHash.String,
+			"file_name":         fileName,
+		}, nil
+	})
 }
 
 type uploadedTokenCreateParams struct {
@@ -790,13 +840,6 @@ func strconvFormatInt(value int64) string {
 func hashTokenValue(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
-}
-
-func isDatabaseBusyError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "database is locked")
 }
 
 func buildUploadResponse(items []map[string]any, batchID string, createdAt string, history []map[string]any, queueStatus map[string]any) map[string]any {

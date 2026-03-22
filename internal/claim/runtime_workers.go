@@ -33,10 +33,16 @@ type tokenImportResult struct {
 
 func (s *Service) hideClaimsWorkerLoop(ctx context.Context) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case task := <-s.hideClaimsCh:
+			if ctx.Err() != nil {
+				return
+			}
 			if err := s.applyHideClaims(ctx, task.userID, task.claimIDs); err != nil {
 				s.logger.Error("hide claims task failed", "error", err, "user_id", task.userID)
 			}
@@ -51,12 +57,23 @@ func (s *Service) tokenImportLoop(ctx context.Context) {
 	s.startupReconcileTokenFiles(ctx)
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case request := <-s.tokenImportCh:
+			if ctx.Err() != nil {
+				s.finishTokenImport(request.fileName)
+				return
+			}
 			changed, err := s.importTokenFile(ctx, request.fileName)
 			if err != nil {
+				if ctx.Err() != nil {
+					s.finishTokenImport(request.fileName)
+					return
+				}
 				if s.retryTokenImport(ctx, request, err) {
 					continue
 				}

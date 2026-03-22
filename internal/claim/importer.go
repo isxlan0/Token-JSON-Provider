@@ -236,21 +236,27 @@ func (s *Service) findSyncTokenConflictTx(ctx context.Context, tx *sql.Tx, accou
 }
 
 func (s *Service) deactivateTokenFile(ctx context.Context, fileName string) (bool, error) {
-	now := time.Now().Unix()
-	result, err := s.store.DB().ExecContext(ctx, `
-		UPDATE tokens
-		SET is_active = 0,
-		    is_available = 0,
-		    updated_at_ts = ?,
-		    last_seen_at_ts = ?
-		WHERE file_name = ? AND is_active != 0
-	`, now, now, fileName)
+	affected, err := runWithDatabaseBusyRetry(ctx, func() (int64, error) {
+		now := time.Now().Unix()
+		result, err := s.store.DB().ExecContext(ctx, `
+			UPDATE tokens
+			SET is_active = 0,
+			    is_available = 0,
+			    updated_at_ts = ?,
+			    last_seen_at_ts = ?
+			WHERE file_name = ? AND is_active != 0
+		`, now, now, fileName)
+		if err != nil {
+			return 0, fmt.Errorf("deactivate token file %s: %w", fileName, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("read deactivate token rows affected: %w", err)
+		}
+		return affected, nil
+	})
 	if err != nil {
-		return false, fmt.Errorf("deactivate token file %s: %w", fileName, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("read deactivate token rows affected: %w", err)
+		return false, err
 	}
 	if affected > 0 {
 		s.invalidateAllRuntimeCache(nil, true)
@@ -285,13 +291,19 @@ func (s *Service) deactivateMissingTokenFiles(ctx context.Context, existingNames
 		query += fmt.Sprintf(" AND file_name NOT IN (%s)", strings.Join(placeholders, ","))
 	}
 
-	result, err := s.store.DB().ExecContext(ctx, query, args...)
+	affected, err := runWithDatabaseBusyRetry(ctx, func() (int64, error) {
+		result, err := s.store.DB().ExecContext(ctx, query, args...)
+		if err != nil {
+			return 0, fmt.Errorf("deactivate missing token files: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("read deactivate missing token rows affected: %w", err)
+		}
+		return affected, nil
+	})
 	if err != nil {
-		return 0, fmt.Errorf("deactivate missing token files: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("read deactivate missing token rows affected: %w", err)
+		return 0, err
 	}
 	return int(affected), nil
 }

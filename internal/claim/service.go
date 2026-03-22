@@ -45,6 +45,7 @@ type Service struct {
 
 	startOnce sync.Once
 	advanceMu sync.Mutex
+	workerWG  sync.WaitGroup
 
 	systemIndexMu        sync.RWMutex
 	systemIndexUpdatedAt string
@@ -225,7 +226,7 @@ func (s *Service) Start(ctx context.Context) {
 		}()
 
 		ticker := time.NewTicker(queuePumpInterval)
-		go func() {
+		s.goWorker(func() {
 			defer ticker.Stop()
 			s.safeAdvanceQueue(ctx)
 			for {
@@ -237,13 +238,36 @@ func (s *Service) Start(ctx context.Context) {
 				}
 				s.safeAdvanceQueue(ctx)
 			}
-		}()
+		})
 
-		go s.uploadWorkerLoop(ctx)
-		go s.hideClaimsWorkerLoop(ctx)
-		go s.tokenImportLoop(ctx)
-		go s.tokenWatchLoop(ctx)
+		s.goWorker(func() { s.uploadWorkerLoop(ctx) })
+		s.goWorker(func() { s.hideClaimsWorkerLoop(ctx) })
+		s.goWorker(func() { s.tokenImportLoop(ctx) })
+		s.goWorker(func() { s.tokenWatchLoop(ctx) })
 	})
+}
+
+func (s *Service) goWorker(fn func()) {
+	s.workerWG.Add(1)
+	go func() {
+		defer s.workerWG.Done()
+		fn()
+	}()
+}
+
+func (s *Service) Stop(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.workerWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Service) safeAdvanceQueue(ctx context.Context) {
@@ -1453,26 +1477,28 @@ func (s *Service) countClaimableTokensForUser(ctx context.Context, queryer sqlQu
 }
 
 func withTx[T any](ctx context.Context, db *sql.DB, fn func(*sql.Tx) (T, error)) (T, error) {
-	var zero T
+	return runWithDatabaseBusyRetry(ctx, func() (T, error) {
+		var zero T
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return zero, fmt.Errorf("begin transaction: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return zero, fmt.Errorf("begin transaction: %w", err)
+		}
+		defer func() {
+			_ = tx.Rollback()
+		}()
 
-	value, err := fn(tx)
-	if err != nil {
-		return zero, err
-	}
+		value, err := fn(tx)
+		if err != nil {
+			return zero, err
+		}
 
-	if err := tx.Commit(); err != nil {
-		return zero, fmt.Errorf("commit transaction: %w", err)
-	}
+		if err := tx.Commit(); err != nil {
+			return zero, fmt.Errorf("commit transaction: %w", err)
+		}
 
-	return value, nil
+		return value, nil
+	})
 }
 
 func queryCount(ctx context.Context, queryer sqlQueryer, query string, args ...any) (int, error) {
