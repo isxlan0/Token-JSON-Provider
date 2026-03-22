@@ -5,11 +5,15 @@ token/
 token_staging/
 __pycache__/
 *.py[cod]
+.venv/
 .playwright-mcp/
 .claude/
 *.db
 GptCodexApi/
-start.*
+bin/
 .vscode/
-*.txt
 token_atlas.db*
+.gocache/
+.gomodcache/
+*.log
+日志.txt

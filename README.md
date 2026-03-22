@@ -2,6 +2,8 @@
 
 基于 LinuxDo OAuth2 的 JSON 账号分发服务。把可分发的 `.json` 文件放到 `token/` 目录，用户登录后可领取账号，并通过 API Key 下载对应 JSON。
 
+当前默认运行的是 Go 重构版服务，旧版 Python 主程序已归档到 `legacy_python_backend/`，仅作留档。
+
 ## 功能
 
 - LinuxDo OAuth2 登录
@@ -17,8 +19,17 @@
 ## 安装
 
 ```powershell
-python -m pip install -r requirements.txt
+.\build-go.bat
 ```
+
+```bash
+./build-go.sh
+```
+
+构建结果：
+
+- 所有平台二进制都会直接输出到 `bin/`
+- 当前默认产物包含：`token-atlas-windows-amd64.exe`、`token-atlas-windows-arm64.exe`、`token-atlas-linux-amd64`、`token-atlas-linux-arm64`、`token-atlas-macos-amd64`、`token-atlas-macos-arm64`
 
 ## 配置
 
@@ -63,8 +74,22 @@ LinuxDo OAuth2 配置步骤：
 ## 启动
 
 ```powershell
-python .\app.py
+python .\start.py
 ```
+
+如果已经编译完成，也可以直接运行 Go 二进制：
+
+```powershell
+.\bin\token-atlas-windows-amd64.exe
+```
+
+```bash
+./bin/token-atlas-linux-amd64
+```
+
+`start.py` 会自动按当前系统与架构选择对应二进制；如果没有 `bin/` 目录，则会回退到项目根目录查找同名文件。
+
+如果需要同时启动 `GptCodexApi/runner.py`，保留原有 `.env` 配置即可，`start.py` 会按需创建 `.venv` 并安装 `GptCodexApi/requirements.txt`。
 
 服务默认监听 `0.0.0.0:8000`，浏览器访问：
 
@@ -142,7 +167,9 @@ curl -L http://127.0.0.1:8000/api/download/123 `
 
 ## 目录结构
 
-- `app.py`：FastAPI 服务
+- `cmd/server/`：Go 服务入口
+- `internal/`：Go 版核心业务逻辑
+- `legacy_python_backend/`：归档的旧版 Python 主程序
 - `token/`：账号 JSON 文件
 - `static/`：前端页面资源
 - `.env.example`：配置模板

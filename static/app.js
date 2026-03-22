@@ -600,11 +600,21 @@ function renderQueueStatus() {
   const position = status.position ?? "-";
   const total = status.total_queued ?? "-";
   const available = status.available_tokens ?? "-";
+  const claimableNow = status.claimable_now;
   const remaining = status.remaining ?? status.requested ?? "-";
   const modeLabel = state.queueStream ? "实时推送" : "低频补偿刷新";
+  let detailText = `当前全局剩余库存 ${available} 次。`;
+  if (Number.isFinite(claimableNow)) {
+    if (claimableNow <= 0) {
+      detailText += " 但你当前可立即领取的不同账号数为 0";
+      detailText += "，同一用户不会重复领取同一个账号，队列会等待新账号进入库存。";
+    } else {
+      detailText += ` 你当前可立即领取的不同账号数约为 ${claimableNow}。`;
+    }
+  }
   elements.claimSummary.textContent =
     `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。` +
-    `当前可领取库存 ${available} 次，库存会优先发给前面排队用户。` +
+    detailText +
     `当前使用${modeLabel}同步状态。`;
   elements.claimSummary.classList.remove("hidden");
   state.queueSticky = true;
@@ -1329,6 +1339,56 @@ function setClaimQueued(queued) {
   syncClaimButtonState();
 }
 
+function mergeClaimResultsOptimistically(items = []) {
+  const incoming = Array.isArray(items) ? items.filter((item) => item && typeof item === "object") : [];
+  if (!incoming.length) {
+    return;
+  }
+
+  const hiddenIds = state.pendingHiddenClaimIds || new Set();
+  const seenKeys = new Set();
+  const merged = [];
+  [...incoming, ...(state.claimResults || [])].forEach((item, index) => {
+    const claimId = item?.claim_id;
+    if (claimId != null && hiddenIds.has(claimId)) {
+      return;
+    }
+    const dedupeKey = claimId != null
+      ? `claim:${claimId}`
+      : `fallback:${item?.token_id ?? ""}:${item?.file_name ?? ""}:${index}`;
+    if (seenKeys.has(dedupeKey)) {
+      return;
+    }
+    seenKeys.add(dedupeKey);
+    merged.push(item);
+  });
+
+  state.claimsInitialized = true;
+  state.claimResults = merged;
+  state.claimSelected.clear();
+  state.lastClaimTotal = merged.length;
+}
+
+function scheduleClaimFollowUpRefreshes(result) {
+  const tasks = [
+    Promise.resolve().then(() => refreshClaimsByLeader("claim-success")),
+    Promise.resolve().then(() => refreshSummariesByLeader("claim-success")),
+  ];
+  if (result?.queued) {
+    tasks.push(Promise.resolve().then(() => loadQueueStatus()));
+  }
+
+  Promise.allSettled(tasks).then((results) => {
+    results.forEach((followUpResult) => {
+      if (followUpResult.status === "rejected") {
+        if (!handleAccessError(followUpResult.reason)) {
+          console.error("领取后的补偿刷新失败", followUpResult.reason);
+        }
+      }
+    });
+  });
+}
+
 function setClaimDownloadAllBusy(busy, count = 0) {
   if (!elements.claimDownloadAll) {
     return;
@@ -1863,10 +1923,10 @@ async function claimTokens() {
     if (result.granted && result.granted > 0) {
       state.skipNextClaimModal = true;
     }
-    await refreshClaimsByLeader("claim-success");
     state.quota = result.quota || state.quota;
     renderQuota();
     if (result.granted && result.granted > 0) {
+      mergeClaimResultsOptimistically(result.items || []);
       state.claims = {
         ...(state.claims || {}),
         total: (state.claims?.total || 0) + result.granted,
@@ -1887,30 +1947,27 @@ async function claimTokens() {
       handleQueueStatusPayload({
         queued: true,
         position: result.queue_position,
+        total_queued: result.queue_position ?? state.queueStatus?.total_queued,
         remaining: result.queue_remaining,
         requested: result.requested,
+        available_tokens: state.systemStatus?.inventory?.available ?? state.queueStatus?.available_tokens,
+        claimable_now: state.queueStatus?.claimable_now,
       }, { source: "action" });
     } else {
       setClaimQueued(false);
       state.queueStatus = { queued: false };
       state.queueSticky = false;
-      elements.claimSummary.textContent = `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
+      const partialRemaining = Math.max(0, (result.requested || 0) - (result.granted || 0));
+      elements.claimSummary.textContent = partialRemaining > 0
+        ? `本次先领取到 ${result.granted} / 请求 ${result.requested}，剩余 ${partialRemaining} 个未自动入队，本小时剩余 ${result.quota.remaining}`
+        : `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
       elements.claimSummary.classList.remove("hidden");
       if (result.granted && result.granted > 0) {
         showModal("申请成功", `共 ${result.granted} 个账号`);
       }
     }
     renderClaimResults();
-    const followUpTasks = [refreshSummariesByLeader("claim-success")];
-    if (result.queued) {
-      followUpTasks.push(loadQueueStatus());
-    }
-    const followUpResults = await Promise.allSettled(followUpTasks);
-    followUpResults.forEach((followUpResult) => {
-      if (followUpResult.status === "rejected") {
-        handleAccessError(followUpResult.reason);
-      }
-    });
+    scheduleClaimFollowUpRefreshes(result);
   } catch (error) {
     setClaimQueued(false);
     elements.claimSummary.classList.add("hidden");
