@@ -18,6 +18,8 @@ bin/
 .vscode/
 token_atlas.db*
 .gocache/
+.gocache-test/
 .gomodcache/
 .runtime/
 *.log
+cmd/server/*.go.[0-9]*

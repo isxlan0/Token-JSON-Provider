@@ -2,6 +2,7 @@ package claim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -152,6 +153,10 @@ func (s *Service) tokenDirPath() string {
 
 func (s *Service) startupReconcileTokenFiles(ctx context.Context) {
 	if _, err := s.reconcileTokenFiles(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.logger.Info("startup reconcile token files cancelled")
+			return
+		}
 		s.logger.Error("startup reconcile token files", "error", err)
 	}
 }

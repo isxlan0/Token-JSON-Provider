@@ -19,6 +19,9 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 	if err := s.ensureTokenDir(); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	entries, err := s.listTokenDirEntries()
 	if err != nil {
@@ -28,16 +31,25 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 	existingNames := make(map[string]struct{}, len(entries))
 	imported := 0
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		fileName := entry.Name()
 		existingNames[fileName] = struct{}{}
 		changed, err := s.importTokenFile(ctx, fileName)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			s.logger.Error("reconcile token file", "error", err, "file_name", fileName)
 			continue
 		}
 		if changed {
 			imported++
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	deactivated, err := s.deactivateMissingTokenFiles(ctx, existingNames)
