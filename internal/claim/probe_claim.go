@@ -330,6 +330,11 @@ func (s *Service) finalizeClaimReservedToken(ctx context.Context, tokenID int64,
 				return nil, fmt.Errorf("read finalized token claim id: %w", err)
 			}
 
+			existingClaimerCount, previousExclusiveUserID, err := s.tokenClaimStatsBeforeInsert(ctx, tx, tokenID)
+			if err != nil {
+				return nil, err
+			}
+
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO user_token_claims (user_id, token_id, first_claim_id, created_at_ts)
 				VALUES (?, ?, ?, ?)
@@ -338,6 +343,9 @@ func (s *Service) finalizeClaimReservedToken(ctx context.Context, tokenID int64,
 					return nil, errRetryAllocation
 				}
 				return nil, fmt.Errorf("insert user token claim: %w", err)
+			}
+			if err := s.applyClaimStatsRuntimeTx(ctx, tx, userID, existingClaimerCount, previousExclusiveUserID); err != nil {
+				return nil, err
 			}
 			if err := s.refreshInventoryRuntimeTx(ctx, tx); err != nil {
 				return nil, err

@@ -18,6 +18,18 @@ const (
 	queueStatusReadTimeout      = 1500 * time.Millisecond
 	dashboardSummaryReadTimeout = 2500 * time.Millisecond
 	bootstrapReadTimeout        = 2500 * time.Millisecond
+
+	dataSourceLive        = "live"
+	dataSourceCache       = "cache"
+	dataSourceStale       = "stale"
+	dataSourceUnavailable = "unavailable"
+
+	degradedReasonReadTimeout       = "read_timeout"
+	degradedReasonDatabaseBusy      = "database_busy"
+	degradedReasonPartialData       = "partial_data_unavailable"
+	degradedReasonCompatibility     = "compatibility_cache_only"
+	degradedReasonDataUnavailable   = "data_unavailable"
+	degradedReasonClaimableDeferred = "claimable_now_deferred"
 )
 
 type sqlMetricsContextKey struct{}
@@ -27,11 +39,58 @@ type sqlMetricsCounter struct {
 }
 
 func withSQLMetrics(ctx context.Context) (context.Context, *sqlMetricsCounter) {
-	if existing := sqlMetricsFromContext(ctx); existing != nil {
-		return ctx, existing
-	}
 	counter := &sqlMetricsCounter{}
 	return context.WithValue(ctx, sqlMetricsContextKey{}, counter), counter
+}
+
+type observedReadStage struct {
+	ctx     context.Context
+	counter *sqlMetricsCounter
+	started time.Time
+}
+
+type staleReadEnvelope[T any] struct {
+	Value       T      `json:"value"`
+	GeneratedAt string `json:"generated_at,omitempty"`
+}
+
+type cachedReadResult[T any] struct {
+	Value          T
+	CacheState     runtimecache.CacheState
+	DataSource     string
+	GeneratedAt    string
+	StaleAt        string
+	Degraded       bool
+	DegradedReason string
+	Duration       time.Duration
+	SQLCount       int64
+}
+
+func startObservedReadStage(ctx context.Context) observedReadStage {
+	stageCtx, counter := withSQLMetrics(ctx)
+	return observedReadStage{
+		ctx:     stageCtx,
+		counter: counter,
+		started: time.Now(),
+	}
+}
+
+func (s observedReadStage) Context() context.Context {
+	return s.ctx
+}
+
+func (s observedReadStage) Duration() time.Duration {
+	if s.started.IsZero() {
+		return 0
+	}
+	return time.Since(s.started)
+}
+
+func (s observedReadStage) SQLCount() int64 {
+	if s.counter == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&s.counter.count)
 }
 
 func sqlMetricsFromContext(ctx context.Context) *sqlMetricsCounter {
@@ -56,6 +115,93 @@ func sqlCount(ctx context.Context) int64 {
 		return 0
 	}
 	return atomic.LoadInt64(&counter.count)
+}
+
+func sumSQLCounts(values ...int64) int64 {
+	total := int64(0)
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func cacheStateLabel(state runtimecache.CacheState) string {
+	trimmed := strings.TrimSpace(string(state))
+	if trimmed == "" {
+		return string(runtimecache.CacheStateMiss)
+	}
+	return trimmed
+}
+
+func degradedReasonForError(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return degradedReasonReadTimeout
+	case isDatabaseBusyError(err):
+		return degradedReasonDatabaseBusy
+	default:
+		return degradedReasonDataUnavailable
+	}
+}
+
+func loadCachedReadResult[T any](
+	ctx context.Context,
+	s *Service,
+	primaryKey string,
+	staleKey string,
+	ttlSec int,
+	loader func(context.Context) (T, error),
+) (cachedReadResult[T], error) {
+	var zero T
+	stage := startObservedReadStage(ctx)
+	liveGeneratedAt := ""
+	value, cacheState, err := runtimecache.CacheJSONWithState(
+		s.cache,
+		primaryKey,
+		ttlSec,
+		func() (T, error) {
+			loaded, loadErr := loader(stage.Context())
+			if loadErr != nil {
+				return zero, loadErr
+			}
+			liveGeneratedAt = isoformatNow()
+			if s.cache != nil && strings.TrimSpace(staleKey) != "" {
+				s.cache.SetJSON(staleKey, staleReadEnvelope[T]{
+					Value:       loaded,
+					GeneratedAt: liveGeneratedAt,
+				}, ttlSec)
+			}
+			return loaded, nil
+		},
+	)
+	result := cachedReadResult[T]{
+		Value:      value,
+		CacheState: cacheState,
+		Duration:   stage.Duration(),
+		SQLCount:   stage.SQLCount(),
+	}
+	if err != nil {
+		if isReadDegradeError(err) && strings.TrimSpace(staleKey) != "" {
+			if staleEnvelope, ok := getCachedJSON[staleReadEnvelope[T]](s.cache, staleKey); ok {
+				result.Value = staleEnvelope.Value
+				result.DataSource = dataSourceStale
+				result.GeneratedAt = staleEnvelope.GeneratedAt
+				result.StaleAt = staleTimestamp(staleEnvelope.GeneratedAt)
+				result.Degraded = true
+				result.DegradedReason = degradedReasonForError(err)
+				return result, nil
+			}
+		}
+		return result, err
+	}
+
+	if cacheState == runtimecache.CacheStateMiss {
+		result.DataSource = dataSourceLive
+		result.GeneratedAt = liveGeneratedAt
+		return result, nil
+	}
+	result.DataSource = dataSourceCache
+	return result, nil
 }
 
 func queryContextCounted(ctx context.Context, queryer sqlQueryer, query string, args ...any) (*sql.Rows, error) {
@@ -163,21 +309,132 @@ func (s *Service) mergeRuntimeSnapshotWithRequestContext(payload runtimeSnapshot
 }
 
 func (s *Service) defaultRuntimeSnapshotPayload(requestContext *auth.RequestContext) runtimeSnapshotPayload {
+	now := isoformatNow()
 	return s.mergeRuntimeSnapshotWithRequestContext(runtimeSnapshotPayload{
-		Quota:         quotaUsage{},
-		Claims:        defaultClaimsSummary(),
-		UploadResults: buildUploadResultsSummaryPayload(nil),
-		Degraded:      true,
+		Quota:          quotaUsage{},
+		Claims:         defaultClaimsSummary(),
+		UploadResults:  buildUploadResultsSummaryPayload(nil),
+		DataSource:     dataSourceUnavailable,
+		GeneratedAt:    now,
+		Degraded:       true,
+		DegradedReason: degradedReasonDataUnavailable,
 	}, requestContext)
 }
 
+func intPtr(value int) *int {
+	result := value
+	return &result
+}
+
+func annotateDashboardSection(section map[string]any, dataSource string, generatedAt string, staleAt string, degradedReason string) map[string]any {
+	if section == nil {
+		section = map[string]any{}
+	}
+	if strings.TrimSpace(dataSource) != "" {
+		section["data_source"] = dataSource
+	}
+	if strings.TrimSpace(generatedAt) != "" {
+		section["generated_at"] = generatedAt
+	}
+	if strings.TrimSpace(staleAt) != "" {
+		section["stale_at"] = staleAt
+	}
+	if strings.TrimSpace(degradedReason) != "" {
+		section["degraded_reason"] = degradedReason
+	}
+	return section
+}
+
+func annotateDashboardPayload(payload map[string]any, dataSource string, generatedAt string, staleAt string, degradedReason string, degraded bool) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if strings.TrimSpace(dataSource) != "" {
+		payload["data_source"] = dataSource
+	}
+	if strings.TrimSpace(generatedAt) != "" {
+		payload["generated_at"] = generatedAt
+	}
+	if strings.TrimSpace(staleAt) != "" {
+		payload["stale_at"] = staleAt
+	}
+	if strings.TrimSpace(degradedReason) != "" {
+		payload["degraded_reason"] = degradedReason
+	}
+	if degraded {
+		payload["degraded"] = true
+	}
+	return payload
+}
+
+func staleTimestamp(generatedAt string) string {
+	trimmed := strings.TrimSpace(generatedAt)
+	if trimmed != "" {
+		return trimmed
+	}
+	return isoformatNow()
+}
+
+func withQueueStatusMetadata(payload queueStatusPayload, dataSource string, generatedAt string, staleAt string, degradedReason string, degraded bool) queueStatusPayload {
+	payload.DataSource = dataSource
+	payload.GeneratedAt = generatedAt
+	payload.StaleAt = staleAt
+	payload.DegradedReason = degradedReason
+	payload.Degraded = degraded
+	if payload.ClaimableNow == nil && strings.TrimSpace(payload.ClaimableNowState) == "" {
+		payload.ClaimableNowState = dataSourceUnavailable
+	}
+	return payload
+}
+
+func stripQueueStatusAuxiliaryFields(payload queueStatusPayload) queueStatusPayload {
+	payload.ClaimableNow = nil
+	payload.ClaimableNowState = ""
+	payload.ClaimableNowUpdatedAt = ""
+	return payload
+}
+
+func applyClaimableNowSnapshot(payload queueStatusPayload, snapshot storedClaimableNowSnapshot, dataSource string) queueStatusPayload {
+	payload.ClaimableNow = intPtr(snapshot.ClaimableNow)
+	payload.ClaimableNowState = dataSource
+	payload.ClaimableNowUpdatedAt = snapshot.GeneratedAt
+	return payload
+}
+
+func claimableNowPayloadFromSnapshot(snapshot storedClaimableNowSnapshot, dataSource string, staleAt string, degradedReason string, degraded bool) claimableNowPayload {
+	count := snapshot.ClaimableNow
+	return claimableNowPayload{
+		ClaimableNow:          &count,
+		ClaimableNowState:     dataSource,
+		ClaimableNowUpdatedAt: snapshot.GeneratedAt,
+		DataSource:            dataSource,
+		GeneratedAt:           snapshot.GeneratedAt,
+		StaleAt:               staleAt,
+		DegradedReason:        degradedReason,
+		Degraded:              degraded,
+	}
+}
+
+func unavailableClaimableNowPayload(reason string) claimableNowPayload {
+	now := isoformatNow()
+	return claimableNowPayload{
+		ClaimableNow:      nil,
+		ClaimableNowState: dataSourceUnavailable,
+		DataSource:        dataSourceUnavailable,
+		GeneratedAt:       now,
+		Degraded:          true,
+		DegradedReason:    reason,
+	}
+}
+
 func (s *Service) defaultQueueStatusPayload() queueStatusPayload {
-	return queueStatusPayload{
+	now := isoformatNow()
+	return withQueueStatusMetadata(queueStatusPayload{
 		Queued:          false,
 		TotalQueued:     0,
 		AvailableTokens: 0,
-		ClaimableNow:    0,
-	}
+		ClaimableNow:    nil,
+	}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable, true)
 }
 
 func (s *Service) defaultDashboardSummaryPayload(options dashboardSummaryOptions) map[string]any {
@@ -187,42 +444,43 @@ func (s *Service) defaultDashboardSummaryPayload(options dashboardSummaryOptions
 		"available": 0,
 		"unclaimed": 0,
 	})
+	now := isoformatNow()
 
-	return map[string]any{
-		"stats": map[string]int{
-			"total_tokens":          0,
-			"available_tokens":      0,
-			"claimed_total":         0,
-			"claimed_unique":        0,
-			"others_claimed_total":  0,
-			"others_claimed_unique": 0,
-		},
-		"leaderboard": map[string]any{
+	return annotateDashboardPayload(map[string]any{
+		"stats": annotateDashboardSection(map[string]any{
+			"total_tokens":          nil,
+			"available_tokens":      nil,
+			"claimed_total":         nil,
+			"claimed_unique":        nil,
+			"others_claimed_total":  nil,
+			"others_claimed_unique": nil,
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+		"leaderboard": annotateDashboardSection(map[string]any{
 			"window": normalized.LeaderboardWindow,
 			"items":  []map[string]any{},
-		},
-		"recent": map[string]any{
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+		"recent": annotateDashboardSection(map[string]any{
 			"items": []map[string]any{},
-		},
-		"contributors": map[string]any{
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+		"contributors": annotateDashboardSection(map[string]any{
 			"items": []map[string]any{},
-		},
-		"recent_contributors": map[string]any{
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+		"recent_contributors": annotateDashboardSection(map[string]any{
 			"items": []map[string]any{},
-		},
-		"trends": map[string]any{
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+		"trends": annotateDashboardSection(map[string]any{
 			"window": normalized.WindowSeconds,
 			"bucket": normalized.BucketSeconds,
 			"series": []map[string]any{},
-		},
-		"system": map[string]any{
-			"inventory": map[string]int{
-				"total":     0,
-				"available": 0,
-				"unclaimed": 0,
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+		"system": annotateDashboardSection(map[string]any{
+			"inventory": map[string]any{
+				"total":     nil,
+				"available": nil,
+				"unclaimed": nil,
 			},
 			"queue": map[string]any{
-				"total": 0,
+				"total": nil,
 			},
 			"health": map[string]any{
 				"status":       policy.Status,
@@ -233,27 +491,30 @@ func (s *Service) defaultDashboardSummaryPayload(options dashboardSummaryOptions
 			"index": map[string]any{
 				"updated_at": s.systemIndexTimestamp(),
 			},
-		},
-		"degraded": true,
-	}
+		}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable),
+	}, dataSourceUnavailable, now, "", degradedReasonDataUnavailable, true)
 }
 
 func (s *Service) defaultBootstrapPayload(requestContext *auth.RequestContext) map[string]any {
-	queueStatus := s.defaultQueueStatusPayload()
-	if requestContext != nil {
-		if cached, ok := s.getCachedQueueStatus(requestContext.UserID); ok {
-			queueStatus = cached
-		}
-	}
-	queueStatus.Degraded = true
+	now := isoformatNow()
 
 	return map[string]any{
 		"profile":        s.defaultProfilePayload(requestContext),
 		"dashboard":      s.defaultDashboardSummaryPayload(dashboardSummaryOptions{Window: defaultDashboardWindow, Bucket: defaultDashboardBucket}),
 		"claim_realtime": s.emptyClaimRealtimeSnapshot(),
-		"queue_status":   queueStatus,
+		"queue_status":   s.defaultQueueStatusPayload(),
 		"upload_results": buildUploadResultsSummaryPayload(nil),
-		"degraded":       true,
+		"sources": map[string]any{
+			"profile":        dataSourceUnavailable,
+			"dashboard":      dataSourceUnavailable,
+			"queue_status":   dataSourceUnavailable,
+			"claim_realtime": dataSourceUnavailable,
+			"upload_results": dataSourceUnavailable,
+		},
+		"data_source":     dataSourceUnavailable,
+		"generated_at":    now,
+		"degraded_reason": degradedReasonCompatibility,
+		"degraded":        true,
 	}
 }
 
@@ -274,10 +535,30 @@ func (s *Service) getCachedRuntimeSnapshot(userID int64) (runtimeSnapshotPayload
 	return getCachedJSON[runtimeSnapshotPayload](s.cache, s.userRuntimeSnapshotCacheKey(userID))
 }
 
+func (s *Service) getCachedProfile(userID int64, isAdmin bool) (profilePayload, bool) {
+	return getCachedJSON[profilePayload](s.cache, s.userProfileCacheKey(userID, isAdmin))
+}
+
 func (s *Service) getCachedDashboardSummary(userID int64, options dashboardSummaryOptions) (map[string]any, bool) {
 	return getCachedJSON[map[string]any](s.cache, s.dashboardSummaryCacheKey(userID, options))
 }
 
-func (s *Service) getCachedBootstrap(userID int64, isAdmin bool) (map[string]any, bool) {
-	return getCachedJSON[map[string]any](s.cache, s.userBootstrapCacheKey(userID, isAdmin))
+func (s *Service) getCachedStaleDashboardSummary(userID int64, options dashboardSummaryOptions) (staleReadEnvelope[map[string]any], bool) {
+	return getCachedJSON[staleReadEnvelope[map[string]any]](s.cache, s.dashboardSummaryStaleCacheKey(userID, options))
+}
+
+func (s *Service) getCachedStaleQueueStatus(userID int64) (queueStatusPayload, bool) {
+	return getCachedJSON[queueStatusPayload](s.cache, s.userQueueStaleCacheKey(userID))
+}
+
+func (s *Service) getCachedClaimRealtime(userID int64) (claimRealtimeSnapshot, bool) {
+	return getCachedJSON[claimRealtimeSnapshot](s.cache, s.userClaimRealtimeCacheKey(userID))
+}
+
+func (s *Service) getCachedClaimableNow(userID int64) (storedClaimableNowSnapshot, bool) {
+	return getCachedJSON[storedClaimableNowSnapshot](s.cache, s.userClaimableNowCacheKey(userID))
+}
+
+func (s *Service) getCachedStaleClaimableNow(userID int64) (storedClaimableNowSnapshot, bool) {
+	return getCachedJSON[storedClaimableNowSnapshot](s.cache, s.userClaimableNowStaleCacheKey(userID))
 }

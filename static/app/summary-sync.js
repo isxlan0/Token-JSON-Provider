@@ -526,29 +526,6 @@ export function createSummarySyncController(deps) {
     return summary;
   }
 
-  async function loadBootstrapBundle(options = {}) {
-    const [runtimeSnapshot, dashboardSummary] = await Promise.all([
-      loadRuntimeSnapshot({
-        broadcast: options.broadcast,
-        version: options.runtimeVersion ?? options.version,
-        requestIds: options.runtimeRequestIds ?? options.requestIds,
-        request_ids: options.runtime_request_ids,
-        attachPendingRequestIds: options.attachPendingRequestIds,
-      }),
-      loadDashboardSummary({
-        broadcast: options.broadcast,
-        version: options.dashboardVersion ?? options.version,
-        requestIds: options.dashboardRequestIds ?? options.requestIds,
-        request_ids: options.dashboard_request_ids,
-        attachPendingRequestIds: options.attachPendingRequestIds,
-      }),
-    ]);
-    return {
-      runtime_snapshot: runtimeSnapshot || {},
-      dashboard_summary: dashboardSummary || {},
-    };
-  }
-
   function buildSummaryRefreshBatch() {
     if (!canPerformPrimaryRefreshWork()) {
       return null;
@@ -741,7 +718,6 @@ export function createSummarySyncController(deps) {
   }
 
   return {
-    loadBootstrapBundle,
     loadRuntimeSnapshot,
     loadDashboardSummary,
     applyRuntimeSnapshotEnvelope,

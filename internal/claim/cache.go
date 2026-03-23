@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"token-atlas/internal/runtimecache"
 )
@@ -41,6 +42,15 @@ func (s *Service) dashboardCacheKey(prefix string, userID *int64, parts ...any) 
 	return runtimecache.BuildCacheKey(prefix, arguments...)
 }
 
+func (s *Service) dashboardStaleCacheKey(prefix string, userID *int64, parts ...any) string {
+	arguments := []any{prefix}
+	if userID != nil {
+		arguments = append(arguments, *userID)
+	}
+	arguments = append(arguments, parts...)
+	return s.snapshotCacheKey("dashboard-stale", arguments...)
+}
+
 func (s *Service) dashboardSummaryCacheKey(userID int64, options dashboardSummaryOptions) string {
 	normalized := normalizeDashboardSummaryOptions(options)
 	return s.snapshotCacheKey(
@@ -61,6 +71,21 @@ func (s *Service) dashboardSummaryCacheKey(userID int64, options dashboardSummar
 		fmt.Sprintf("cv%d", s.cacheScopeVersion("dashboard-contributors")),
 		fmt.Sprintf("rcv%d", s.cacheScopeVersion("dashboard-recent-contributors")),
 		fmt.Sprintf("tv%d", s.cacheScopeVersion("dashboard-trends")),
+	)
+}
+
+func (s *Service) dashboardSummaryStaleCacheKey(userID int64, options dashboardSummaryOptions) string {
+	normalized := normalizeDashboardSummaryOptions(options)
+	return s.dashboardStaleCacheKey(
+		"dashboard-summary",
+		&userID,
+		normalized.WindowSeconds,
+		normalized.BucketSeconds,
+		normalized.LeaderboardWindow,
+		normalized.LeaderboardLimit,
+		normalized.RecentLimit,
+		normalized.ContributorLimit,
+		normalized.RecentContributorLimit,
 	)
 }
 
@@ -125,20 +150,25 @@ func (s *Service) userQueueCacheKey(userID int64) string {
 	)
 }
 
-func (s *Service) userUploadResultsCacheKey(userID int64) string {
-	return s.snapshotCacheKey("user-upload-results", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-upload-results", userID)))
+func (s *Service) userQueueStaleCacheKey(userID int64) string {
+	return s.snapshotCacheKey("user-queue-stale", userID)
 }
 
-func (s *Service) userBootstrapCacheKey(userID int64, isAdmin bool) string {
+func (s *Service) userClaimableNowCacheKey(userID int64) string {
 	return s.snapshotCacheKey(
-		"user-bootstrap",
+		"user-claimable-now",
 		userID,
-		boolToFlag(isAdmin),
-		fmt.Sprintf("pv%d", s.cacheScopeVersion("user-profile", userID)),
-		fmt.Sprintf("crv%d", s.cacheScopeVersion("user-claim-realtime", userID)),
-		fmt.Sprintf("qv%d", s.cacheScopeVersion("user-queue", userID)),
-		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
+		fmt.Sprintf("cv%d", s.cacheScopeVersion("user-claims-summary", userID)),
+		fmt.Sprintf("iv%d", s.cacheScopeVersion("inventory")),
 	)
+}
+
+func (s *Service) userClaimableNowStaleCacheKey(userID int64) string {
+	return s.snapshotCacheKey("user-claimable-now-stale", userID)
+}
+
+func (s *Service) userUploadResultsCacheKey(userID int64) string {
+	return s.snapshotCacheKey("user-upload-results", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-upload-results", userID)))
 }
 
 func (s *Service) adminBootstrapCacheKey(userID int64) string {
@@ -383,6 +413,10 @@ func (s *Service) uploadResultsTTL() int {
 	return maxInt(s.cfg.Cache.MeTTL, 60)
 }
 
+func (s *Service) claimableNowSnapshotTTL() int {
+	return maxInt(s.cfg.Cache.QueueTTL, 300)
+}
+
 func (s *Service) getCachedQueueStatus(userID int64) (queueStatusPayload, bool) {
 	if s.cache == nil {
 		return queueStatusPayload{}, false
@@ -399,6 +433,12 @@ func (s *Service) setQueueStatusSnapshot(userID int64, payload queueStatusPayloa
 		return payload
 	}
 
+	payload = stripQueueStatusAuxiliaryFields(payload)
+	if strings.TrimSpace(payload.GeneratedAt) == "" {
+		payload.GeneratedAt = isoformatNow()
+	}
+	payload = withQueueStatusMetadata(payload, dataSourceLive, payload.GeneratedAt, "", "", false)
+
 	key := s.userQueueCacheKey(userID)
 	var previous queueStatusPayload
 	hadPrevious := s.cache.GetJSON(key, &previous)
@@ -408,10 +448,23 @@ func (s *Service) setQueueStatusSnapshot(userID int64, payload queueStatusPayloa
 		key = s.userQueueCacheKey(userID)
 	}
 	s.cache.SetJSON(key, payload, s.queueSnapshotTTL())
+	s.cache.SetJSON(s.userQueueStaleCacheKey(userID), payload, s.queueSnapshotTTL())
 	if changed {
 		s.queueEvents.notify(userID)
 	}
 	return payload
+}
+
+func (s *Service) setClaimableNowSnapshot(userID int64, snapshot storedClaimableNowSnapshot) storedClaimableNowSnapshot {
+	if s.cache == nil {
+		return snapshot
+	}
+	if strings.TrimSpace(snapshot.GeneratedAt) == "" {
+		snapshot.GeneratedAt = isoformatNow()
+	}
+	s.cache.SetJSON(s.userClaimableNowCacheKey(userID), snapshot, s.claimableNowSnapshotTTL())
+	s.cache.SetJSON(s.userClaimableNowStaleCacheKey(userID), snapshot, s.claimableNowSnapshotTTL())
+	return snapshot
 }
 
 func buildUploadResultsSummaryPayload(payload map[string]any) map[string]any {

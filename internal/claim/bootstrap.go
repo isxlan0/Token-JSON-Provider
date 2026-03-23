@@ -18,110 +18,160 @@ const (
 	defaultAdminTokensLimit = 50
 )
 
-func (s *Service) buildBootstrapPayload(ctx context.Context, requestContext *auth.RequestContext) (map[string]any, error) {
-	profile, err := s.GetProfile(ctx, requestContext)
-	if err != nil {
-		return nil, err
-	}
-
-	dashboard, err := s.GetDashboardSummary(ctx, requestContext.UserID, defaultDashboardWindow, defaultDashboardBucket)
-	if err != nil {
-		return nil, err
-	}
-
-	queueStatus, err := s.GetQueueStatus(ctx, requestContext.UserID)
-	if err != nil {
-		return nil, err
-	}
-
-	claimRealtime, err := s.GetClaimRealtimeSnapshot(ctx, requestContext.UserID, requestContext.SessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]any{
-		"profile":        profile,
-		"dashboard":      dashboard,
-		"claim_realtime": claimRealtime,
-		"queue_status":   queueStatus,
-		"upload_results": buildUploadResultsSummaryPayload(s.GetUploadResults(requestContext.UserID)),
-	}, nil
-}
-
 func (s *Service) GetBootstrap(ctx context.Context, requestContext *auth.RequestContext) (map[string]any, error) {
 	startedAt := time.Now()
-	observedCtx, _ := withSQLMetrics(ctx)
+	userID := int64(0)
 	var (
 		profileDuration       time.Duration
 		dashboardDuration     time.Duration
 		queueStatusDuration   time.Duration
 		claimRealtimeDuration time.Duration
 		uploadResultsDuration time.Duration
-		loaderExecuted        bool
+		profileSource         = dataSourceUnavailable
+		dashboardSource       = dataSourceUnavailable
+		queueStatusSource     = dataSourceUnavailable
+		claimRealtimeSource   = dataSourceUnavailable
+		uploadResultsSource   = dataSourceLive
 	)
+	if requestContext != nil {
+		userID = requestContext.UserID
+	}
 
-	payload, err := runtimecache.CacheJSON(
-		s.cache,
-		s.userBootstrapCacheKey(requestContext.UserID, requestContext.IsAdmin),
-		s.cfg.Cache.MeTTL,
-		func() (map[string]any, error) {
-			loaderExecuted = true
-
-			stageStartedAt := time.Now()
-			profile, err := s.GetProfile(observedCtx, requestContext)
-			profileDuration = time.Since(stageStartedAt)
-			if err != nil {
-				return nil, err
+	profileStartedAt := time.Now()
+	profile := s.defaultProfilePayload(requestContext)
+	if requestContext != nil {
+		if cached, ok := s.getCachedProfile(requestContext.UserID, requestContext.IsAdmin); ok {
+			profile = cached
+			profileSource = dataSourceCache
+		} else if runtimeSnapshot, ok := s.getCachedRuntimeSnapshot(requestContext.UserID); ok {
+			profile = s.defaultProfilePayload(requestContext)
+			profile.Quota = runtimeSnapshot.Quota
+			profile.Claims = runtimeSnapshot.Claims
+			if summary, ok := runtimeSnapshot.APIKeys["summary"]; ok {
+				profile.APIKeys = summary
 			}
-
-			stageStartedAt = time.Now()
-			dashboard, err := s.GetDashboardSummary(observedCtx, requestContext.UserID, defaultDashboardWindow, defaultDashboardBucket)
-			dashboardDuration = time.Since(stageStartedAt)
-			if err != nil {
-				return nil, err
+			if runtimeSnapshot.Uploads != nil {
+				profile.Uploads = runtimeSnapshot.Uploads
 			}
+			profileSource = dataSourceCache
+		}
+	}
+	profileDuration = time.Since(profileStartedAt)
 
-			stageStartedAt = time.Now()
-			queueStatus, err := s.GetQueueStatus(observedCtx, requestContext.UserID)
-			queueStatusDuration = time.Since(stageStartedAt)
-			if err != nil {
-				return nil, err
+	dashboardOptions := dashboardSummaryOptions{Window: defaultDashboardWindow, Bucket: defaultDashboardBucket}
+	dashboardStartedAt := time.Now()
+	dashboard := s.defaultDashboardSummaryPayload(dashboardOptions)
+	if requestContext != nil {
+		if cached, ok := s.getCachedDashboardSummary(requestContext.UserID, dashboardOptions); ok {
+			dashboard = annotateDashboardPayload(cached, dataSourceCache, "", "", "", false)
+			dashboardSource = dataSourceCache
+		} else if stale, ok := s.getCachedStaleDashboardSummary(requestContext.UserID, dashboardOptions); ok {
+			dashboard = annotateDashboardPayload(
+				stale.Value,
+				dataSourceStale,
+				stale.GeneratedAt,
+				staleTimestamp(stale.GeneratedAt),
+				degradedReasonCompatibility,
+				true,
+			)
+			dashboardSource = dataSourceStale
+		}
+	}
+	dashboardDuration = time.Since(dashboardStartedAt)
+
+	queueStatusStartedAt := time.Now()
+	queueStatus := s.defaultQueueStatusPayload()
+	if requestContext != nil {
+		if cached, ok := s.getCachedQueueStatus(requestContext.UserID); ok {
+			queueStatus = withQueueStatusMetadata(cached, dataSourceCache, cached.GeneratedAt, "", "", false)
+			queueStatusSource = dataSourceCache
+		} else if stale, ok := s.getCachedStaleQueueStatus(requestContext.UserID); ok {
+			queueStatus = withQueueStatusMetadata(
+				stale,
+				dataSourceStale,
+				stale.GeneratedAt,
+				staleTimestamp(stale.GeneratedAt),
+				degradedReasonCompatibility,
+				true,
+			)
+			queueStatusSource = dataSourceStale
+		}
+		queueStatus = s.attachCachedClaimableNow(requestContext.UserID, queueStatus)
+	}
+	queueStatusDuration = time.Since(queueStatusStartedAt)
+
+	claimRealtimeStartedAt := time.Now()
+	claimRealtime := s.emptyClaimRealtimeSnapshot()
+	if requestContext != nil {
+		if cached, ok := s.getCachedClaimRealtime(requestContext.UserID); ok {
+			claimRealtime = cached
+			claimRealtimeSource = dataSourceCache
+		}
+	}
+	claimRealtimeDuration = time.Since(claimRealtimeStartedAt)
+
+	uploadResultsStartedAt := time.Now()
+	uploadResults := buildUploadResultsSummaryPayload(nil)
+	if requestContext != nil {
+		uploadResults = buildUploadResultsSummaryPayload(s.GetUploadResults(requestContext.UserID))
+	}
+	uploadResultsDuration = time.Since(uploadResultsStartedAt)
+	dashboardStaleAt, _ := dashboard["stale_at"].(string)
+
+	bootstrapSource := dataSourceCache
+	for _, source := range []string{profileSource, dashboardSource, queueStatusSource, claimRealtimeSource} {
+		switch source {
+		case dataSourceUnavailable:
+			bootstrapSource = dataSourceUnavailable
+		case dataSourceStale:
+			if bootstrapSource != dataSourceUnavailable {
+				bootstrapSource = dataSourceStale
 			}
+		}
+	}
 
-			stageStartedAt = time.Now()
-			claimRealtime, err := s.GetClaimRealtimeSnapshot(observedCtx, requestContext.UserID, requestContext.SessionID)
-			claimRealtimeDuration = time.Since(stageStartedAt)
-			if err != nil {
-				return nil, err
-			}
-
-			stageStartedAt = time.Now()
-			uploadResults := buildUploadResultsSummaryPayload(s.GetUploadResults(requestContext.UserID))
-			uploadResultsDuration = time.Since(stageStartedAt)
-
-			return map[string]any{
-				"profile":        profile,
-				"dashboard":      dashboard,
-				"claim_realtime": claimRealtime,
-				"queue_status":   queueStatus,
-				"upload_results": uploadResults,
-			}, nil
+	payload := map[string]any{
+		"profile":        profile,
+		"dashboard":      dashboard,
+		"claim_realtime": claimRealtime,
+		"queue_status":   queueStatus,
+		"upload_results": uploadResults,
+		"sources": map[string]any{
+			"profile":        profileSource,
+			"dashboard":      dashboardSource,
+			"queue_status":   queueStatusSource,
+			"claim_realtime": claimRealtimeSource,
+			"upload_results": uploadResultsSource,
 		},
-	)
+		"data_source":     bootstrapSource,
+		"generated_at":    isoformatNow(),
+		"degraded":        true,
+		"degraded_reason": degradedReasonCompatibility,
+	}
+	if bootstrapSource == dataSourceStale {
+		payload["stale_at"] = firstNonEmpty(
+			strings.TrimSpace(queueStatus.StaleAt),
+			strings.TrimSpace(dashboardStaleAt),
+		)
+	}
 	s.logger.Info(
 		"get bootstrap",
-		"user_id", requestContext.UserID,
-		"cache_hit", !loaderExecuted,
+		"user_id", userID,
+		"data_source", payload["data_source"],
+		"degraded", payload["degraded"],
+		"profile_source", profileSource,
+		"dashboard_source", dashboardSource,
+		"queue_status_source", queueStatusSource,
+		"claim_realtime_source", claimRealtimeSource,
+		"upload_results_source", uploadResultsSource,
 		"total_ms", durationMillis(time.Since(startedAt)),
 		"profile_ms", durationMillis(profileDuration),
 		"dashboard_ms", durationMillis(dashboardDuration),
 		"queue_status_ms", durationMillis(queueStatusDuration),
 		"claim_realtime_ms", durationMillis(claimRealtimeDuration),
 		"upload_results_ms", durationMillis(uploadResultsDuration),
-		"sql_count", sqlCount(observedCtx),
-		"error", err,
 	)
-	return payload, err
+	return payload, nil
 }
 
 func (s *Service) cachedAdminUsersPage(ctx context.Context, search string, banStatus string, limit int, offset int) (map[string]any, error) {

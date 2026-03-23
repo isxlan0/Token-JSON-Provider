@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 
@@ -34,6 +35,7 @@ func (s *Service) RegisterRoutes(e *echo.Echo) {
 	me.GET("/runtime-snapshot", s.getRuntimeSnapshot)
 	me.GET("/bootstrap", s.getBootstrap)
 	me.GET("/queue-status", s.getQueueStatus)
+	me.GET("/claimable-now", s.getClaimableNow)
 	me.GET("/queue-stream", s.getQueueStream)
 	me.GET("/uploads/results", s.getUploadResults)
 	me.GET("/uploads/stream", s.getUploadResultsStream)
@@ -181,11 +183,14 @@ func (s *Service) getRuntimeSnapshot(c echo.Context) error {
 		}
 		if cached, ok := s.getCachedRuntimeSnapshot(requestContext.UserID); ok {
 			payload = cached
+			payload.DataSource = dataSourceCache
+			payload.StaleAt = staleTimestamp(payload.GeneratedAt)
 		} else {
 			payload = s.defaultRuntimeSnapshotPayload(requestContext)
 		}
 		payload = s.mergeRuntimeSnapshotWithRequestContext(payload, requestContext)
 		payload.Degraded = true
+		payload.DegradedReason = degradedReasonForError(err)
 		return c.JSON(http.StatusOK, payload)
 	}
 	payload = s.mergeRuntimeSnapshotWithRequestContext(payload, requestContext)
@@ -206,14 +211,22 @@ func (s *Service) getBootstrap(c echo.Context) error {
 		if !isReadDegradeError(err) {
 			return err
 		}
-		if cached, ok := s.getCachedBootstrap(requestContext.UserID, requestContext.IsAdmin); ok {
-			payload = cached
-		} else {
-			payload = s.defaultBootstrapPayload(requestContext)
-		}
-		payload["degraded"] = true
-		return c.JSON(http.StatusOK, payload)
+		payload = s.defaultBootstrapPayload(requestContext)
+		payload["degraded_reason"] = degradedReasonForError(err)
 	}
+	s.logger.Info(
+		"bootstrap request source",
+		"user_id", requestContext.UserID,
+		"client_build", strings.TrimSpace(c.Request().Header.Get("X-App-Build")),
+		"client_entry", strings.TrimSpace(c.Request().Header.Get("X-App-Entry")),
+		"referer", strings.TrimSpace(c.Request().Header.Get("Referer")),
+		"user_agent", strings.TrimSpace(c.Request().Header.Get("User-Agent")),
+		"sec_fetch_site", strings.TrimSpace(c.Request().Header.Get("Sec-Fetch-Site")),
+		"sec_fetch_mode", strings.TrimSpace(c.Request().Header.Get("Sec-Fetch-Mode")),
+		"sec_fetch_dest", strings.TrimSpace(c.Request().Header.Get("Sec-Fetch-Dest")),
+		"data_source", payload["data_source"],
+		"degraded", payload["degraded"],
+	)
 	return c.JSON(http.StatusOK, payload)
 }
 
@@ -231,12 +244,58 @@ func (s *Service) getQueueStatus(c echo.Context) error {
 		if !isReadDegradeError(err) {
 			return err
 		}
-		if cached, ok := s.getCachedQueueStatus(requestContext.UserID); ok {
+		if cached, ok := s.getCachedStaleQueueStatus(requestContext.UserID); ok {
 			payload = cached
+			payload = withQueueStatusMetadata(
+				payload,
+				dataSourceStale,
+				payload.GeneratedAt,
+				staleTimestamp(payload.GeneratedAt),
+				degradedReasonForError(err),
+				true,
+			)
 		} else {
 			payload = s.defaultQueueStatusPayload()
+			payload = withQueueStatusMetadata(
+				payload,
+				dataSourceUnavailable,
+				payload.GeneratedAt,
+				"",
+				degradedReasonForError(err),
+				true,
+			)
 		}
-		payload.Degraded = true
+		payload = s.attachCachedClaimableNow(requestContext.UserID, payload)
+		return c.JSON(http.StatusOK, payload)
+	}
+	return c.JSON(http.StatusOK, payload)
+}
+
+func (s *Service) getClaimableNow(c echo.Context) error {
+	requestContext, ok := auth.RequestContextFromEcho(c)
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
+	}
+
+	readCtx, cancel := context.WithTimeout(c.Request().Context(), queueStatusReadTimeout)
+	defer cancel()
+
+	payload, err := s.GetClaimableNow(readCtx, requestContext.UserID)
+	if err != nil {
+		if !isReadDegradeError(err) {
+			return err
+		}
+		if cached, ok := s.getCachedStaleClaimableNow(requestContext.UserID); ok {
+			payload = claimableNowPayloadFromSnapshot(
+				cached,
+				dataSourceStale,
+				staleTimestamp(cached.GeneratedAt),
+				degradedReasonForError(err),
+				true,
+			)
+		} else {
+			payload = unavailableClaimableNowPayload(degradedReasonForError(err))
+		}
 		return c.JSON(http.StatusOK, payload)
 	}
 	return c.JSON(http.StatusOK, payload)
@@ -333,12 +392,26 @@ func (s *Service) getDashboardSummary(c echo.Context) error {
 		if !isReadDegradeError(err) {
 			return err
 		}
-		if cached, ok := s.getCachedDashboardSummary(requestContext.UserID, options); ok && cached != nil {
-			payload = cached
+		if cached, ok := s.getCachedStaleDashboardSummary(requestContext.UserID, options); ok && cached.Value != nil {
+			payload = annotateDashboardPayload(
+				cached.Value,
+				dataSourceStale,
+				cached.GeneratedAt,
+				staleTimestamp(cached.GeneratedAt),
+				degradedReasonForError(err),
+				true,
+			)
 		} else {
 			payload = s.defaultDashboardSummaryPayload(options)
+			payload = annotateDashboardPayload(
+				payload,
+				dataSourceUnavailable,
+				"",
+				"",
+				degradedReasonForError(err),
+				true,
+			)
 		}
-		payload["degraded"] = true
 		return c.JSON(http.StatusOK, payload)
 	}
 	return c.JSON(http.StatusOK, payload)

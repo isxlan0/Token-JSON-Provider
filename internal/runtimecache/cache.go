@@ -168,6 +168,14 @@ type cacheFlight struct {
 	err    error
 }
 
+type CacheState string
+
+const (
+	CacheStateMemoryHit   CacheState = "memory_hit"
+	CacheStateFlightShared CacheState = "flight_shared"
+	CacheStateMiss        CacheState = "miss"
+)
+
 func New(ctx context.Context, cfg config.CacheConfig, logger *slog.Logger) *AppCache {
 	if logger == nil {
 		logger = slog.Default()
@@ -374,25 +382,25 @@ func BuildSnapshotCacheKey(prefix string, parts ...any) string {
 	return BuildCacheKey("snapshot", arguments...)
 }
 
-func CacheJSON[T any](cache *AppCache, key string, ttlSec int, loader func() (T, error)) (T, error) {
+func CacheJSONWithState[T any](cache *AppCache, key string, ttlSec int, loader func() (T, error)) (T, CacheState, error) {
 	var zero T
 	if cache != nil {
 		var cached T
 		if cache.GetJSON(key, &cached) {
-			return cached, nil
+			return cached, CacheStateMemoryHit, nil
 		}
 
 		flight, leader := cache.beginFlight(key)
 		if !leader {
 			<-flight.done
 			if flight.err != nil {
-				return zero, flight.err
+				return zero, CacheStateFlightShared, flight.err
 			}
 			value, ok := flight.result.(T)
 			if !ok {
-				return zero, fmt.Errorf("cache flight result type mismatch for key %q", key)
+				return zero, CacheStateFlightShared, fmt.Errorf("cache flight result type mismatch for key %q", key)
 			}
-			return value, nil
+			return value, CacheStateFlightShared, nil
 		}
 		defer func() {
 			if r := recover(); r != nil {
@@ -404,21 +412,26 @@ func CacheJSON[T any](cache *AppCache, key string, ttlSec int, loader func() (T,
 		value, err := loader()
 		if err != nil {
 			cache.finishFlight(key, flight, zero, err)
-			return zero, err
+			return zero, CacheStateMiss, err
 		}
 		cache.SetJSON(key, value, ttlSec)
 		cache.finishFlight(key, flight, value, nil)
-		return value, nil
+		return value, CacheStateMiss, nil
 	}
 
 	value, err := loader()
 	if err != nil {
-		return zero, err
+		return zero, CacheStateMiss, err
 	}
 	if cache != nil {
 		cache.SetJSON(key, value, ttlSec)
 	}
-	return value, nil
+	return value, CacheStateMiss, nil
+}
+
+func CacheJSON[T any](cache *AppCache, key string, ttlSec int, loader func() (T, error)) (T, error) {
+	value, _, err := CacheJSONWithState(cache, key, ttlSec, loader)
+	return value, err
 }
 
 func secondsToDuration(value int) time.Duration {

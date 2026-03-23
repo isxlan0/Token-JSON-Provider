@@ -30,6 +30,8 @@ func TestInitCreatesSchemaAndIndexes(t *testing.T) {
 		"user_bans",
 		"inventory_runtime",
 		"queue_runtime",
+		"claim_stats_runtime",
+		"user_claim_stats_runtime",
 	} {
 		if !sqliteObjectExists(t, store.DB(), "table", tableName) {
 			t.Fatalf("missing table %s", tableName)
@@ -45,6 +47,7 @@ func TestInitCreatesSchemaAndIndexes(t *testing.T) {
 		"idx_token_claims_claimed_at",
 		"idx_token_claims_claimed_at_request_user",
 		"idx_user_token_claims_user",
+		"idx_user_token_claims_token",
 		"idx_claim_queue_status_time",
 		"idx_claim_queue_user_status_remaining_time",
 		"idx_claim_queue_status_remaining_time",
@@ -53,6 +56,7 @@ func TestInitCreatesSchemaAndIndexes(t *testing.T) {
 		"idx_tokens_access_token_hash_unique",
 		"idx_token_claims_token_user",
 		"idx_tokens_claimable_candidates",
+		"idx_tokens_provider_identity_uploaded",
 		"idx_api_keys_user_status",
 		"idx_user_bans_target_time",
 		"idx_user_bans_active_lookup",
@@ -153,6 +157,30 @@ func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 		}
 	}
 
+	claimStatsColumns := tableColumnSet(t, store.DB(), "claim_stats_runtime")
+	for _, columnName := range []string{
+		"claimed_total",
+		"claimed_unique",
+		"updated_at_ts",
+	} {
+		if _, ok := claimStatsColumns[columnName]; !ok {
+			t.Fatalf("missing migrated claim_stats_runtime column %s", columnName)
+		}
+	}
+
+	userClaimStatsColumns := tableColumnSet(t, store.DB(), "user_claim_stats_runtime")
+	for _, columnName := range []string{
+		"user_id",
+		"claimed_total",
+		"claimed_unique",
+		"exclusive_claimed_unique",
+		"updated_at_ts",
+	} {
+		if _, ok := userClaimStatsColumns[columnName]; !ok {
+			t.Fatalf("missing migrated user_claim_stats_runtime column %s", columnName)
+		}
+	}
+
 	var (
 		accountID       string
 		accessTokenHash string
@@ -196,6 +224,38 @@ func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 	}
 	if totalQueued != 2 {
 		t.Fatalf("unexpected total queued: %d", totalQueued)
+	}
+
+	var claimedTotal int
+	var claimedUnique int
+	if err := store.DB().QueryRow(`
+		SELECT claimed_total, claimed_unique
+		FROM claim_stats_runtime
+		WHERE id = 1
+	`).Scan(&claimedTotal, &claimedUnique); err != nil {
+		t.Fatalf("query claim stats runtime: %v", err)
+	}
+	if claimedTotal != 2 || claimedUnique != 1 {
+		t.Fatalf("unexpected claim stats runtime: total=%d unique=%d", claimedTotal, claimedUnique)
+	}
+
+	var userClaimedTotal int
+	var userClaimedUnique int
+	var exclusiveClaimedUnique int
+	if err := store.DB().QueryRow(`
+		SELECT claimed_total, claimed_unique, exclusive_claimed_unique
+		FROM user_claim_stats_runtime
+		WHERE user_id = 1
+	`).Scan(&userClaimedTotal, &userClaimedUnique, &exclusiveClaimedUnique); err != nil {
+		t.Fatalf("query user claim stats runtime: %v", err)
+	}
+	if userClaimedTotal != 2 || userClaimedUnique != 1 || exclusiveClaimedUnique != 1 {
+		t.Fatalf(
+			"unexpected user claim stats runtime: total=%d unique=%d exclusive=%d",
+			userClaimedTotal,
+			userClaimedUnique,
+			exclusiveClaimedUnique,
+		)
 	}
 
 	var (

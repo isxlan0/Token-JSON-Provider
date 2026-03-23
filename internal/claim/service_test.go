@@ -118,6 +118,29 @@ func TestGetQueueStatusCachesMissAndReusesSnapshot(t *testing.T) {
 	}
 }
 
+func TestGetQueueStatusDefersClaimableNowOnMainPath(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10023", "queue-deferred-user")
+	insertTestToken(t, store, "queue-deferred.json", `{"access_token":"queue-deferred","refresh_token":"queue-deferred-r","account_id":"acct-queue-deferred"}`, 0, 1)
+
+	payload, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get queue status: %v", err)
+	}
+	if payload.ClaimableNow != nil {
+		t.Fatalf("expected queue status main path to defer claimable_now, got %+v", payload)
+	}
+	if payload.ClaimableNowState != dataSourceUnavailable {
+		t.Fatalf("expected deferred claimable_now state to be unavailable, got %+v", payload)
+	}
+	if payload.DegradedReason != degradedReasonClaimableDeferred {
+		t.Fatalf("expected deferred degraded reason, got %+v", payload)
+	}
+}
+
 func TestServiceStopWaitsForWorkersToExit(t *testing.T) {
 	service, _ := newClaimTestService(t)
 
@@ -189,6 +212,41 @@ func TestBootstrapCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
 	}
 	if secondUpload["batch_id"] != "batch-1" {
 		t.Fatalf("expected refreshed upload batch id, got %#v", secondUpload["batch_id"])
+	}
+}
+
+func TestDashboardSummaryCachesColdAndHotReads(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10032", "dashboard-cache-user")
+	insertTestToken(t, store, "dashboard-cache.json", `{"access_token":"dashboard-cache","refresh_token":"dashboard-cache-r","account_id":"acct-dashboard-cache"}`, 0, 1)
+
+	options := dashboardSummaryOptions{
+		Window:                 defaultDashboardWindow,
+		Bucket:                 defaultDashboardBucket,
+		LeaderboardWindow:      "24h",
+		LeaderboardLimit:       10,
+		RecentLimit:            10,
+		ContributorLimit:       10,
+		RecentContributorLimit: 10,
+	}
+
+	first, err := service.GetDashboardSummaryWithOptions(ctx, userID, options)
+	if err != nil {
+		t.Fatalf("get cold dashboard summary: %v", err)
+	}
+	if first["data_source"] != dataSourceLive {
+		t.Fatalf("expected cold dashboard summary to be live, got %#v", first["data_source"])
+	}
+
+	second, err := service.GetDashboardSummaryWithOptions(ctx, userID, options)
+	if err != nil {
+		t.Fatalf("get hot dashboard summary: %v", err)
+	}
+	if second["data_source"] != dataSourceCache {
+		t.Fatalf("expected hot dashboard summary to be cache, got %#v", second["data_source"])
 	}
 }
 
@@ -320,6 +378,79 @@ func TestAdminQueueCacheUsesDedicatedScope(t *testing.T) {
 	}
 	if intFromAny(third["total"]) != 2 {
 		t.Fatalf("expected queue-specific invalidation to refresh cache, got %+v", third)
+	}
+}
+
+func TestDefaultDashboardSummaryPayloadMarksUnavailableValues(t *testing.T) {
+	service, _ := newClaimTestService(t)
+
+	payload := service.defaultDashboardSummaryPayload(dashboardSummaryOptions{
+		Window: defaultDashboardWindow,
+		Bucket: defaultDashboardBucket,
+	})
+
+	if payload["data_source"] != dataSourceUnavailable {
+		t.Fatalf("expected top-level unavailable data source, got %#v", payload["data_source"])
+	}
+	if _, ok := payload["stale_at"]; ok {
+		t.Fatalf("default unavailable payload should not include stale_at, got %#v", payload["stale_at"])
+	}
+
+	stats, ok := payload["stats"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected stats payload: %#v", payload["stats"])
+	}
+	if stats["data_source"] != dataSourceUnavailable {
+		t.Fatalf("expected stats data source to be unavailable, got %#v", stats["data_source"])
+	}
+	if value, exists := stats["total_tokens"]; !exists || value != nil {
+		t.Fatalf("expected unavailable total_tokens to be null, got exists=%v value=%#v", exists, value)
+	}
+}
+
+func TestGetBootstrapReadsStaleDashboardEnvelope(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10031", "bootstrap-stale-user")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "10031",
+			Username:   "bootstrap-stale-user",
+			Name:       "bootstrap-stale-user",
+			TrustLevel: 2,
+		},
+	}
+
+	options := dashboardSummaryOptions{Window: defaultDashboardWindow, Bucket: defaultDashboardBucket}
+	staleGeneratedAt := "2026-03-23T12:00:00Z"
+	stalePayload := service.defaultDashboardSummaryPayload(options)
+	stalePayload["data_source"] = dataSourceStale
+	service.cache.SetJSON(
+		service.dashboardSummaryStaleCacheKey(userID, options),
+		staleReadEnvelope[map[string]any]{
+			Value:       stalePayload,
+			GeneratedAt: staleGeneratedAt,
+		},
+		service.cfg.Cache.DashboardTTL,
+	)
+
+	payload, err := service.GetBootstrap(ctx, requestContext)
+	if err != nil {
+		t.Fatalf("get bootstrap: %v", err)
+	}
+
+	dashboard, ok := payload["dashboard"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected dashboard payload: %#v", payload["dashboard"])
+	}
+	if dashboard["data_source"] != dataSourceStale {
+		t.Fatalf("expected stale dashboard data source, got %#v", dashboard["data_source"])
+	}
+	if dashboard["stale_at"] != staleGeneratedAt {
+		t.Fatalf("expected dashboard stale_at=%q, got %#v", staleGeneratedAt, dashboard["stale_at"])
 	}
 }
 

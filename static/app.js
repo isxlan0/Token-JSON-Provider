@@ -5,7 +5,16 @@ import {
   buildQueueStatusFromRequest,
   createInitialClaimRealtimeState,
 } from "./app/claim-realtime.js?v=20260323b";
-import { createSummarySyncController } from "./app/summary-sync.js?v=20260323h";
+import { createSummarySyncController } from "./app/summary-sync.js?v=20260323i";
+
+const APP_BUILD = (() => {
+  try {
+    return new URL(import.meta.url).searchParams.get("v") || "dev";
+  } catch (error) {
+    return "unknown";
+  }
+})();
+const APP_ENTRY = "web-spa";
 
 function createClientTabId() {
   const storageKey = "token_atlas_tab_id";
@@ -94,6 +103,9 @@ const state = {
   leaderCandidatePeers: new Map(),
   lastLowFrequencyAt: 0,
   bootstrapPromise: null,
+  runtimeSnapshotMeta: null,
+  dashboardMeta: null,
+  dashboardSectionMeta: {},
 };
 
 const LOW_FREQUENCY_REFRESH_MS = 60000;
@@ -204,6 +216,112 @@ const elements = {
   uploadSelectedList: document.getElementById("upload-selected-list"),
   uploadResults: document.getElementById("upload-results"),
 };
+
+function normalizeDataSource(value) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  switch (normalized) {
+    case "live":
+    case "cache":
+    case "stale":
+    case "unavailable":
+      return normalized;
+    default:
+      return "";
+  }
+}
+
+function normalizeOptionalNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function extractPayloadMeta(payload = {}) {
+  return {
+    data_source: normalizeDataSource(payload?.data_source),
+    generated_at: typeof payload?.generated_at === "string" ? payload.generated_at : "",
+    stale_at: typeof payload?.stale_at === "string" ? payload.stale_at : "",
+    degraded: Boolean(payload?.degraded),
+    degraded_reason: typeof payload?.degraded_reason === "string" ? payload.degraded_reason : "",
+  };
+}
+
+function isUnavailableMeta(meta = null) {
+  return normalizeDataSource(meta?.data_source) === "unavailable";
+}
+
+function isStaleMeta(meta = null) {
+  return normalizeDataSource(meta?.data_source) === "stale";
+}
+
+function formatMetricValue(value, meta = null) {
+  if (isUnavailableMeta(meta)) {
+    return "暂不可用";
+  }
+  const numeric = normalizeOptionalNumber(value);
+  if (numeric === null) {
+    return "-";
+  }
+  return String(numeric);
+}
+
+function listEmptyText(baseText, meta = null) {
+  if (isUnavailableMeta(meta)) {
+    return "数据暂不可用。";
+  }
+  if (isStaleMeta(meta)) {
+    return `${baseText}（旧快照）`;
+  }
+  return baseText;
+}
+
+function describeMetaStatus(label, meta = null) {
+  if (isUnavailableMeta(meta)) {
+    return `${label}暂不可用`;
+  }
+  if (isStaleMeta(meta)) {
+    return `${label}使用旧快照`;
+  }
+  if (meta?.degraded) {
+    return `${label}已降级`;
+  }
+  return "";
+}
+
+function updateSummaryOriginBadge() {
+  if (!elements.summaryOrigin) {
+    return;
+  }
+  const statusParts = [
+    describeMetaStatus("运行时", state.runtimeSnapshotMeta),
+    describeMetaStatus("排队", state.queueStatus),
+    describeMetaStatus("面板", state.dashboardMeta),
+  ].filter(Boolean);
+  const originText = statusParts.length
+    ? `API：${window.location.origin} · 构建：${APP_BUILD} · ${statusParts.join(" / ")}`
+    : `API：${window.location.origin} · 构建：${APP_BUILD}`;
+  elements.summaryOrigin.textContent = originText;
+  elements.summaryOrigin.title = originText;
+}
+
+function describeQueueStatusNotice(status = {}) {
+  const meta = extractPayloadMeta(status);
+  if (isUnavailableMeta(meta)) {
+    return "排队状态暂不可用，稍后会自动重试。";
+  }
+  if (isStaleMeta(meta)) {
+    const updatedAt = formatDateTime(status?.stale_at || status?.generated_at || status?.claimable_now_updated_at);
+    return updatedAt && updatedAt !== "-"
+      ? `排队状态当前使用旧快照（更新时间 ${updatedAt}）。`
+      : "排队状态当前使用旧快照。";
+  }
+  if (meta.degraded && meta.degraded_reason) {
+    return "排队状态已降级返回。";
+  }
+  return "";
+}
 
 function showScreen(name) {
   const loadingVisible = name === "loading";
@@ -559,6 +677,7 @@ function applyRuntimeSnapshot(payload) {
   if (!payload) {
     return;
   }
+  state.runtimeSnapshotMeta = extractPayloadMeta(payload);
   if (payload.user) {
     state.user = payload.user;
     renderUser();
@@ -584,9 +703,20 @@ function applyRuntimeSnapshot(payload) {
   if (payload.upload_results?.summary) {
     applyUploadResultsSummaryPayload(payload.upload_results);
   }
+  updateSummaryOriginBadge();
 }
 
 function applyDashboardSummary(summary) {
+  state.dashboardMeta = extractPayloadMeta(summary);
+  state.dashboardSectionMeta = {
+    stats: extractPayloadMeta(summary?.stats),
+    leaderboard: extractPayloadMeta(summary?.leaderboard),
+    recent: extractPayloadMeta(summary?.recent),
+    contributors: extractPayloadMeta(summary?.contributors),
+    recent_contributors: extractPayloadMeta(summary?.recent_contributors),
+    trends: extractPayloadMeta(summary?.trends),
+    system: extractPayloadMeta(summary?.system),
+  };
   state.stats = summary?.stats || null;
   state.leaderboard = summary?.leaderboard?.items || [];
   state.recentClaims = summary?.recent?.items || [];
@@ -604,6 +734,7 @@ function applyDashboardSummary(summary) {
   renderRecentContributors();
   renderSystemStatus();
   renderTrends();
+  updateSummaryOriginBadge();
 }
 
 function logClaimClientEvent(message, details = {}) {
@@ -672,6 +803,12 @@ function updateClaimRequestUI(activeRequest = null, queueRequest = null) {
   }
   if (state.claimStreamError) {
     elements.claimSummary.textContent = state.claimStreamError;
+    elements.claimSummary.classList.remove("hidden");
+    return;
+  }
+  const queueNotice = describeQueueStatusNotice(state.queueStatus || {});
+  if (queueNotice) {
+    elements.claimSummary.textContent = queueNotice;
     elements.claimSummary.classList.remove("hidden");
     return;
   }
@@ -755,17 +892,22 @@ function applyClaimRealtimePayload(payload, options = {}) {
 }
 
 function normalizeQueueStatusPayload(payload = {}) {
+  const meta = extractPayloadMeta(payload);
   return {
     queued: Boolean(payload?.queued),
-    queue_id: Number(payload?.queue_id) || 0,
-    position: Number(payload?.position) || 0,
-    total_queued: Number(payload?.total_queued) || 0,
-    requested: Number(payload?.requested) || 0,
-    remaining: Number(payload?.remaining ?? payload?.requested) || 0,
+    queue_id: normalizeOptionalNumber(payload?.queue_id),
+    position: normalizeOptionalNumber(payload?.position),
+    total_queued: normalizeOptionalNumber(payload?.total_queued),
+    requested: normalizeOptionalNumber(payload?.requested),
+    remaining: normalizeOptionalNumber(payload?.remaining ?? payload?.requested),
     request_id: typeof payload?.request_id === "string" ? payload.request_id : "",
-    available_tokens: Number(payload?.available_tokens) || 0,
-    claimable_now: Number(payload?.claimable_now) || 0,
-    degraded: Boolean(payload?.degraded),
+    available_tokens: normalizeOptionalNumber(payload?.available_tokens),
+    claimable_now: normalizeOptionalNumber(payload?.claimable_now),
+    claimable_now_state: normalizeDataSource(payload?.claimable_now_state),
+    claimable_now_updated_at: typeof payload?.claimable_now_updated_at === "string"
+      ? payload.claimable_now_updated_at
+      : "",
+    ...meta,
   };
 }
 
@@ -776,11 +918,11 @@ function buildQueueRequestFromStatus(status = {}) {
   return {
     status: "queued",
     queued: true,
-    queue_id: status.queue_id || 0,
-    queue_position: status.position || 0,
-    queue_total: status.total_queued || 0,
-    requested: status.requested || 0,
-    remaining: status.remaining || 0,
+    queue_id: status.queue_id ?? 0,
+    queue_position: status.position ?? 0,
+    queue_total: status.total_queued ?? 0,
+    requested: status.requested ?? 0,
+    remaining: status.remaining ?? 0,
     request_id: status.request_id || "",
   };
 }
@@ -789,6 +931,7 @@ function applyQueueStatusPayload(payload) {
   state.queueStatus = normalizeQueueStatusPayload(payload || {});
   renderQueueStatus();
   syncQueueRealtimeTransport();
+  updateSummaryOriginBadge();
   return state.queueStatus;
 }
 
@@ -842,11 +985,17 @@ function hasPendingClaimRealtimeRequests() {
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, {
-    cache: "no-store",
-    credentials: "same-origin",
-    ...options,
-  });
+	const headers = {
+		"X-App-Build": APP_BUILD,
+		"X-App-Entry": APP_ENTRY,
+		...(options.headers || {}),
+	};
+	const response = await fetch(url, {
+		cache: "no-store",
+		credentials: "same-origin",
+		...options,
+		headers,
+	});
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(payload.detail || `请求失败: ${response.status}`);
@@ -1226,10 +1375,10 @@ function renderUser() {
 }
 
 function renderQuota() {
-  if (!state.quota) {
-    elements.quotaUsed.textContent = "0";
-    elements.quotaRemaining.textContent = "0";
-    elements.quotaLimit.textContent = "0";
+  if (!state.quota || isUnavailableMeta(state.runtimeSnapshotMeta)) {
+    elements.quotaUsed.textContent = "暂不可用";
+    elements.quotaRemaining.textContent = "暂不可用";
+    elements.quotaLimit.textContent = "暂不可用";
     return;
   }
   elements.quotaUsed.textContent = state.quota.used;
@@ -1238,24 +1387,29 @@ function renderQuota() {
 }
 
 function renderStats() {
-  if (!state.stats) {
-    elements.inventoryAvailable.textContent = "0";
-    elements.inventoryTotal.textContent = "0";
-    elements.claimsOthersTotal.textContent = "0";
-    elements.claimsOthersUnique.textContent = "0";
-    elements.claimsTotal.textContent = "0";
-    elements.claimsUnique.textContent = "0";
+  const statsMeta = state.dashboardSectionMeta?.stats || null;
+  if (!state.stats || isUnavailableMeta(statsMeta)) {
+    elements.inventoryAvailable.textContent = "暂不可用";
+    elements.inventoryTotal.textContent = "暂不可用";
+    elements.claimsOthersTotal.textContent = "暂不可用";
+    elements.claimsOthersUnique.textContent = "暂不可用";
+    elements.claimsTotal.textContent = "暂不可用";
+    elements.claimsUnique.textContent = "暂不可用";
     return;
   }
-  elements.inventoryAvailable.textContent = state.stats.available_tokens;
-  elements.inventoryTotal.textContent = state.stats.total_tokens;
-  elements.claimsOthersTotal.textContent = state.stats.others_claimed_total;
-  elements.claimsOthersUnique.textContent = state.stats.others_claimed_unique;
-  elements.claimsTotal.textContent = state.stats.claimed_total;
-  elements.claimsUnique.textContent = state.stats.claimed_unique;
+  elements.inventoryAvailable.textContent = formatMetricValue(state.stats.available_tokens, statsMeta);
+  elements.inventoryTotal.textContent = formatMetricValue(state.stats.total_tokens, statsMeta);
+  elements.claimsOthersTotal.textContent = formatMetricValue(state.stats.others_claimed_total, statsMeta);
+  elements.claimsOthersUnique.textContent = formatMetricValue(state.stats.others_claimed_unique, statsMeta);
+  elements.claimsTotal.textContent = formatMetricValue(state.stats.claimed_total, statsMeta);
+  elements.claimsUnique.textContent = formatMetricValue(state.stats.claimed_unique, statsMeta);
 }
 
 function renderMyClaims() {
+  if (isUnavailableMeta(state.runtimeSnapshotMeta)) {
+    elements.myClaimsTotal.textContent = "暂不可用";
+    return;
+  }
   const total = Math.max(0, (state.claims?.total ?? 0) - (state.pendingHiddenClaimIds?.size ?? 0));
   elements.myClaimsTotal.textContent = total;
 }
@@ -1288,7 +1442,7 @@ function formatDateTime(value) {
   return date.toLocaleString();
 }
 
-function renderRankedList(list, items, emptyText) {
+function renderRankedList(list, items, emptyText, meta = null) {
   if (!list) {
     return;
   }
@@ -1296,7 +1450,7 @@ function renderRankedList(list, items, emptyText) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = emptyText;
+    empty.textContent = listEmptyText(emptyText, meta);
     list.appendChild(empty);
     return;
   }
@@ -1312,7 +1466,7 @@ function renderRankedList(list, items, emptyText) {
   });
 }
 
-function renderTimedList(list, items, emptyText, timeField) {
+function renderTimedList(list, items, emptyText, timeField, meta = null) {
   if (!list) {
     return;
   }
@@ -1320,7 +1474,7 @@ function renderTimedList(list, items, emptyText, timeField) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = emptyText;
+    empty.textContent = listEmptyText(emptyText, meta);
     list.appendChild(empty);
     return;
   }
@@ -1337,18 +1491,30 @@ function renderTimedList(list, items, emptyText, timeField) {
 }
 
 function renderLeaderboard() {
-  renderRankedList(elements.leaderboardList, state.leaderboard || [], "No leaderboard data.");
+  renderRankedList(
+    elements.leaderboardList,
+    state.leaderboard || [],
+    "暂无排行数据。",
+    state.dashboardSectionMeta?.leaderboard
+  );
 }
 
 function renderRecentClaims() {
-  renderTimedList(elements.recentClaimsList, state.recentClaims || [], "No recent claims.", "claimed_at");
+  renderTimedList(
+    elements.recentClaimsList,
+    state.recentClaims || [],
+    "暂无最近领取记录。",
+    "claimed_at",
+    state.dashboardSectionMeta?.recent
+  );
 }
 
 function renderContributorLeaderboard() {
   renderRankedList(
     elements.contributorLeaderboardList,
     state.contributorLeaderboard || [],
-    "No contributor data."
+    "暂无贡献者数据。",
+    state.dashboardSectionMeta?.contributors
   );
 }
 
@@ -1356,24 +1522,42 @@ function renderRecentContributors() {
   renderTimedList(
     elements.recentContributorsList,
     state.recentContributors || [],
-    "No recent contributors.",
-    "uploaded_at"
+    "暂无最近贡献者数据。",
+    "uploaded_at",
+    state.dashboardSectionMeta?.recent_contributors
   );
 }
 
 function renderSystemStatus() {
+  const systemMeta = state.dashboardSectionMeta?.system || null;
   const status = state.systemStatus;
-  if (!status) {
+  if (!status || isUnavailableMeta(systemMeta)) {
     if (elements.inventoryStatus) {
-      elements.inventoryStatus.textContent = "-";
+      elements.inventoryStatus.textContent = "暂不可用";
       elements.inventoryStatus.className = "status-pill";
+    }
+    if (elements.inventoryHealthValue) {
+      elements.inventoryHealthValue.textContent = "暂不可用";
+    }
+    if (elements.inventoryHealthUnclaimed) {
+      elements.inventoryHealthUnclaimed.textContent = "暂不可用";
+    }
+    if (elements.inventoryHealthHourly) {
+      elements.inventoryHealthHourly.textContent = "暂不可用";
+    }
+    if (elements.systemStatusValue) {
+      elements.systemStatusValue.textContent = "暂不可用";
+    }
+    if (elements.systemStatusQueue) {
+      elements.systemStatusQueue.textContent = "暂不可用";
+    }
+    if (elements.systemStatusIndex) {
+      elements.systemStatusIndex.textContent = "暂不可用";
     }
     return;
   }
   const inventory = status.inventory || {};
   const health = status.health || {};
-  const total = inventory.total ?? 0;
-  const available = inventory.available ?? 0;
   const unclaimed = inventory.unclaimed ?? 0;
   const statusMap = { healthy: "健康", warning: "警告", critical: "严重" };
   const statusKey = health.status || "healthy";
@@ -1387,26 +1571,33 @@ function renderSystemStatus() {
     elements.inventoryHealthHourly.textContent = health.hourly_limit ?? 0;
   }
   if (elements.systemStatusValue) {
-    elements.systemStatusValue.textContent = "在线";
+    elements.systemStatusValue.textContent = isStaleMeta(systemMeta) ? "旧快照" : "在线";
   }
   if (elements.systemStatusQueue) {
-    elements.systemStatusQueue.textContent = status.queue?.total ?? 0;
+    elements.systemStatusQueue.textContent = formatMetricValue(status.queue?.total, systemMeta);
   }
   if (elements.systemStatusIndex) {
     elements.systemStatusIndex.textContent = formatDateTime(status.index?.updated_at);
   }
 }
 
-function renderTrendChart(series) {
+function renderTrendChart(series, meta = null) {
   const container = elements.trendChart;
   if (!container) {
     return;
   }
   container.innerHTML = "";
+  if (isUnavailableMeta(meta)) {
+    const empty = document.createElement("div");
+    empty.className = "trend-empty";
+    empty.textContent = "趋势数据暂不可用。";
+    container.appendChild(empty);
+    return;
+  }
   if (!series || !series.length) {
     const empty = document.createElement("div");
     empty.className = "trend-empty";
-    empty.textContent = "No trend data.";
+    empty.textContent = "暂无趋势数据。";
     container.appendChild(empty);
     return;
   }
@@ -1475,13 +1666,18 @@ function renderTrendChart(series) {
 }
 
 function renderTrends() {
+  const trendsMeta = state.dashboardSectionMeta?.trends || null;
   const series = state.trends || [];
-  renderTrendChart(series);
+  renderTrendChart(series, trendsMeta);
   if (!elements.trendSummary) {
     return;
   }
+  if (isUnavailableMeta(trendsMeta)) {
+    elements.trendSummary.textContent = "趋势数据暂不可用。";
+    return;
+  }
   if (!series.length) {
-    elements.trendSummary.textContent = "No trend data.";
+    elements.trendSummary.textContent = "暂无趋势数据。";
     return;
   }
   const total = series.reduce((sum, item) => sum + (item.count || 0), 0);
@@ -2942,9 +3138,7 @@ async function init() {
   renderUploadSelected();
   renderUploadResults();
   setUploadSubmitting(false);
-  const originText = `API：${window.location.origin}`;
-  elements.summaryOrigin.textContent = originText;
-  elements.summaryOrigin.title = originText;
+  updateSummaryOriginBadge();
   const url = new URL(window.location.href);
   state.authErrorParam = url.searchParams.get("auth_error") || "";
   await bootstrapAppShell();

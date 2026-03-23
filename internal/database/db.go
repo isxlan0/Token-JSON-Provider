@@ -132,6 +132,20 @@ var schemaStatements = []string{
 		total_queued INTEGER NOT NULL,
 		updated_at_ts INTEGER NOT NULL
 	)`,
+	`CREATE TABLE IF NOT EXISTS claim_stats_runtime (
+		id INTEGER PRIMARY KEY CHECK(id = 1),
+		claimed_total INTEGER NOT NULL DEFAULT 0,
+		claimed_unique INTEGER NOT NULL DEFAULT 0,
+		updated_at_ts INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS user_claim_stats_runtime (
+		user_id INTEGER PRIMARY KEY,
+		claimed_total INTEGER NOT NULL DEFAULT 0,
+		claimed_unique INTEGER NOT NULL DEFAULT 0,
+		exclusive_claimed_unique INTEGER NOT NULL DEFAULT 0,
+		updated_at_ts INTEGER NOT NULL,
+		FOREIGN KEY(user_id) REFERENCES users(id)
+	)`,
 	`CREATE TABLE IF NOT EXISTS user_bans (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		linuxdo_user_id TEXT NOT NULL,
@@ -164,6 +178,8 @@ var indexStatements = []string{
 		ON token_claims(claimed_at_ts DESC, request_id, user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_user_token_claims_user
 		ON user_token_claims(user_id, token_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_user_token_claims_token
+		ON user_token_claims(token_id, user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
 		ON claim_queue(status, enqueued_at_ts, id)`,
 	`CREATE INDEX IF NOT EXISTS idx_claim_queue_user_status_remaining_time
@@ -182,6 +198,9 @@ var indexStatements = []string{
 		ON token_claims(token_id, user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_tokens_claimable_candidates
 		ON tokens(is_active, is_enabled, is_banned, is_available, probe_lock_until_ts, claim_count, max_claims, id)`,
+	`CREATE INDEX IF NOT EXISTS idx_tokens_provider_identity_uploaded
+		ON tokens(provider_user_id, provider_username, provider_name, uploaded_at_ts DESC)
+		WHERE provider_user_id IS NOT NULL AND provider_user_id != ''`,
 	`CREATE INDEX IF NOT EXISTS idx_api_keys_user_status
 		ON api_keys(user_id, status)`,
 	`CREATE INDEX IF NOT EXISTS idx_user_bans_target_time
@@ -276,6 +295,12 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := ensureInventoryRuntimeColumns(ctx, tx); err != nil {
 		return err
 	}
+	if err := ensureClaimStatsRuntimeColumns(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureUserClaimStatsRuntimeColumns(ctx, tx); err != nil {
+		return err
+	}
 	if err := refreshQueueRuntime(ctx, tx); err != nil {
 		return err
 	}
@@ -292,6 +317,9 @@ func (s *Store) Init(ctx context.Context) error {
 		return err
 	}
 	if err := hideDuplicateClaims(ctx, tx); err != nil {
+		return err
+	}
+	if err := refreshClaimStatsRuntime(ctx, tx); err != nil {
 		return err
 	}
 
@@ -530,6 +558,61 @@ func ensureInventoryRuntimeColumns(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func ensureClaimStatsRuntimeColumns(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "claim_stats_runtime")
+	if err != nil {
+		return err
+	}
+
+	definitions := []struct {
+		name       string
+		definition string
+	}{
+		{name: "claimed_total", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "claimed_unique", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+
+	for _, definition := range definitions {
+		if _, ok := columns[definition.name]; ok {
+			continue
+		}
+		statement := fmt.Sprintf(`ALTER TABLE claim_stats_runtime ADD COLUMN %s %s`, definition.name, definition.definition)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("add claim_stats_runtime.%s: %w", definition.name, err)
+		}
+	}
+
+	return nil
+}
+
+func ensureUserClaimStatsRuntimeColumns(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "user_claim_stats_runtime")
+	if err != nil {
+		return err
+	}
+
+	definitions := []struct {
+		name       string
+		definition string
+	}{
+		{name: "claimed_total", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "claimed_unique", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "exclusive_claimed_unique", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+
+	for _, definition := range definitions {
+		if _, ok := columns[definition.name]; ok {
+			continue
+		}
+		statement := fmt.Sprintf(`ALTER TABLE user_claim_stats_runtime ADD COLUMN %s %s`, definition.name, definition.definition)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("add user_claim_stats_runtime.%s: %w", definition.name, err)
+		}
+	}
+
+	return nil
+}
+
 func refreshQueueRuntime(ctx context.Context, tx *sql.Tx) error {
 	var totalQueued int64
 	if err := tx.QueryRowContext(ctx, `
@@ -692,6 +775,85 @@ func hideDuplicateClaims(ctx context.Context, tx *sql.Tx) error {
 		)
 	`); err != nil {
 		return fmt.Errorf("hide duplicate claims: %w", err)
+	}
+
+	return nil
+}
+
+func refreshClaimStatsRuntime(ctx context.Context, tx *sql.Tx) error {
+	var claimedTotal int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM token_claims`).Scan(&claimedTotal); err != nil {
+		return fmt.Errorf("count total claim stats runtime: %w", err)
+	}
+
+	var claimedUnique int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT token_id) FROM user_token_claims`).Scan(&claimedUnique); err != nil {
+		return fmt.Errorf("count unique claim stats runtime: %w", err)
+	}
+
+	now := nowUnix()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO claim_stats_runtime (id, claimed_total, claimed_unique, updated_at_ts)
+		VALUES (1, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			claimed_total = excluded.claimed_total,
+			claimed_unique = excluded.claimed_unique,
+			updated_at_ts = excluded.updated_at_ts
+	`, claimedTotal, claimedUnique, now); err != nil {
+		return fmt.Errorf("upsert claim_stats_runtime: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_claim_stats_runtime`); err != nil {
+		return fmt.Errorf("clear user_claim_stats_runtime: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO user_claim_stats_runtime (
+			user_id,
+			claimed_total,
+			claimed_unique,
+			exclusive_claimed_unique,
+			updated_at_ts
+		)
+		WITH claim_totals AS (
+			SELECT user_id, COUNT(*) AS claimed_total
+			FROM token_claims
+			GROUP BY user_id
+		),
+		unique_totals AS (
+			SELECT user_id, COUNT(*) AS claimed_unique
+			FROM user_token_claims
+			GROUP BY user_id
+		),
+		exclusive_totals AS (
+			SELECT utc.user_id, COUNT(*) AS exclusive_claimed_unique
+			FROM user_token_claims AS utc
+			JOIN (
+				SELECT token_id
+				FROM user_token_claims
+				GROUP BY token_id
+				HAVING COUNT(*) = 1
+			) AS exclusive_tokens
+			  ON exclusive_tokens.token_id = utc.token_id
+			GROUP BY utc.user_id
+		)
+		SELECT users.id,
+		       COALESCE(claim_totals.claimed_total, 0),
+		       COALESCE(unique_totals.claimed_unique, 0),
+		       COALESCE(exclusive_totals.exclusive_claimed_unique, 0),
+		       ?
+		FROM users
+		LEFT JOIN claim_totals
+		  ON claim_totals.user_id = users.id
+		LEFT JOIN unique_totals
+		  ON unique_totals.user_id = users.id
+		LEFT JOIN exclusive_totals
+		  ON exclusive_totals.user_id = users.id
+		WHERE COALESCE(claim_totals.claimed_total, 0) > 0
+		   OR COALESCE(unique_totals.claimed_unique, 0) > 0
+		   OR COALESCE(exclusive_totals.exclusive_claimed_unique, 0) > 0
+	`, now); err != nil {
+		return fmt.Errorf("rebuild user_claim_stats_runtime: %w", err)
 	}
 
 	return nil

@@ -25,6 +25,7 @@ func TestCacheJSONSingleflightSharesConcurrentMiss(t *testing.T) {
 
 	type result struct {
 		value map[string]int
+		state CacheState
 		err   error
 	}
 
@@ -34,8 +35,8 @@ func TestCacheJSONSingleflightSharesConcurrentMiss(t *testing.T) {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			value, err := CacheJSON(cache, "shared-key", 60, loader)
-			results[index] = result{value: value, err: err}
+			value, state, err := CacheJSONWithState(cache, "shared-key", 60, loader)
+			results[index] = result{value: value, state: state, err: err}
 		}(idx)
 	}
 
@@ -59,5 +60,31 @@ func TestCacheJSONSingleflightSharesConcurrentMiss(t *testing.T) {
 		if item.value["value"] != 7 {
 			t.Fatalf("result %d returned unexpected payload: %#v", idx, item.value)
 		}
+		if item.state != CacheStateMiss && item.state != CacheStateFlightShared {
+			t.Fatalf("result %d returned unexpected cache state: %q", idx, item.state)
+		}
+	}
+}
+
+func TestCacheJSONWithStateMemoryHit(t *testing.T) {
+	cache := &AppCache{
+		backendName: "memory",
+		backend:     newMemoryBackend(),
+		flights:     make(map[string]*cacheFlight),
+	}
+	cache.SetJSON("memory-hit", map[string]int{"value": 11}, 60)
+
+	value, state, err := CacheJSONWithState(cache, "memory-hit", 60, func() (map[string]int, error) {
+		t.Fatal("loader should not run on memory hit")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("memory hit returned error: %v", err)
+	}
+	if state != CacheStateMemoryHit {
+		t.Fatalf("expected memory hit state, got %q", state)
+	}
+	if value["value"] != 11 {
+		t.Fatalf("unexpected memory hit payload: %#v", value)
 	}
 }

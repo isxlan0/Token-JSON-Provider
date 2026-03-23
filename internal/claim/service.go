@@ -110,6 +110,20 @@ type inventoryRuntimeState struct {
 	UpdatedAtTS int64
 }
 
+type claimStatsRuntimeState struct {
+	ClaimedTotal  int
+	ClaimedUnique int
+	UpdatedAtTS   int64
+}
+
+type userClaimStatsRuntimeState struct {
+	UserID                 int64
+	ClaimedTotal           int
+	ClaimedUnique          int
+	ExclusiveClaimedUnique int
+	UpdatedAtTS            int64
+}
+
 type quotaUsage struct {
 	Used      int `json:"used"`
 	Limit     int `json:"limit"`
@@ -158,18 +172,40 @@ type claimHistoryItem struct {
 }
 
 type queueStatusPayload struct {
-	Queued          bool   `json:"queued"`
-	QueueID         int64  `json:"queue_id,omitempty"`
-	Position        int    `json:"position,omitempty"`
-	Ahead           int    `json:"ahead,omitempty"`
-	Requested       int    `json:"requested,omitempty"`
-	Remaining       int    `json:"remaining,omitempty"`
-	EnqueuedAt      string `json:"enqueued_at,omitempty"`
-	RequestID       string `json:"request_id,omitempty"`
-	TotalQueued     int    `json:"total_queued"`
-	AvailableTokens int    `json:"available_tokens"`
-	ClaimableNow    int    `json:"claimable_now"`
-	Degraded        bool   `json:"degraded,omitempty"`
+	Queued                bool   `json:"queued"`
+	QueueID               int64  `json:"queue_id,omitempty"`
+	Position              int    `json:"position,omitempty"`
+	Ahead                 int    `json:"ahead,omitempty"`
+	Requested             int    `json:"requested,omitempty"`
+	Remaining             int    `json:"remaining,omitempty"`
+	EnqueuedAt            string `json:"enqueued_at,omitempty"`
+	RequestID             string `json:"request_id,omitempty"`
+	TotalQueued           int    `json:"total_queued"`
+	AvailableTokens       int    `json:"available_tokens"`
+	ClaimableNow          *int   `json:"claimable_now"`
+	ClaimableNowState     string `json:"claimable_now_state,omitempty"`
+	ClaimableNowUpdatedAt string `json:"claimable_now_updated_at,omitempty"`
+	DataSource            string `json:"data_source,omitempty"`
+	GeneratedAt           string `json:"generated_at,omitempty"`
+	StaleAt               string `json:"stale_at,omitempty"`
+	Degraded              bool   `json:"degraded,omitempty"`
+	DegradedReason        string `json:"degraded_reason,omitempty"`
+}
+
+type claimableNowPayload struct {
+	ClaimableNow          *int   `json:"claimable_now"`
+	ClaimableNowState     string `json:"claimable_now_state,omitempty"`
+	ClaimableNowUpdatedAt string `json:"claimable_now_updated_at,omitempty"`
+	DataSource            string `json:"data_source,omitempty"`
+	GeneratedAt           string `json:"generated_at,omitempty"`
+	StaleAt               string `json:"stale_at,omitempty"`
+	Degraded              bool   `json:"degraded,omitempty"`
+	DegradedReason        string `json:"degraded_reason,omitempty"`
+}
+
+type storedClaimableNowSnapshot struct {
+	ClaimableNow int    `json:"claimable_now"`
+	GeneratedAt  string `json:"generated_at,omitempty"`
 }
 
 type userQueueEntry struct {
@@ -223,13 +259,17 @@ type profilePayload struct {
 }
 
 type runtimeSnapshotPayload struct {
-	User          *profileUserPayload             `json:"user,omitempty"`
-	Quota         quotaUsage                      `json:"quota"`
-	Claims        map[string]int                  `json:"claims"`
-	APIKeys       map[string]apiKeySummaryPayload `json:"api_keys"`
-	Uploads       map[string]int                  `json:"uploads,omitempty"`
-	UploadResults map[string]any                  `json:"upload_results"`
-	Degraded      bool                            `json:"degraded,omitempty"`
+	User           *profileUserPayload             `json:"user,omitempty"`
+	Quota          quotaUsage                      `json:"quota"`
+	Claims         map[string]int                  `json:"claims"`
+	APIKeys        map[string]apiKeySummaryPayload `json:"api_keys"`
+	Uploads        map[string]int                  `json:"uploads,omitempty"`
+	UploadResults  map[string]any                  `json:"upload_results"`
+	DataSource     string                          `json:"data_source,omitempty"`
+	GeneratedAt    string                          `json:"generated_at,omitempty"`
+	StaleAt        string                          `json:"stale_at,omitempty"`
+	Degraded       bool                            `json:"degraded,omitempty"`
+	DegradedReason string                          `json:"degraded_reason,omitempty"`
 }
 
 func NewService(cfg config.Config, store *database.Store, authService *auth.Service, cache *runtimecache.AppCache, logger *slog.Logger) *Service {
@@ -607,19 +647,20 @@ func (s *Service) GetQuotaUsage(ctx context.Context, userID int64) (quotaUsage, 
 
 func (s *Service) GetUserClaimTotals(ctx context.Context, userID int64) (map[string]int, error) {
 	return runtimecache.CacheJSON(s.cache, s.userClaimSummaryCacheKey(userID), s.cfg.Cache.MeTTL, func() (map[string]int, error) {
-		total, err := queryCount(ctx, s.store.DB(), `SELECT COUNT(*) FROM token_claims WHERE user_id = ?`, userID)
+		stats, exists, err := s.getUserClaimStatsRuntimeState(ctx, s.store.DB(), userID)
 		if err != nil {
 			return nil, err
 		}
-
-		unique, err := queryCount(ctx, s.store.DB(), `SELECT COUNT(DISTINCT token_id) FROM token_claims WHERE user_id = ?`, userID)
-		if err != nil {
-			return nil, err
+		if !exists {
+			return map[string]int{
+				"total":  0,
+				"unique": 0,
+			}, nil
 		}
 
 		return map[string]int{
-			"total":  total,
-			"unique": unique,
+			"total":  stats.ClaimedTotal,
+			"unique": stats.ClaimedUnique,
 		}, nil
 	})
 }
@@ -640,38 +681,40 @@ func (s *Service) GetAPIKeySummary(ctx context.Context, userID int64) (apiKeySum
 
 func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestContext) (profilePayload, error) {
 	startedAt := time.Now()
-	observedCtx, _ := withSQLMetrics(ctx)
 	var (
 		quotaDuration   time.Duration
 		claimsDuration  time.Duration
 		apiKeysDuration time.Duration
-		loaderExecuted  bool
+		quotaSQLCount   int64
+		claimsSQLCount  int64
+		apiKeysSQLCount int64
 	)
 
-	payload, err := runtimecache.CacheJSON(
+	payload, cacheState, err := runtimecache.CacheJSONWithState(
 		s.cache,
 		s.userProfileCacheKey(requestContext.UserID, requestContext.IsAdmin),
 		s.cfg.Cache.MeTTL,
 		func() (profilePayload, error) {
-			loaderExecuted = true
-
-			stageStartedAt := time.Now()
-			quota, err := s.GetQuotaUsage(observedCtx, requestContext.UserID)
-			quotaDuration = time.Since(stageStartedAt)
+			quotaStage := startObservedReadStage(ctx)
+			quota, err := s.GetQuotaUsage(quotaStage.Context(), requestContext.UserID)
+			quotaDuration = quotaStage.Duration()
+			quotaSQLCount = quotaStage.SQLCount()
 			if err != nil {
 				return profilePayload{}, err
 			}
 
-			stageStartedAt = time.Now()
-			claims, err := s.GetUserClaimTotals(observedCtx, requestContext.UserID)
-			claimsDuration = time.Since(stageStartedAt)
+			claimsStage := startObservedReadStage(ctx)
+			claims, err := s.GetUserClaimTotals(claimsStage.Context(), requestContext.UserID)
+			claimsDuration = claimsStage.Duration()
+			claimsSQLCount = claimsStage.SQLCount()
 			if err != nil {
 				return profilePayload{}, err
 			}
 
-			stageStartedAt = time.Now()
-			apiKeys, err := s.GetAPIKeySummary(observedCtx, requestContext.UserID)
-			apiKeysDuration = time.Since(stageStartedAt)
+			apiKeysStage := startObservedReadStage(ctx)
+			apiKeys, err := s.GetAPIKeySummary(apiKeysStage.Context(), requestContext.UserID)
+			apiKeysDuration = apiKeysStage.Duration()
+			apiKeysSQLCount = apiKeysStage.SQLCount()
 			if err != nil {
 				return profilePayload{}, err
 			}
@@ -701,12 +744,15 @@ func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestCo
 	s.logger.Info(
 		"get profile",
 		"user_id", requestContext.UserID,
-		"cache_hit", !loaderExecuted,
+		"cache_state", cacheStateLabel(cacheState),
 		"total_ms", durationMillis(time.Since(startedAt)),
 		"quota_ms", durationMillis(quotaDuration),
 		"claims_ms", durationMillis(claimsDuration),
 		"api_keys_ms", durationMillis(apiKeysDuration),
-		"sql_count", sqlCount(observedCtx),
+		"quota_sql_count", quotaSQLCount,
+		"claims_sql_count", claimsSQLCount,
+		"api_keys_sql_count", apiKeysSQLCount,
+		"cumulative_sql_count", sumSQLCounts(quotaSQLCount, claimsSQLCount, apiKeysSQLCount),
 		"error", err,
 	)
 	return payload, err
@@ -714,50 +760,58 @@ func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestCo
 
 func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtimeSnapshotPayload, error) {
 	startedAt := time.Now()
-	observedCtx, _ := withSQLMetrics(ctx)
+	liveGeneratedAt := ""
 	var (
 		quotaDuration         time.Duration
 		claimsDuration        time.Duration
 		apiKeysDuration       time.Duration
 		uploadResultsDuration time.Duration
-		loaderExecuted        bool
+		quotaSQLCount         int64
+		claimsSQLCount        int64
+		apiKeysSQLCount       int64
+		uploadResultsSQLCount int64
 	)
 
-	payload, err := runtimecache.CacheJSON(
+	payload, cacheState, err := runtimecache.CacheJSONWithState(
 		s.cache,
 		s.userRuntimeSnapshotCacheKey(userID),
 		s.cfg.Cache.MeTTL,
 		func() (runtimeSnapshotPayload, error) {
-			loaderExecuted = true
-
-			stageStartedAt := time.Now()
-			quota, err := s.GetQuotaUsage(observedCtx, userID)
-			quotaDuration = time.Since(stageStartedAt)
+			quotaStage := startObservedReadStage(ctx)
+			quota, err := s.GetQuotaUsage(quotaStage.Context(), userID)
+			quotaDuration = quotaStage.Duration()
+			quotaSQLCount = quotaStage.SQLCount()
 			if err != nil {
 				return runtimeSnapshotPayload{}, err
 			}
 
-			stageStartedAt = time.Now()
-			claims, err := s.GetUserClaimTotals(observedCtx, userID)
-			claimsDuration = time.Since(stageStartedAt)
+			claimsStage := startObservedReadStage(ctx)
+			claims, err := s.GetUserClaimTotals(claimsStage.Context(), userID)
+			claimsDuration = claimsStage.Duration()
+			claimsSQLCount = claimsStage.SQLCount()
 			if err != nil {
 				return runtimeSnapshotPayload{}, err
 			}
 
-			stageStartedAt = time.Now()
-			apiKeys, err := s.GetAPIKeySummary(observedCtx, userID)
-			apiKeysDuration = time.Since(stageStartedAt)
+			apiKeysStage := startObservedReadStage(ctx)
+			apiKeys, err := s.GetAPIKeySummary(apiKeysStage.Context(), userID)
+			apiKeysDuration = apiKeysStage.Duration()
+			apiKeysSQLCount = apiKeysStage.SQLCount()
 			if err != nil {
 				return runtimeSnapshotPayload{}, err
 			}
 
-			stageStartedAt = time.Now()
+			uploadResultsStage := startObservedReadStage(ctx)
 			uploadResults := buildUploadResultsSummaryPayload(s.GetUploadResults(userID))
-			uploadResultsDuration = time.Since(stageStartedAt)
+			uploadResultsDuration = uploadResultsStage.Duration()
+			uploadResultsSQLCount = uploadResultsStage.SQLCount()
 
+			liveGeneratedAt = isoformatNow()
 			return runtimeSnapshotPayload{
-				Quota:  quota,
-				Claims: claims,
+				Quota:       quota,
+				Claims:      claims,
+				DataSource:  dataSourceLive,
+				GeneratedAt: liveGeneratedAt,
 				APIKeys: map[string]apiKeySummaryPayload{
 					"summary": apiKeys,
 				},
@@ -771,120 +825,154 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 			}, nil
 		},
 	)
+	if err == nil {
+		switch cacheState {
+		case runtimecache.CacheStateMiss:
+			if strings.TrimSpace(payload.GeneratedAt) == "" {
+				payload.GeneratedAt = liveGeneratedAt
+			}
+			payload.DataSource = dataSourceLive
+			payload.StaleAt = ""
+		case runtimecache.CacheStateMemoryHit, runtimecache.CacheStateFlightShared:
+			payload.DataSource = dataSourceCache
+			payload.StaleAt = ""
+		}
+	}
 
 	s.logger.Info(
 		"get runtime snapshot",
 		"user_id", userID,
-		"cache_hit", !loaderExecuted,
+		"cache_state", cacheStateLabel(cacheState),
 		"total_ms", durationMillis(time.Since(startedAt)),
 		"quota_ms", durationMillis(quotaDuration),
 		"claims_ms", durationMillis(claimsDuration),
 		"api_keys_ms", durationMillis(apiKeysDuration),
 		"upload_results_ms", durationMillis(uploadResultsDuration),
-		"sql_count", sqlCount(observedCtx),
+		"quota_sql_count", quotaSQLCount,
+		"claims_sql_count", claimsSQLCount,
+		"api_keys_sql_count", apiKeysSQLCount,
+		"upload_results_sql_count", uploadResultsSQLCount,
+		"cumulative_sql_count", sumSQLCounts(quotaSQLCount, claimsSQLCount, apiKeysSQLCount, uploadResultsSQLCount),
 		"error", err,
 	)
 	return payload, err
 }
 
+type queueStatusReadMetrics struct {
+	EntryDuration      time.Duration
+	QueueTotalDuration time.Duration
+	InventoryDuration  time.Duration
+	EntrySQLCount      int64
+	QueueTotalSQLCount int64
+	InventorySQLCount  int64
+}
+
 func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatusPayload, error) {
 	startedAt := time.Now()
-	observedCtx, _ := withSQLMetrics(ctx)
 	if payload, ok := s.getCachedQueueStatus(userID); ok {
+		payload = withQueueStatusMetadata(payload, dataSourceCache, payload.GeneratedAt, "", "", false)
+		payload = s.attachCachedClaimableNow(userID, payload)
 		s.logger.Info(
 			"get queue status",
 			"user_id", userID,
-			"cache_hit", true,
+			"cache_state", string(runtimecache.CacheStateMemoryHit),
+			"data_source", payload.DataSource,
+			"claimable_now_state", payload.ClaimableNowState,
 			"total_ms", durationMillis(time.Since(startedAt)),
 			"entry_ms", int64(0),
 			"queue_total_ms", int64(0),
 			"inventory_ms", int64(0),
 			"claimable_ms", int64(0),
-			"sql_count", sqlCount(observedCtx),
+			"entry_sql_count", int64(0),
+			"queue_total_sql_count", int64(0),
+			"inventory_sql_count", int64(0),
+			"claimable_sql_count", int64(0),
+			"cumulative_sql_count", int64(0),
 		)
 		return payload, nil
 	}
 
-	var (
-		entryDuration      time.Duration
-		queueTotalDuration time.Duration
-		inventoryDuration  time.Duration
-		claimableDuration  time.Duration
-	)
-
-	payload, err := s.loadQueueStatusSnapshotWithTimings(
-		observedCtx,
-		userID,
-		&entryDuration,
-		&queueTotalDuration,
-		&inventoryDuration,
-		&claimableDuration,
-	)
+	var metrics queueStatusReadMetrics
+	payload, err := s.loadQueueStatusSnapshotWithMetrics(ctx, userID, &metrics)
 	if err != nil {
 		s.logger.Info(
 			"get queue status",
 			"user_id", userID,
-			"cache_hit", false,
+			"cache_state", string(runtimecache.CacheStateMiss),
+			"data_source", dataSourceUnavailable,
+			"claimable_now_state", dataSourceUnavailable,
 			"total_ms", durationMillis(time.Since(startedAt)),
-			"entry_ms", durationMillis(entryDuration),
-			"queue_total_ms", durationMillis(queueTotalDuration),
-			"inventory_ms", durationMillis(inventoryDuration),
-			"claimable_ms", durationMillis(claimableDuration),
-			"sql_count", sqlCount(observedCtx),
+			"entry_ms", durationMillis(metrics.EntryDuration),
+			"queue_total_ms", durationMillis(metrics.QueueTotalDuration),
+			"inventory_ms", durationMillis(metrics.InventoryDuration),
+			"claimable_ms", int64(0),
+			"entry_sql_count", metrics.EntrySQLCount,
+			"queue_total_sql_count", metrics.QueueTotalSQLCount,
+			"inventory_sql_count", metrics.InventorySQLCount,
+			"claimable_sql_count", int64(0),
+			"cumulative_sql_count", sumSQLCounts(metrics.EntrySQLCount, metrics.QueueTotalSQLCount, metrics.InventorySQLCount),
 			"error", err,
 		)
 		return queueStatusPayload{}, err
 	}
 
 	payload = s.setQueueStatusSnapshot(userID, payload)
+	payload = withQueueStatusMetadata(payload, dataSourceLive, payload.GeneratedAt, "", "", false)
+	payload = s.attachCachedClaimableNow(userID, payload)
 	s.logger.Info(
 		"get queue status",
 		"user_id", userID,
-		"cache_hit", false,
+		"cache_state", string(runtimecache.CacheStateMiss),
+		"data_source", payload.DataSource,
+		"claimable_now_state", payload.ClaimableNowState,
 		"total_ms", durationMillis(time.Since(startedAt)),
-		"entry_ms", durationMillis(entryDuration),
-		"queue_total_ms", durationMillis(queueTotalDuration),
-		"inventory_ms", durationMillis(inventoryDuration),
-		"claimable_ms", durationMillis(claimableDuration),
-		"sql_count", sqlCount(observedCtx),
+		"entry_ms", durationMillis(metrics.EntryDuration),
+		"queue_total_ms", durationMillis(metrics.QueueTotalDuration),
+		"inventory_ms", durationMillis(metrics.InventoryDuration),
+		"claimable_ms", int64(0),
+		"entry_sql_count", metrics.EntrySQLCount,
+		"queue_total_sql_count", metrics.QueueTotalSQLCount,
+		"inventory_sql_count", metrics.InventorySQLCount,
+		"claimable_sql_count", int64(0),
+		"cumulative_sql_count", sumSQLCounts(metrics.EntrySQLCount, metrics.QueueTotalSQLCount, metrics.InventorySQLCount),
 	)
 	return payload, nil
 }
 
 func (s *Service) loadQueueStatusSnapshot(ctx context.Context, userID int64) (queueStatusPayload, error) {
-	return s.loadQueueStatusSnapshotWithTimings(ctx, userID, nil, nil, nil, nil)
+	return s.loadQueueStatusSnapshotWithMetrics(ctx, userID, nil)
 }
 
-func (s *Service) loadQueueStatusSnapshotWithTimings(
+func (s *Service) loadQueueStatusSnapshotWithMetrics(
 	ctx context.Context,
 	userID int64,
-	entryDuration *time.Duration,
-	queueTotalDuration *time.Duration,
-	inventoryDuration *time.Duration,
-	claimableDuration *time.Duration,
+	metrics *queueStatusReadMetrics,
 ) (queueStatusPayload, error) {
-	stageStartedAt := time.Now()
-	entry, err := s.getUserQueueEntry(ctx, userID)
-	if entryDuration != nil {
-		*entryDuration = time.Since(stageStartedAt)
+	entryStage := startObservedReadStage(ctx)
+	entry, err := s.getUserQueueEntry(entryStage.Context(), userID)
+	if metrics != nil {
+		metrics.EntryDuration = entryStage.Duration()
+		metrics.EntrySQLCount = entryStage.SQLCount()
 	}
 	if err != nil {
 		return queueStatusPayload{}, err
 	}
 
-	stageStartedAt = time.Now()
-	totalQueued, err := s.getTotalQueued(ctx, s.store.DB())
-	if queueTotalDuration != nil {
-		*queueTotalDuration = time.Since(stageStartedAt)
+	queueTotalStage := startObservedReadStage(ctx)
+	totalQueued, err := s.getTotalQueued(queueTotalStage.Context(), s.store.DB())
+	if metrics != nil {
+		metrics.QueueTotalDuration = queueTotalStage.Duration()
+		metrics.QueueTotalSQLCount = queueTotalStage.SQLCount()
 	}
 	if err != nil {
 		return queueStatusPayload{}, err
 	}
 
-	stageStartedAt = time.Now()
-	runtimeState, runtimeExists, err := s.getInventoryRuntimeState(ctx, s.store.DB())
-	if inventoryDuration != nil {
-		*inventoryDuration = time.Since(stageStartedAt)
+	inventoryStage := startObservedReadStage(ctx)
+	runtimeState, runtimeExists, err := s.getInventoryRuntimeState(inventoryStage.Context(), s.store.DB())
+	if metrics != nil {
+		metrics.InventoryDuration = inventoryStage.Duration()
+		metrics.InventorySQLCount = inventoryStage.SQLCount()
 	}
 	if err != nil {
 		return queueStatusPayload{}, err
@@ -894,10 +982,11 @@ func (s *Service) loadQueueStatusSnapshotWithTimings(
 	if runtimeExists {
 		availableTokens = runtimeState.Available
 	} else {
-		stageStartedAt = time.Now()
-		snapshot, snapshotErr := s.getInventorySnapshot(ctx, s.store.DB())
-		if inventoryDuration != nil {
-			*inventoryDuration += time.Since(stageStartedAt)
+		inventoryFallbackStage := startObservedReadStage(ctx)
+		snapshot, snapshotErr := s.getInventorySnapshot(inventoryFallbackStage.Context(), s.store.DB())
+		if metrics != nil {
+			metrics.InventoryDuration += inventoryFallbackStage.Duration()
+			metrics.InventorySQLCount += inventoryFallbackStage.SQLCount()
 		}
 		if snapshotErr != nil {
 			return queueStatusPayload{}, snapshotErr
@@ -905,29 +994,21 @@ func (s *Service) loadQueueStatusSnapshotWithTimings(
 		availableTokens = snapshot["available"]
 	}
 
-	stageStartedAt = time.Now()
-	claimableNow, err := s.countClaimableTokensForUser(ctx, s.store.DB(), userID)
-	if claimableDuration != nil {
-		*claimableDuration = time.Since(stageStartedAt)
-	}
-	if err != nil {
-		return queueStatusPayload{}, err
-	}
-
-	return buildQueueStatusPayload(entry, totalQueued, availableTokens, claimableNow), nil
+	return buildQueueStatusPayload(entry, totalQueued, availableTokens), nil
 }
 
-func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTokens int, claimableNow int) queueStatusPayload {
+func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTokens int) queueStatusPayload {
+	generatedAt := isoformatNow()
 	if entry == nil {
-		return queueStatusPayload{
+		return withQueueStatusMetadata(queueStatusPayload{
 			Queued:          false,
 			TotalQueued:     totalQueued,
 			AvailableTokens: availableTokens,
-			ClaimableNow:    claimableNow,
-		}
+			ClaimableNow:    nil,
+		}, dataSourceLive, generatedAt, "", "", false)
 	}
 
-	return queueStatusPayload{
+	return withQueueStatusMetadata(queueStatusPayload{
 		Queued:          true,
 		QueueID:         entry.ID,
 		Position:        entry.QueueRank,
@@ -938,8 +1019,111 @@ func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTo
 		RequestID:       entry.RequestID,
 		TotalQueued:     totalQueued,
 		AvailableTokens: availableTokens,
-		ClaimableNow:    claimableNow,
+		ClaimableNow:    nil,
+	}, dataSourceLive, generatedAt, "", "", false)
+}
+
+func (s *Service) attachCachedClaimableNow(userID int64, payload queueStatusPayload) queueStatusPayload {
+	if snapshot, ok := s.getCachedClaimableNow(userID); ok {
+		return applyClaimableNowSnapshot(payload, snapshot, dataSourceCache)
 	}
+	if snapshot, ok := s.getCachedStaleClaimableNow(userID); ok {
+		payload = applyClaimableNowSnapshot(payload, snapshot, dataSourceStale)
+		if strings.TrimSpace(payload.StaleAt) == "" {
+			payload.StaleAt = staleTimestamp(snapshot.GeneratedAt)
+		}
+		if strings.TrimSpace(payload.DegradedReason) == "" {
+			payload.DegradedReason = degradedReasonClaimableDeferred
+		}
+		payload.Degraded = true
+		return payload
+	}
+	payload.ClaimableNow = nil
+	payload.ClaimableNowState = dataSourceUnavailable
+	payload.ClaimableNowUpdatedAt = ""
+	if strings.TrimSpace(payload.DegradedReason) == "" {
+		payload.DegradedReason = degradedReasonClaimableDeferred
+	}
+	payload.Degraded = true
+	return payload
+}
+
+func (s *Service) GetClaimableNow(ctx context.Context, userID int64) (claimableNowPayload, error) {
+	startedAt := time.Now()
+	stage := startObservedReadStage(ctx)
+	snapshot, cacheState, err := runtimecache.CacheJSONWithState(
+		s.cache,
+		s.userClaimableNowCacheKey(userID),
+		s.claimableNowSnapshotTTL(),
+		func() (storedClaimableNowSnapshot, error) {
+			count, countErr := s.countClaimableTokensForUser(stage.Context(), s.store.DB(), userID)
+			if countErr != nil {
+				return storedClaimableNowSnapshot{}, countErr
+			}
+			return storedClaimableNowSnapshot{
+				ClaimableNow: count,
+				GeneratedAt:  isoformatNow(),
+			}, nil
+		},
+	)
+	if err != nil {
+		if staleSnapshot, ok := s.getCachedStaleClaimableNow(userID); ok && isReadDegradeError(err) {
+			payload := claimableNowPayloadFromSnapshot(
+				staleSnapshot,
+				dataSourceStale,
+				staleTimestamp(staleSnapshot.GeneratedAt),
+				degradedReasonForError(err),
+				true,
+			)
+			s.logger.Info(
+				"get claimable now",
+				"user_id", userID,
+				"cache_state", cacheStateLabel(cacheState),
+				"data_source", payload.DataSource,
+				"total_ms", durationMillis(time.Since(startedAt)),
+				"count_ms", durationMillis(stage.Duration()),
+				"count_sql_count", stage.SQLCount(),
+				"cumulative_sql_count", stage.SQLCount(),
+				"error", err,
+			)
+			return payload, nil
+		}
+
+		payload := unavailableClaimableNowPayload(degradedReasonForError(err))
+		s.logger.Info(
+			"get claimable now",
+			"user_id", userID,
+			"cache_state", cacheStateLabel(cacheState),
+			"data_source", payload.DataSource,
+			"total_ms", durationMillis(time.Since(startedAt)),
+			"count_ms", durationMillis(stage.Duration()),
+			"count_sql_count", stage.SQLCount(),
+			"cumulative_sql_count", stage.SQLCount(),
+			"error", err,
+		)
+		return claimableNowPayload{}, err
+	}
+
+	if cacheState == runtimecache.CacheStateMiss {
+		snapshot = s.setClaimableNowSnapshot(userID, snapshot)
+	}
+
+	dataSource := dataSourceLive
+	if cacheState == runtimecache.CacheStateMemoryHit || cacheState == runtimecache.CacheStateFlightShared {
+		dataSource = dataSourceCache
+	}
+	payload := claimableNowPayloadFromSnapshot(snapshot, dataSource, "", "", false)
+	s.logger.Info(
+		"get claimable now",
+		"user_id", userID,
+		"cache_state", cacheStateLabel(cacheState),
+		"data_source", payload.DataSource,
+		"total_ms", durationMillis(time.Since(startedAt)),
+		"count_ms", durationMillis(stage.Duration()),
+		"count_sql_count", stage.SQLCount(),
+		"cumulative_sql_count", stage.SQLCount(),
+	)
+	return payload, nil
 }
 
 func (s *Service) ListClaims(ctx context.Context, userID int64) ([]claimHistoryItem, error) {
@@ -1054,39 +1238,55 @@ func (s *Service) GetDashboardSummary(ctx context.Context, userID int64, window 
 	})
 }
 
+func (s *Service) loadSystemStatus(ctx context.Context) (map[string]any, error) {
+	snapshot, runtimeState, runtimeExists, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
+	if err != nil {
+		return nil, err
+	}
+
+	policy := s.buildInventoryPolicy(snapshot)
+	if runtimeExists {
+		policy.Status = runtimeState.Status
+		policy.MaxClaims = runtimeState.MaxClaims
+	}
+	totalQueued, err := s.getTotalQueued(ctx, s.store.DB())
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]any{
+		"inventory": snapshot,
+		"queue": map[string]any{
+			"total": totalQueued,
+		},
+		"health": map[string]any{
+			"status":       policy.Status,
+			"hourly_limit": policy.HourlyLimit,
+			"max_claims":   policy.MaxClaims,
+			"thresholds":   policy.Thresholds,
+		},
+		"index": map[string]any{
+			"updated_at": s.systemIndexTimestamp(),
+		},
+	}, nil
+}
+
+func (s *Service) getSystemStatusObserved(ctx context.Context) (cachedReadResult[map[string]any], error) {
+	return loadCachedReadResult(
+		ctx,
+		s,
+		s.dashboardCacheKey("dashboard-system", nil),
+		s.dashboardStaleCacheKey("dashboard-system", nil),
+		s.cfg.Cache.DashboardTTL,
+		func(loadCtx context.Context) (map[string]any, error) {
+			return s.loadSystemStatus(loadCtx)
+		},
+	)
+}
+
 func (s *Service) getSystemStatus(ctx context.Context) (map[string]any, error) {
-	return runtimecache.CacheJSON(s.cache, s.dashboardCacheKey("dashboard-system", nil), s.cfg.Cache.DashboardTTL, func() (map[string]any, error) {
-		snapshot, runtimeState, runtimeExists, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
-		if err != nil {
-			return nil, err
-		}
-
-		policy := s.buildInventoryPolicy(snapshot)
-		if runtimeExists {
-			policy.Status = runtimeState.Status
-			policy.MaxClaims = runtimeState.MaxClaims
-		}
-		totalQueued, err := s.getTotalQueued(ctx, s.store.DB())
-		if err != nil {
-			return nil, err
-		}
-
-		return map[string]any{
-			"inventory": snapshot,
-			"queue": map[string]any{
-				"total": totalQueued,
-			},
-			"health": map[string]any{
-				"status":       policy.Status,
-				"hourly_limit": policy.HourlyLimit,
-				"max_claims":   policy.MaxClaims,
-				"thresholds":   policy.Thresholds,
-			},
-			"index": map[string]any{
-				"updated_at": s.systemIndexTimestamp(),
-			},
-		}, nil
-	})
+	result, err := s.getSystemStatusObserved(ctx)
+	return result.Value, err
 }
 
 func (s *Service) systemIndexTimestamp() string {
@@ -1101,37 +1301,54 @@ func (s *Service) touchSystemIndexTimestamp() {
 	s.systemIndexMu.Unlock()
 }
 
+func (s *Service) loadDashboardStats(ctx context.Context, userID int64) (map[string]int, error) {
+	snapshot, _, _, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
+	if err != nil {
+		return nil, err
+	}
+
+	runtimeStats, runtimeExists, err := s.getClaimStatsRuntimeState(ctx, s.store.DB())
+	if err != nil {
+		return nil, err
+	}
+	if !runtimeExists {
+		return nil, fmt.Errorf("claim stats runtime unavailable")
+	}
+
+	userStats, _, err := s.getUserClaimStatsRuntimeState(ctx, s.store.DB(), userID)
+	if err != nil {
+		return nil, err
+	}
+
+	othersClaimedTotal := maxInt(0, runtimeStats.ClaimedTotal-userStats.ClaimedTotal)
+	othersClaimedUnique := maxInt(0, runtimeStats.ClaimedUnique-userStats.ExclusiveClaimedUnique)
+
+	return map[string]int{
+		"total_tokens":          snapshot["total"],
+		"available_tokens":      snapshot["available"],
+		"claimed_total":         runtimeStats.ClaimedTotal,
+		"claimed_unique":        runtimeStats.ClaimedUnique,
+		"others_claimed_total":  othersClaimedTotal,
+		"others_claimed_unique": othersClaimedUnique,
+	}, nil
+}
+
+func (s *Service) getDashboardStatsObserved(ctx context.Context, userID int64) (cachedReadResult[map[string]int], error) {
+	return loadCachedReadResult(
+		ctx,
+		s,
+		s.dashboardCacheKey("dashboard-stats", &userID),
+		s.dashboardStaleCacheKey("dashboard-stats", &userID),
+		s.cfg.Cache.DashboardTTL,
+		func(loadCtx context.Context) (map[string]int, error) {
+			return s.loadDashboardStats(loadCtx, userID)
+		},
+	)
+}
+
 func (s *Service) getDashboardStats(ctx context.Context, userID int64) (map[string]int, error) {
-	return runtimecache.CacheJSON(s.cache, s.dashboardCacheKey("dashboard-stats", &userID), s.cfg.Cache.DashboardTTL, func() (map[string]int, error) {
-		snapshot, _, _, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
-		if err != nil {
-			return nil, err
-		}
-
-		claimedTotal, err := queryCount(ctx, s.store.DB(), `SELECT COUNT(*) FROM token_claims`)
-		if err != nil {
-			return nil, err
-		}
-
-		othersClaimedTotal, err := queryCount(ctx, s.store.DB(), `SELECT COUNT(*) FROM token_claims WHERE user_id != ?`, userID)
-		if err != nil {
-			return nil, err
-		}
-
-		othersClaimedUnique, err := queryCount(ctx, s.store.DB(), `SELECT COUNT(DISTINCT token_id) FROM token_claims WHERE user_id != ?`, userID)
-		if err != nil {
-			return nil, err
-		}
-
-		return map[string]int{
-			"total_tokens":          snapshot["total"],
-			"available_tokens":      snapshot["available"],
-			"claimed_total":         claimedTotal,
-			"claimed_unique":        maxInt(0, snapshot["total"]-snapshot["unclaimed"]),
-			"others_claimed_total":  othersClaimedTotal,
-			"others_claimed_unique": othersClaimedUnique,
-		}, nil
-	})
+	result, err := s.getDashboardStatsObserved(ctx, userID)
+	return result.Value, err
 }
 
 func (s *Service) enqueueClaim(ctx context.Context, userID int64, apiKeyID *int64, target int, used int, limit int, remaining int) (*claimResult, error) {
@@ -1591,6 +1808,149 @@ func (s *Service) getInventoryRuntimeState(ctx context.Context, queryer sqlQuery
 	}
 
 	return state, true, nil
+}
+
+func (s *Service) getClaimStatsRuntimeState(ctx context.Context, queryer sqlQueryer) (claimStatsRuntimeState, bool, error) {
+	row := queryRowContextCounted(ctx, queryer, `
+		SELECT claimed_total,
+		       claimed_unique,
+		       updated_at_ts
+		FROM claim_stats_runtime
+		WHERE id = 1
+	`)
+
+	var state claimStatsRuntimeState
+	if err := row.Scan(
+		&state.ClaimedTotal,
+		&state.ClaimedUnique,
+		&state.UpdatedAtTS,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return claimStatsRuntimeState{}, false, nil
+		}
+		return claimStatsRuntimeState{}, false, fmt.Errorf("load claim stats runtime: %w", err)
+	}
+
+	return state, true, nil
+}
+
+func (s *Service) getUserClaimStatsRuntimeState(ctx context.Context, queryer sqlQueryer, userID int64) (userClaimStatsRuntimeState, bool, error) {
+	row := queryRowContextCounted(ctx, queryer, `
+		SELECT user_id,
+		       claimed_total,
+		       claimed_unique,
+		       exclusive_claimed_unique,
+		       updated_at_ts
+		FROM user_claim_stats_runtime
+		WHERE user_id = ?
+	`, userID)
+
+	var state userClaimStatsRuntimeState
+	if err := row.Scan(
+		&state.UserID,
+		&state.ClaimedTotal,
+		&state.ClaimedUnique,
+		&state.ExclusiveClaimedUnique,
+		&state.UpdatedAtTS,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return userClaimStatsRuntimeState{}, false, nil
+		}
+		return userClaimStatsRuntimeState{}, false, fmt.Errorf("load user claim stats runtime for user %d: %w", userID, err)
+	}
+
+	return state, true, nil
+}
+
+func (s *Service) tokenClaimStatsBeforeInsert(ctx context.Context, queryer sqlQueryer, tokenID int64) (int, int64, error) {
+	rows, err := queryContextCounted(ctx, queryer, `
+		SELECT user_id
+		FROM user_token_claims
+		WHERE token_id = ?
+		ORDER BY id ASC
+		LIMIT 2
+	`, tokenID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("load token claim stats for token %d: %w", tokenID, err)
+	}
+	defer rows.Close()
+
+	count := 0
+	firstUserID := int64(0)
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return 0, 0, fmt.Errorf("scan token claim stats for token %d: %w", tokenID, err)
+		}
+		count++
+		if count == 1 {
+			firstUserID = userID
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, fmt.Errorf("iterate token claim stats for token %d: %w", tokenID, err)
+	}
+
+	return count, firstUserID, nil
+}
+
+func (s *Service) applyClaimStatsRuntimeTx(ctx context.Context, tx *sql.Tx, userID int64, existingClaimerCount int, previousExclusiveUserID int64) error {
+	if userID <= 0 {
+		return nil
+	}
+
+	uniqueClaimDelta := 0
+	exclusiveClaimDelta := 0
+	if existingClaimerCount == 0 {
+		uniqueClaimDelta = 1
+		exclusiveClaimDelta = 1
+	}
+
+	now := time.Now().Unix()
+	if _, err := execContextCounted(ctx, tx, `
+		INSERT INTO claim_stats_runtime (id, claimed_total, claimed_unique, updated_at_ts)
+		VALUES (1, 1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			claimed_total = claim_stats_runtime.claimed_total + 1,
+			claimed_unique = claim_stats_runtime.claimed_unique + excluded.claimed_unique,
+			updated_at_ts = excluded.updated_at_ts
+	`, uniqueClaimDelta, now); err != nil {
+		return fmt.Errorf("upsert claim stats runtime: %w", err)
+	}
+
+	if _, err := execContextCounted(ctx, tx, `
+		INSERT INTO user_claim_stats_runtime (
+			user_id,
+			claimed_total,
+			claimed_unique,
+			exclusive_claimed_unique,
+			updated_at_ts
+		)
+		VALUES (?, 1, 1, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET
+			claimed_total = user_claim_stats_runtime.claimed_total + 1,
+			claimed_unique = user_claim_stats_runtime.claimed_unique + 1,
+			exclusive_claimed_unique = user_claim_stats_runtime.exclusive_claimed_unique + excluded.exclusive_claimed_unique,
+			updated_at_ts = excluded.updated_at_ts
+	`, userID, exclusiveClaimDelta, now); err != nil {
+		return fmt.Errorf("upsert user claim stats runtime for user %d: %w", userID, err)
+	}
+
+	if existingClaimerCount == 1 && previousExclusiveUserID > 0 && previousExclusiveUserID != userID {
+		if _, err := execContextCounted(ctx, tx, `
+			UPDATE user_claim_stats_runtime
+			SET exclusive_claimed_unique = CASE
+					WHEN exclusive_claimed_unique > 0 THEN exclusive_claimed_unique - 1
+					ELSE 0
+				END,
+			    updated_at_ts = ?
+			WHERE user_id = ?
+		`, now, previousExclusiveUserID); err != nil {
+			return fmt.Errorf("decrement exclusive claim stats runtime for user %d: %w", previousExclusiveUserID, err)
+		}
+	}
+
+	return nil
 }
 
 func (s *Service) hasPendingQueueTx(ctx context.Context, tx *sql.Tx) (bool, error) {
