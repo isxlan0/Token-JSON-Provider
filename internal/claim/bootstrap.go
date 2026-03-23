@@ -2,12 +2,10 @@ package claim
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
 	"strings"
+	"time"
 
 	"token-atlas/internal/auth"
-	"token-atlas/internal/database"
 	"token-atlas/internal/runtimecache"
 )
 
@@ -51,14 +49,79 @@ func (s *Service) buildBootstrapPayload(ctx context.Context, requestContext *aut
 }
 
 func (s *Service) GetBootstrap(ctx context.Context, requestContext *auth.RequestContext) (map[string]any, error) {
-	return runtimecache.CacheJSON(
+	startedAt := time.Now()
+	observedCtx, _ := withSQLMetrics(ctx)
+	var (
+		profileDuration       time.Duration
+		dashboardDuration     time.Duration
+		queueStatusDuration   time.Duration
+		claimRealtimeDuration time.Duration
+		uploadResultsDuration time.Duration
+		loaderExecuted        bool
+	)
+
+	payload, err := runtimecache.CacheJSON(
 		s.cache,
 		s.userBootstrapCacheKey(requestContext.UserID, requestContext.IsAdmin),
 		s.cfg.Cache.MeTTL,
 		func() (map[string]any, error) {
-			return s.buildBootstrapPayload(ctx, requestContext)
+			loaderExecuted = true
+
+			stageStartedAt := time.Now()
+			profile, err := s.GetProfile(observedCtx, requestContext)
+			profileDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return nil, err
+			}
+
+			stageStartedAt = time.Now()
+			dashboard, err := s.GetDashboardSummary(observedCtx, requestContext.UserID, defaultDashboardWindow, defaultDashboardBucket)
+			dashboardDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return nil, err
+			}
+
+			stageStartedAt = time.Now()
+			queueStatus, err := s.GetQueueStatus(observedCtx, requestContext.UserID)
+			queueStatusDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return nil, err
+			}
+
+			stageStartedAt = time.Now()
+			claimRealtime, err := s.GetClaimRealtimeSnapshot(observedCtx, requestContext.UserID, requestContext.SessionID)
+			claimRealtimeDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return nil, err
+			}
+
+			stageStartedAt = time.Now()
+			uploadResults := buildUploadResultsSummaryPayload(s.GetUploadResults(requestContext.UserID))
+			uploadResultsDuration = time.Since(stageStartedAt)
+
+			return map[string]any{
+				"profile":        profile,
+				"dashboard":      dashboard,
+				"claim_realtime": claimRealtime,
+				"queue_status":   queueStatus,
+				"upload_results": uploadResults,
+			}, nil
 		},
 	)
+	s.logger.Info(
+		"get bootstrap",
+		"user_id", requestContext.UserID,
+		"cache_hit", !loaderExecuted,
+		"total_ms", durationMillis(time.Since(startedAt)),
+		"profile_ms", durationMillis(profileDuration),
+		"dashboard_ms", durationMillis(dashboardDuration),
+		"queue_status_ms", durationMillis(queueStatusDuration),
+		"claim_realtime_ms", durationMillis(claimRealtimeDuration),
+		"upload_results_ms", durationMillis(uploadResultsDuration),
+		"sql_count", sqlCount(observedCtx),
+		"error", err,
+	)
+	return payload, err
 }
 
 func (s *Service) cachedAdminUsersPage(ctx context.Context, search string, banStatus string, limit int, offset int) (map[string]any, error) {
@@ -172,29 +235,6 @@ func (s *Service) warmReadCaches(ctx context.Context) {
 		s.logger.Warn("warm claim trends cache", "error", err)
 	}
 	s.primeAdminDefaultReadCaches(ctx)
-
-	userIDs, err := s.listQueuedUserIDs(ctx)
-	if err != nil {
-		s.logger.Warn("list queued users for cache warmup", "error", err)
-		return
-	}
-	for _, userID := range userIDs {
-		if userID <= 0 {
-			continue
-		}
-		if err := s.refreshUserBootstrapCacheByID(ctx, userID); err != nil {
-			s.logger.Warn("warm queued user bootstrap cache", "user_id", userID, "error", err)
-		}
-	}
-}
-
-func (s *Service) primeUserReadCaches(ctx context.Context, userID int64) {
-	if ctx.Err() != nil || userID <= 0 {
-		return
-	}
-	if err := s.refreshUserBootstrapCacheByID(ctx, userID); err != nil {
-		s.logger.Warn("refresh user bootstrap cache", "user_id", userID, "error", err)
-	}
 }
 
 func (s *Service) primeAdminDefaultReadCaches(ctx context.Context) {
@@ -216,81 +256,4 @@ func (s *Service) primeAdminDefaultReadCaches(ctx context.Context) {
 	if _, err := s.GetAdminPolicy(ctx); err != nil {
 		s.logger.Warn("warm admin policy cache", "error", err)
 	}
-}
-
-func (s *Service) refreshUserBootstrapCache(ctx context.Context, requestContext *auth.RequestContext) error {
-	if requestContext == nil || requestContext.IsBanned {
-		return nil
-	}
-	_, err := s.GetBootstrap(ctx, requestContext)
-	return err
-}
-
-func (s *Service) refreshUserBootstrapCacheByID(ctx context.Context, userID int64) error {
-	requestContext, err := s.buildRequestContextForUserID(ctx, userID)
-	if err != nil || requestContext == nil {
-		return err
-	}
-	return s.refreshUserBootstrapCache(ctx, requestContext)
-}
-
-func (s *Service) buildRequestContextForUserID(ctx context.Context, userID int64) (*auth.RequestContext, error) {
-	user, err := s.getUserByID(ctx, userID)
-	if err != nil || user == nil {
-		return nil, err
-	}
-
-	username := user.LinuxDOUsername
-	isAdmin := s.isAdminIdentity(user.LinuxDOUserID, username)
-	userPayload := auth.UserPayload{
-		ID:         user.LinuxDOUserID,
-		Username:   username,
-		Name:       firstNonEmpty(user.LinuxDOName.String, username),
-		TrustLevel: user.TrustLevel,
-		IsAdmin:    isAdmin,
-	}
-
-	ban, err := s.getActiveBanPayload(ctx, user.LinuxDOUserID)
-	if err != nil {
-		return nil, err
-	}
-
-	return &auth.RequestContext{
-		UserID:   user.ID,
-		DBUser:   user,
-		User:     userPayload,
-		IsAdmin:  isAdmin,
-		Ban:      ban,
-		IsBanned: ban != nil,
-	}, nil
-}
-
-func (s *Service) getUserByID(ctx context.Context, userID int64) (*database.User, error) {
-	return s.getUserByIDQueryer(ctx, s.store.DB(), userID)
-}
-
-func (s *Service) getUserByIDQueryer(ctx context.Context, queryer sqlQueryer, userID int64) (*database.User, error) {
-	row := queryer.QueryRowContext(ctx, `
-		SELECT id, linuxdo_user_id, linuxdo_username, linuxdo_name, trust_level, created_at_ts, last_login_at_ts
-		FROM users
-		WHERE id = ?
-	`, userID)
-
-	var user database.User
-	if err := row.Scan(&user.ID, &user.LinuxDOUserID, &user.LinuxDOUsername, &user.LinuxDOName, &user.TrustLevel, &user.CreatedAtTS, &user.LastLoginAtTS); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("query user by id %d: %w", userID, err)
-	}
-	return &user, nil
-}
-
-func (s *Service) isAdminIdentity(linuxDOUserID string, username string) bool {
-	if _, ok := s.cfg.APIKeys.AdminIdentities.IDs[strings.TrimSpace(linuxDOUserID)]; ok {
-		return true
-	}
-	normalized := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(username), "@")))
-	_, ok := s.cfg.APIKeys.AdminIdentities.Usernames[normalized]
-	return ok
 }

@@ -586,7 +586,9 @@ func (s *Service) SetTokenEnabled(ctx context.Context, tokenID int64, enabled bo
 		return nil, err
 	}
 	if item != nil {
-		s.invalidateAllRuntimeCache(nil, true)
+		s.invalidateInventoryCache()
+		s.invalidateDashboardInventoryCache()
+		s.invalidateAdminCache()
 		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
@@ -683,7 +685,9 @@ func (s *Service) CleanupExhaustedTokens(ctx context.Context, mode string) (map[
 		"failed":            failed,
 	}
 	if len(cleanedIDs) > 0 || compactedContent > 0 {
-		s.invalidateAllRuntimeCache(nil, true)
+		s.invalidateInventoryCache()
+		s.invalidateDashboardInventoryCache()
+		s.invalidateAdminCache()
 		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
@@ -791,6 +795,23 @@ func (s *Service) getUserByLinuxDOID(ctx context.Context, linuxDOUserID string) 
 			return nil, nil
 		}
 		return nil, fmt.Errorf("query user by linuxdo id %s: %w", linuxDOUserID, err)
+	}
+	return &user, nil
+}
+
+func (s *Service) getUserByIDQueryer(ctx context.Context, queryer sqlQueryer, userID int64) (*database.User, error) {
+	row := queryer.QueryRowContext(ctx, `
+		SELECT id, linuxdo_user_id, linuxdo_username, linuxdo_name, trust_level, created_at_ts, last_login_at_ts
+		FROM users
+		WHERE id = ?
+	`, userID)
+
+	var user database.User
+	if err := row.Scan(&user.ID, &user.LinuxDOUserID, &user.LinuxDOUsername, &user.LinuxDOName, &user.TrustLevel, &user.CreatedAtTS, &user.LastLoginAtTS); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query user by id %d: %w", userID, err)
 	}
 	return &user, nil
 }

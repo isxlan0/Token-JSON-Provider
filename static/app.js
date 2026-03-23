@@ -5,7 +5,7 @@ import {
   buildQueueStatusFromRequest,
   createInitialClaimRealtimeState,
 } from "./app/claim-realtime.js?v=20260323b";
-import { createSummarySyncController } from "./app/summary-sync.js?v=20260322g";
+import { createSummarySyncController } from "./app/summary-sync.js?v=20260323h";
 
 function createClientTabId() {
   const storageKey = "token_atlas_tab_id";
@@ -259,6 +259,7 @@ function switchTab(name) {
     });
   }
   if (name === "claim") {
+    renderQueueStatus();
     ensureClaimsLoaded().catch((error) => {
       if (!handleAccessError(error)) {
         console.error("加载领取记录失败", error);
@@ -558,6 +559,10 @@ function applyRuntimeSnapshot(payload) {
   if (!payload) {
     return;
   }
+  if (payload.user) {
+    state.user = payload.user;
+    renderUser();
+  }
   if (payload.quota) {
     state.quota = payload.quota;
     renderQuota();
@@ -571,6 +576,10 @@ function applyRuntimeSnapshot(payload) {
     if (state.activeTab === "keys") {
       renderApiKeys();
     }
+  }
+  if (payload.uploads) {
+    state.uploadPolicy = payload.uploads;
+    renderUploadPolicy();
   }
   if (payload.upload_results?.summary) {
     applyUploadResultsSummaryPayload(payload.upload_results);
@@ -736,13 +745,51 @@ function applyClaimRealtimePayload(payload, options = {}) {
     state.claimStreamError = "";
     state.claimStreamRetryCount = 0;
   }
-  updateClaimRequestUI(result.activeRequest, result.queueRequest);
+  renderQueueStatus();
   if (result.activeRequest?.terminal) {
     setClaimSubmitting(false);
   }
   broadcastClaimRealtimePayload(payload || {}, options);
   handleClaimRealtimeEffects(result.effects || []);
   syncQueueRealtimeTransport();
+}
+
+function normalizeQueueStatusPayload(payload = {}) {
+  return {
+    queued: Boolean(payload?.queued),
+    queue_id: Number(payload?.queue_id) || 0,
+    position: Number(payload?.position) || 0,
+    total_queued: Number(payload?.total_queued) || 0,
+    requested: Number(payload?.requested) || 0,
+    remaining: Number(payload?.remaining ?? payload?.requested) || 0,
+    request_id: typeof payload?.request_id === "string" ? payload.request_id : "",
+    available_tokens: Number(payload?.available_tokens) || 0,
+    claimable_now: Number(payload?.claimable_now) || 0,
+    degraded: Boolean(payload?.degraded),
+  };
+}
+
+function buildQueueRequestFromStatus(status = {}) {
+  if (!status?.queued) {
+    return null;
+  }
+  return {
+    status: "queued",
+    queued: true,
+    queue_id: status.queue_id || 0,
+    queue_position: status.position || 0,
+    queue_total: status.total_queued || 0,
+    requested: status.requested || 0,
+    remaining: status.remaining || 0,
+    request_id: status.request_id || "",
+  };
+}
+
+function applyQueueStatusPayload(payload) {
+  state.queueStatus = normalizeQueueStatusPayload(payload || {});
+  renderQueueStatus();
+  syncQueueRealtimeTransport();
+  return state.queueStatus;
 }
 
 function applyBootstrapPayload(payload) {
@@ -783,13 +830,15 @@ function renderQueueStatus() {
   const activeRequest = state.activeClaimRequestId
     ? requests.find((request) => request.request_id === state.activeClaimRequestId) || null
     : null;
-  const queueRequest = requests.find((request) => request.status === "queued") || null;
+  const queueRequest = requests.find((request) => request.status === "queued")
+    || buildQueueRequestFromStatus(state.queueStatus);
   updateClaimRequestUI(activeRequest, queueRequest);
 }
 
 function hasPendingClaimRealtimeRequests() {
   const requests = Object.values(state.claimRealtimeState?.requestsById || {});
-  return requests.some((request) => request && request.terminal !== true);
+  return requests.some((request) => request && request.terminal !== true)
+    || Boolean(state.queueStatus?.queued);
 }
 
 async function fetchJson(url, options = {}) {
@@ -2041,10 +2090,22 @@ function renderClaimResults() {
   });
 }
 
+async function loadQueueStatus() {
+  const payload = await fetchJson("/me/queue-status");
+  applyQueueStatusPayload(payload || {});
+  return payload;
+}
+
 async function loadDashboard() {
-  const bootstrap = await fetchJson("/me/bootstrap");
-  applyBootstrapPayload(bootstrap || {});
-  return bootstrap;
+  return loadDashboardSummary();
+}
+
+async function loadAppShellData() {
+  const [runtimeSnapshot, queueStatus] = await Promise.all([
+    loadRuntimeSnapshot(),
+    loadQueueStatus(),
+  ]);
+  return { runtimeSnapshot, queueStatus };
 }
 
 async function bootstrapAppShell() {
@@ -2054,7 +2115,7 @@ async function bootstrapAppShell() {
 
   setLoadingState({
     title: "正在加载",
-    subtitle: "正在请求数据面板并确认当前会话。",
+    subtitle: "正在确认当前会话并加载运行时数据。",
     message: "",
     showRetry: false,
     showSpinner: true,
@@ -2064,12 +2125,17 @@ async function bootstrapAppShell() {
   state.bootstrapPromise = (async () => {
     try {
       applyDocsBaseUrl();
-      await loadDashboard();
+      await loadAppShellData();
       showScreen("app");
       switchTab("data");
       claimPollingLeadership();
       syncQueueRealtimeTransport();
       syncUploadResultsTransport();
+      loadDashboard().catch((error) => {
+        if (!handleAccessError(error)) {
+          console.error("异步加载数据面板失败", error);
+        }
+      });
     } catch (error) {
       if (error?.status === 401) {
         stopAllBackgroundActivity("auth-expired");
@@ -2455,7 +2521,11 @@ async function runLowFrequencyRefresh() {
   }
   state.refreshing = true;
   try {
-    await summarySync.loadBootstrapBundle({ broadcast: true });
+    await Promise.all([
+      summarySync.loadRuntimeSnapshot({ broadcast: true }),
+      loadQueueStatus(),
+      loadDashboardSummary({ broadcast: true }),
+    ]);
     state.lastLowFrequencyAt = Date.now();
   } catch (error) {
     if (handleAccessError(error)) {

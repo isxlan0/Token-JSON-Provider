@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const busyTimeoutMS = 30_000
+const busyTimeoutMS = 1_500
 
 var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS users (
@@ -119,6 +121,9 @@ var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS inventory_runtime (
 		id INTEGER PRIMARY KEY CHECK(id = 1),
 		status TEXT NOT NULL,
+		total_tokens INTEGER NOT NULL DEFAULT 0,
+		available_tokens INTEGER NOT NULL DEFAULT 0,
+		unclaimed_tokens INTEGER NOT NULL DEFAULT 0,
 		max_claims INTEGER NOT NULL,
 		updated_at_ts INTEGER NOT NULL
 	)`,
@@ -153,6 +158,10 @@ var indexStatements = []string{
 		ON token_claims(user_id, token_id, is_hidden, claimed_at_ts DESC)`,
 	`CREATE INDEX IF NOT EXISTS idx_token_claims_request_user_time
 		ON token_claims(request_id, user_id, claimed_at_ts)`,
+	`CREATE INDEX IF NOT EXISTS idx_token_claims_claimed_at
+		ON token_claims(claimed_at_ts DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_token_claims_claimed_at_request_user
+		ON token_claims(claimed_at_ts DESC, request_id, user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_user_token_claims_user
 		ON user_token_claims(user_id, token_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_claim_queue_status_time
@@ -193,15 +202,15 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("database path is empty")
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database %q: %w", path, err)
 	}
 
-	// SQLite pragmas such as foreign_keys are per connection. Keeping a single
-	// connection during the rewrite avoids silent divergence between requests.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	maxOpen := sqliteMaxOpenConns()
+	maxIdle := sqliteMaxIdleConns(maxOpen)
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(0)
 
 	store := &Store{
@@ -261,10 +270,13 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := ensureQueueColumns(ctx, tx); err != nil {
 		return err
 	}
-	if err := refreshQueueRuntime(ctx, tx); err != nil {
+	if err := ensureTokenColumns(ctx, tx); err != nil {
 		return err
 	}
-	if err := ensureTokenColumns(ctx, tx); err != nil {
+	if err := ensureInventoryRuntimeColumns(ctx, tx); err != nil {
+		return err
+	}
+	if err := refreshQueueRuntime(ctx, tx); err != nil {
 		return err
 	}
 	if err := backfillClaimContentColumns(ctx, tx); err != nil {
@@ -307,6 +319,32 @@ func (s *Store) applyPragmas(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func sqliteDSN(path string) string {
+	query := url.Values{}
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS))
+	query.Add("_pragma", "foreign_keys(ON)")
+	query.Add("_pragma", "journal_mode(WAL)")
+	return path + "?" + query.Encode()
+}
+
+func sqliteMaxOpenConns() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 4 {
+		return 4
+	}
+	if workers > 8 {
+		return 8
+	}
+	return workers
+}
+
+func sqliteMaxIdleConns(maxOpen int) int {
+	if maxOpen <= 4 {
+		return maxOpen
+	}
+	return 4
 }
 
 func ensureClaimColumns(ctx context.Context, tx *sql.Tx) error {
@@ -458,6 +496,34 @@ func ensureTokenColumns(ctx context.Context, tx *sql.Tx) error {
 		statement := fmt.Sprintf(`ALTER TABLE tokens ADD COLUMN %s %s`, definition.name, definition.definition)
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("add tokens.%s: %w", definition.name, err)
+		}
+	}
+
+	return nil
+}
+
+func ensureInventoryRuntimeColumns(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "inventory_runtime")
+	if err != nil {
+		return err
+	}
+
+	definitions := []struct {
+		name       string
+		definition string
+	}{
+		{name: "total_tokens", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "available_tokens", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "unclaimed_tokens", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+
+	for _, definition := range definitions {
+		if _, ok := columns[definition.name]; ok {
+			continue
+		}
+		statement := fmt.Sprintf(`ALTER TABLE inventory_runtime ADD COLUMN %s %s`, definition.name, definition.definition)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("add inventory_runtime.%s: %w", definition.name, err)
 		}
 	}
 

@@ -160,7 +160,9 @@ func (s *Service) markTokenBanned(ctx context.Context, tokenID int64, reason str
 		s.scheduleTokenFileDeleteRetry(fileName, reason, deleteErr)
 	}
 
-	s.invalidateAllRuntimeCache(nil, true)
+	s.invalidateInventoryCache()
+	s.invalidateDashboardInventoryCache()
+	s.invalidateAdminCache()
 	s.notifyQueueUsers(ctx)
 	return nil
 }
@@ -336,6 +338,9 @@ func (s *Service) finalizeClaimReservedToken(ctx context.Context, tokenID int64,
 					return nil, errRetryAllocation
 				}
 				return nil, fmt.Errorf("insert user token claim: %w", err)
+			}
+			if err := s.refreshInventoryRuntimeTx(ctx, tx); err != nil {
+				return nil, err
 			}
 
 			content, err := decodeJSONContent(contentJSON)

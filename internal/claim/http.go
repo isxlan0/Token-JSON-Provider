@@ -1,6 +1,7 @@
 package claim
 
 import (
+	"context"
 	"io"
 	"net/http"
 
@@ -152,9 +153,6 @@ func (s *Service) hideClaims(c echo.Context) error {
 	}
 
 	s.invalidateUserClaimsCache(requestContext.UserID)
-	s.invalidateUserProfileCache(requestContext.UserID)
-	userIDCopy := requestContext.UserID
-	s.invalidateDashboardCache(&userIDCopy)
 	select {
 	case s.hideClaimsCh <- hideClaimsTask{userID: requestContext.UserID, claimIDs: append([]int64(nil), claimIDs...)}:
 	case <-c.Request().Context().Done():
@@ -173,10 +171,24 @@ func (s *Service) getRuntimeSnapshot(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
-	payload, err := s.GetRuntimeSnapshot(c.Request().Context(), requestContext.UserID)
+	readCtx, cancel := context.WithTimeout(c.Request().Context(), runtimeSnapshotReadTimeout)
+	defer cancel()
+
+	payload, err := s.GetRuntimeSnapshot(readCtx, requestContext.UserID)
 	if err != nil {
-		return err
+		if !isReadDegradeError(err) {
+			return err
+		}
+		if cached, ok := s.getCachedRuntimeSnapshot(requestContext.UserID); ok {
+			payload = cached
+		} else {
+			payload = s.defaultRuntimeSnapshotPayload(requestContext)
+		}
+		payload = s.mergeRuntimeSnapshotWithRequestContext(payload, requestContext)
+		payload.Degraded = true
+		return c.JSON(http.StatusOK, payload)
 	}
+	payload = s.mergeRuntimeSnapshotWithRequestContext(payload, requestContext)
 	return c.JSON(http.StatusOK, payload)
 }
 
@@ -186,9 +198,21 @@ func (s *Service) getBootstrap(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
-	payload, err := s.GetBootstrap(c.Request().Context(), requestContext)
+	readCtx, cancel := context.WithTimeout(c.Request().Context(), bootstrapReadTimeout)
+	defer cancel()
+
+	payload, err := s.GetBootstrap(readCtx, requestContext)
 	if err != nil {
-		return err
+		if !isReadDegradeError(err) {
+			return err
+		}
+		if cached, ok := s.getCachedBootstrap(requestContext.UserID, requestContext.IsAdmin); ok {
+			payload = cached
+		} else {
+			payload = s.defaultBootstrapPayload(requestContext)
+		}
+		payload["degraded"] = true
+		return c.JSON(http.StatusOK, payload)
 	}
 	return c.JSON(http.StatusOK, payload)
 }
@@ -199,9 +223,21 @@ func (s *Service) getQueueStatus(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
-	payload, err := s.GetQueueStatus(c.Request().Context(), requestContext.UserID)
+	readCtx, cancel := context.WithTimeout(c.Request().Context(), queueStatusReadTimeout)
+	defer cancel()
+
+	payload, err := s.GetQueueStatus(readCtx, requestContext.UserID)
 	if err != nil {
-		return err
+		if !isReadDegradeError(err) {
+			return err
+		}
+		if cached, ok := s.getCachedQueueStatus(requestContext.UserID); ok {
+			payload = cached
+		} else {
+			payload = s.defaultQueueStatusPayload()
+		}
+		payload.Degraded = true
+		return c.JSON(http.StatusOK, payload)
 	}
 	return c.JSON(http.StatusOK, payload)
 }
@@ -279,7 +315,7 @@ func (s *Service) getDashboardSummary(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
-	payload, err := s.GetDashboardSummaryWithOptions(c.Request().Context(), requestContext.UserID, dashboardSummaryOptions{
+	options := dashboardSummaryOptions{
 		Window:                 c.QueryParam("window"),
 		Bucket:                 c.QueryParam("bucket"),
 		LeaderboardWindow:      c.QueryParam("leaderboard_window"),
@@ -287,9 +323,23 @@ func (s *Service) getDashboardSummary(c echo.Context) error {
 		RecentLimit:            parseBoundedInt(c.QueryParam("recent_limit"), 10, 1, 10),
 		ContributorLimit:       parseBoundedInt(c.QueryParam("contributor_limit"), 10, 1, 10),
 		RecentContributorLimit: parseBoundedInt(c.QueryParam("recent_contributor_limit"), 10, 1, 10),
-	})
+	}
+
+	readCtx, cancel := context.WithTimeout(c.Request().Context(), dashboardSummaryReadTimeout)
+	defer cancel()
+
+	payload, err := s.GetDashboardSummaryWithOptions(readCtx, requestContext.UserID, options)
 	if err != nil {
-		return err
+		if !isReadDegradeError(err) {
+			return err
+		}
+		if cached, ok := s.getCachedDashboardSummary(requestContext.UserID, options); ok && cached != nil {
+			payload = cached
+		} else {
+			payload = s.defaultDashboardSummaryPayload(options)
+		}
+		payload["degraded"] = true
+		return c.JSON(http.StatusOK, payload)
 	}
 	return c.JSON(http.StatusOK, payload)
 }

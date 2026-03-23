@@ -19,54 +19,91 @@ type dashboardSummaryOptions struct {
 	RecentContributorLimit int
 }
 
+type normalizedDashboardSummaryOptions struct {
+	WindowSeconds          int
+	BucketSeconds          int
+	LeaderboardWindow      int
+	LeaderboardLimit       int
+	RecentLimit            int
+	ContributorLimit       int
+	RecentContributorLimit int
+}
+
+func normalizeDashboardSummaryOptions(options dashboardSummaryOptions) normalizedDashboardSummaryOptions {
+	return normalizedDashboardSummaryOptions{
+		WindowSeconds:          parseWindowSeconds(options.Window, 7*24*3600, 14*24*3600),
+		BucketSeconds:          parseBucketSeconds(options.Bucket, 3600),
+		LeaderboardWindow:      parseWindowSeconds(options.LeaderboardWindow, 24*3600, 7*24*3600),
+		LeaderboardLimit:       clampInt(options.LeaderboardLimit, 1, 10, 10),
+		RecentLimit:            clampInt(options.RecentLimit, 1, 10, 10),
+		ContributorLimit:       clampInt(options.ContributorLimit, 1, 10, 10),
+		RecentContributorLimit: clampInt(options.RecentContributorLimit, 1, 10, 10),
+	}
+}
+
 func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int64, options dashboardSummaryOptions) (map[string]any, error) {
-	leaderboardWindow := parseWindowSeconds(options.LeaderboardWindow, 24*3600, 7*24*3600)
-	leaderboardLimit := clampInt(options.LeaderboardLimit, 1, 10, 10)
-	recentLimit := clampInt(options.RecentLimit, 1, 10, 10)
-	contributorLimit := clampInt(options.ContributorLimit, 1, 10, 10)
-	recentContributorLimit := clampInt(options.RecentContributorLimit, 1, 10, 10)
-	windowSeconds := parseWindowSeconds(options.Window, 7*24*3600, 14*24*3600)
-	bucketSeconds := parseBucketSeconds(options.Bucket, 3600)
-
-	cacheKey := s.dashboardCacheKey(
-		"dashboard-summary",
-		&userID,
-		windowSeconds,
-		bucketSeconds,
-		leaderboardWindow,
-		leaderboardLimit,
-		recentLimit,
-		contributorLimit,
-		recentContributorLimit,
+	normalized := normalizeDashboardSummaryOptions(options)
+	startedAt := time.Now()
+	observedCtx, _ := withSQLMetrics(ctx)
+	var (
+		statsDuration              time.Duration
+		systemDuration             time.Duration
+		leaderboardDuration        time.Duration
+		recentDuration             time.Duration
+		contributorsDuration       time.Duration
+		recentContributorsDuration time.Duration
+		trendsDuration             time.Duration
+		loaderExecuted             bool
 	)
-	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() (map[string]any, error) {
-		stats, err := s.getDashboardStats(ctx, userID)
+
+	payload, err := runtimecache.CacheJSON(s.cache, s.dashboardSummaryCacheKey(userID, options), s.cfg.Cache.DashboardTTL, func() (map[string]any, error) {
+		loaderExecuted = true
+
+		stageStartedAt := time.Now()
+		stats, err := s.getDashboardStats(observedCtx, userID)
+		statsDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
 
-		system, err := s.getSystemStatus(ctx)
+		stageStartedAt = time.Now()
+		system, err := s.getSystemStatus(observedCtx)
+		systemDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
 
-		leaderboard, err := s.getLeaderboard(ctx, leaderboardWindow, leaderboardLimit)
+		stageStartedAt = time.Now()
+		leaderboard, err := s.getLeaderboard(observedCtx, normalized.LeaderboardWindow, normalized.LeaderboardLimit)
+		leaderboardDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
-		recentClaims, err := s.getRecentClaims(ctx, recentLimit)
+
+		stageStartedAt = time.Now()
+		recentClaims, err := s.getRecentClaims(observedCtx, normalized.RecentLimit)
+		recentDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
-		contributors, err := s.getContributorLeaderboard(ctx, contributorLimit)
+
+		stageStartedAt = time.Now()
+		contributors, err := s.getContributorLeaderboard(observedCtx, normalized.ContributorLimit)
+		contributorsDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
-		recentContributors, err := s.getRecentContributors(ctx, recentContributorLimit)
+
+		stageStartedAt = time.Now()
+		recentContributors, err := s.getRecentContributors(observedCtx, normalized.RecentContributorLimit)
+		recentContributorsDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
-		trends, err := s.getClaimTrends(ctx, windowSeconds, bucketSeconds)
+
+		stageStartedAt = time.Now()
+		trends, err := s.getClaimTrends(observedCtx, normalized.WindowSeconds, normalized.BucketSeconds)
+		trendsDuration = time.Since(stageStartedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -78,19 +115,36 @@ func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int
 			"contributors":        map[string]any{"items": contributors},
 			"recent_contributors": map[string]any{"items": recentContributors},
 			"trends": map[string]any{
-				"window": windowSeconds,
-				"bucket": bucketSeconds,
+				"window": normalized.WindowSeconds,
+				"bucket": normalized.BucketSeconds,
 				"series": trends,
 			},
 			"system": system,
 		}, nil
 	})
+
+	s.logger.Info(
+		"get dashboard summary",
+		"user_id", userID,
+		"cache_hit", !loaderExecuted,
+		"total_ms", durationMillis(time.Since(startedAt)),
+		"stats_ms", durationMillis(statsDuration),
+		"system_ms", durationMillis(systemDuration),
+		"leaderboard_ms", durationMillis(leaderboardDuration),
+		"recent_ms", durationMillis(recentDuration),
+		"contributors_ms", durationMillis(contributorsDuration),
+		"recent_contributors_ms", durationMillis(recentContributorsDuration),
+		"trends_ms", durationMillis(trendsDuration),
+		"sql_count", sqlCount(observedCtx),
+		"error", err,
+	)
+	return payload, err
 }
 
 func (s *Service) getLeaderboard(ctx context.Context, windowSeconds int, limit int) (map[string]any, error) {
 	cacheKey := s.dashboardCacheKey("dashboard-leaderboard", nil, windowSeconds, limit)
 	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() (map[string]any, error) {
-		rows, err := s.store.DB().QueryContext(ctx, `
+		rows, err := queryContextCounted(ctx, s.store.DB(), `
 			SELECT users.linuxdo_user_id,
 			       users.linuxdo_username,
 			       users.linuxdo_name,
@@ -139,7 +193,7 @@ func (s *Service) getLeaderboard(ctx context.Context, windowSeconds int, limit i
 func (s *Service) getRecentClaims(ctx context.Context, limit int) ([]map[string]any, error) {
 	cacheKey := s.dashboardCacheKey("dashboard-recent", nil, limit)
 	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() ([]map[string]any, error) {
-		rows, err := s.store.DB().QueryContext(ctx, `
+		rows, err := queryContextCounted(ctx, s.store.DB(), `
 			SELECT MIN(token_claims.id) AS first_claim_id,
 			       token_claims.request_id,
 			       MAX(token_claims.claimed_at_ts) AS claimed_at_ts,
@@ -189,7 +243,7 @@ func (s *Service) getRecentClaims(ctx context.Context, limit int) ([]map[string]
 func (s *Service) getContributorLeaderboard(ctx context.Context, limit int) ([]map[string]any, error) {
 	cacheKey := s.dashboardCacheKey("dashboard-contributors", nil, limit)
 	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() ([]map[string]any, error) {
-		rows, err := s.store.DB().QueryContext(ctx, `
+		rows, err := queryContextCounted(ctx, s.store.DB(), `
 			SELECT provider_user_id,
 			       provider_username,
 			       provider_name,
@@ -234,7 +288,7 @@ func (s *Service) getContributorLeaderboard(ctx context.Context, limit int) ([]m
 func (s *Service) getRecentContributors(ctx context.Context, limit int) ([]map[string]any, error) {
 	cacheKey := s.dashboardCacheKey("dashboard-recent-contributors", nil, limit)
 	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.DashboardTTL, func() ([]map[string]any, error) {
-		rows, err := s.store.DB().QueryContext(ctx, `
+		rows, err := queryContextCounted(ctx, s.store.DB(), `
 			SELECT provider_user_id,
 			       provider_username,
 			       provider_name,
@@ -291,7 +345,7 @@ func (s *Service) getClaimTrends(ctx context.Context, windowSeconds int, bucketS
 		startBucket := (startTS / int64(bucketSeconds)) * int64(bucketSeconds)
 		endBucket := (time.Now().Unix() / int64(bucketSeconds)) * int64(bucketSeconds)
 
-		rows, err := s.store.DB().QueryContext(ctx, `
+		rows, err := queryContextCounted(ctx, s.store.DB(), `
 			SELECT CAST(claimed_at_ts / ? AS INTEGER) * ? AS bucket_ts,
 			       COUNT(*) AS cnt
 			FROM token_claims

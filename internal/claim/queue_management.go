@@ -34,6 +34,7 @@ const (
 
 type queueAdvanceResult struct {
 	Changed bool
+	Claimed bool
 }
 
 type queueFailureResult struct {
@@ -74,8 +75,10 @@ func mapKeysInt64(values map[int64]struct{}) []int64 {
 }
 
 func (s *Service) afterQueueMutation(ctx context.Context, userIDs ...int64) {
-	s.invalidateAllRuntimeCache(nil, true)
+	s.invalidateQueueRuntimeCache()
+	s.invalidateDashboardQueueCache()
 	s.invalidateAdminQueueCache()
+	s.invalidateAdminCache()
 
 	seen := make(map[int64]struct{}, len(userIDs))
 	for _, userID := range userIDs {
@@ -86,16 +89,10 @@ func (s *Service) afterQueueMutation(ctx context.Context, userIDs ...int64) {
 			continue
 		}
 		seen[userID] = struct{}{}
-		s.invalidateUserCache(userID)
-		userIDCopy := userID
-		s.invalidateDashboardCache(&userIDCopy)
+		s.invalidateUserQueueCache(userID)
 	}
 
 	s.notifyQueueUsers(ctx, userIDs...)
-	for userID := range seen {
-		s.primeUserReadCaches(ctx, userID)
-	}
-	s.primeAdminDefaultReadCaches(ctx)
 }
 
 func (s *Service) isQueueEntryTimedOut(entry userQueueEntry, nowTS int64) bool {
@@ -311,7 +308,7 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 			)
 		}
 	}
-	return queueAdvanceResult{Changed: true}, nil
+	return queueAdvanceResult{Changed: true, Claimed: true}, nil
 }
 
 func (s *Service) recordQueueFailure(ctx context.Context, entry userQueueEntry, reason string) (queueFailureResult, error) {

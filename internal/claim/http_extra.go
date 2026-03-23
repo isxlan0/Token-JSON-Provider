@@ -192,7 +192,6 @@ func (s *Service) uploadTokens(c echo.Context) error {
 	if err != nil {
 		return mapDatabaseBusyError(c, err)
 	}
-	s.primeUserReadCaches(c.Request().Context(), requestContext.UserID)
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -324,7 +323,6 @@ func (s *Service) adminBanUser(c echo.Context) error {
 	s.invalidateUserCache(targetUser.ID)
 	s.invalidateUserQueueCache(targetUser.ID)
 	s.invalidateAdminCache()
-	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, map[string]any{"ok": true, "ban": ban})
 }
 
@@ -346,10 +344,8 @@ func (s *Service) adminUnbanUser(c echo.Context) error {
 		if targetUser != nil {
 			s.invalidateUserCache(targetUser.ID)
 			s.invalidateUserQueueCache(targetUser.ID)
-			s.primeUserReadCaches(c.Request().Context(), targetUser.ID)
 		}
 		s.invalidateAdminCache()
-		s.primeAdminDefaultReadCaches(c.Request().Context())
 	}
 	return c.JSON(http.StatusOK, map[string]any{"ok": changed})
 }
@@ -396,7 +392,6 @@ func (s *Service) adminRefreshQueue(c echo.Context) error {
 	if err != nil {
 		return mapDatabaseBusyError(c, err)
 	}
-	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -431,7 +426,6 @@ func (s *Service) adminCancelQueueEntry(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "Queue entry not found.")
 	}
 
-	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, map[string]any{
 		"ok":            true,
 		"queue_id":      entry.ID,
@@ -477,7 +471,6 @@ func (s *Service) adminCancelUserQueue(c echo.Context) error {
 		queueIDs = append(queueIDs, item.ID)
 	}
 
-	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, map[string]any{
 		"ok":            true,
 		"user_id":       targetUserID,
@@ -509,7 +502,6 @@ func (s *Service) adminSetTokenEnabled(c echo.Context, enabled bool) error {
 	if item == nil {
 		return echo.NewHTTPError(http.StatusNotFound, "Token not found.")
 	}
-	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, map[string]any{"ok": true, "item": item})
 }
 
@@ -526,7 +518,6 @@ func (s *Service) adminCleanupExhaustedTokens(c echo.Context) error {
 		return mapDatabaseBusyError(c, err)
 	}
 	result["ok"] = true
-	s.primeAdminDefaultReadCaches(c.Request().Context())
 	return c.JSON(http.StatusOK, result)
 }
 

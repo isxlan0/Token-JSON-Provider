@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -41,6 +42,8 @@ func TestInitCreatesSchemaAndIndexes(t *testing.T) {
 		"idx_token_claims_user_hidden_time",
 		"idx_token_claims_user_token_hidden_time",
 		"idx_token_claims_request_user_time",
+		"idx_token_claims_claimed_at",
+		"idx_token_claims_claimed_at_request_user",
 		"idx_user_token_claims_user",
 		"idx_claim_queue_status_time",
 		"idx_claim_queue_user_status_remaining_time",
@@ -136,6 +139,20 @@ func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 		}
 	}
 
+	inventoryColumns := tableColumnSet(t, store.DB(), "inventory_runtime")
+	for _, columnName := range []string{
+		"status",
+		"total_tokens",
+		"available_tokens",
+		"unclaimed_tokens",
+		"max_claims",
+		"updated_at_ts",
+	} {
+		if _, ok := inventoryColumns[columnName]; !ok {
+			t.Fatalf("missing migrated inventory_runtime column %s", columnName)
+		}
+	}
+
 	var (
 		accountID       string
 		accessTokenHash string
@@ -214,6 +231,70 @@ func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 	}
 }
 
+func TestDashboardTimeRangeQueriesUseClaimTimeIndexes(t *testing.T) {
+	store := openTempStore(t)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+
+	testCases := []struct {
+		name        string
+		query       string
+		args        []any
+		wantDetails []string
+	}{
+		{
+			name: "leaderboard",
+			query: `
+				SELECT users.linuxdo_user_id,
+				       users.linuxdo_username,
+				       users.linuxdo_name,
+				       COUNT(*) AS cnt
+				FROM token_claims
+				JOIN users ON users.id = token_claims.user_id
+				WHERE token_claims.claimed_at_ts >= ?
+				GROUP BY users.id, users.linuxdo_user_id, users.linuxdo_username, users.linuxdo_name
+				ORDER BY cnt DESC, users.linuxdo_username ASC, users.linuxdo_user_id ASC
+				LIMIT ?
+			`,
+			args: []any{0, 10},
+			wantDetails: []string{
+				"idx_token_claims_claimed_at",
+				"idx_token_claims_claimed_at_request_user",
+			},
+		},
+		{
+			name: "trends",
+			query: `
+				SELECT CAST(claimed_at_ts / ? AS INTEGER) * ? AS bucket_ts,
+				       COUNT(*) AS cnt
+				FROM token_claims
+				WHERE claimed_at_ts >= ?
+				GROUP BY bucket_ts
+				ORDER BY bucket_ts ASC
+			`,
+			args: []any{3600, 3600, 0},
+			wantDetails: []string{
+				"idx_token_claims_claimed_at",
+				"idx_token_claims_claimed_at_request_user",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			details := sqliteQueryPlanDetails(t, store.DB(), tc.query, tc.args...)
+			if !queryPlanContainsAny(details, tc.wantDetails...) {
+				t.Fatalf("query plan for %s did not mention expected indexes; details=%v", tc.name, details)
+			}
+		})
+	}
+}
+
 func openTempStore(t *testing.T) *Store {
 	t.Helper()
 
@@ -280,6 +361,46 @@ func tableColumnSet(t *testing.T, db *sql.DB, tableName string) map[string]struc
 	}
 
 	return columns
+}
+
+func sqliteQueryPlanDetails(t *testing.T, db *sql.DB, query string, args ...any) []string {
+	t.Helper()
+
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+query, args...)
+	if err != nil {
+		t.Fatalf("explain query plan: %v", err)
+	}
+	defer rows.Close()
+
+	details := make([]string, 0)
+	for rows.Next() {
+		var (
+			id     int
+			parent int
+			unused int
+			detail string
+		)
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan query plan row: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate query plan rows: %v", err)
+	}
+	return details
+}
+
+func queryPlanContainsAny(details []string, wantDetails ...string) bool {
+	for _, detail := range details {
+		lowerDetail := strings.ToLower(detail)
+		for _, want := range wantDetails {
+			if strings.Contains(lowerDetail, strings.ToLower(want)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func createLegacySchema(t *testing.T, db *sql.DB) {

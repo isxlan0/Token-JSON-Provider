@@ -413,13 +413,12 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 					RecordEvent: true,
 				})
 				resultItem["token_id"] = created.TokenID
-				userIDCopy := task.UserID
-				s.invalidateUserCache(task.UserID)
-				s.invalidateDashboardCache(&userIDCopy)
+				s.invalidateDashboardUploadCaches()
 				s.invalidateAdminCache()
+				s.invalidateInventoryCache()
 				s.notifyQueueUsers(ctx, task.UserID)
 				s.wakeQueuePump()
-				s.primeUserReadCaches(ctx, task.UserID)
+				s.invalidateUserUploadResultsCache(task.UserID)
 			}
 		}
 	}

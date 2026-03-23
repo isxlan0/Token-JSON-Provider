@@ -58,7 +58,9 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 	}
 
 	if imported > 0 || deactivated > 0 {
-		s.invalidateAllRuntimeCache(nil, true)
+		s.invalidateInventoryCache()
+		s.invalidateDashboardUploadCaches()
+		s.invalidateAdminCache()
 		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
@@ -221,7 +223,9 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 		return false, err
 	}
 	if changed {
-		s.invalidateAllRuntimeCache(nil, true)
+		s.invalidateInventoryCache()
+		s.invalidateDashboardUploadCaches()
+		s.invalidateAdminCache()
 		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
@@ -275,7 +279,9 @@ func (s *Service) deactivateTokenFile(ctx context.Context, fileName string) (boo
 		return false, err
 	}
 	if affected > 0 {
-		s.invalidateAllRuntimeCache(nil, true)
+		s.invalidateInventoryCache()
+		s.invalidateDashboardUploadCaches()
+		s.invalidateAdminCache()
 		s.notifyQueueUsers(ctx)
 	}
 	return affected > 0, nil

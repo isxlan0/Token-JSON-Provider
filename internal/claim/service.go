@@ -101,6 +101,15 @@ type inventoryPolicy struct {
 	NonHealthyMaxClaimsScope string
 }
 
+type inventoryRuntimeState struct {
+	Status      string
+	Total       int
+	Available   int
+	Unclaimed   int
+	MaxClaims   int
+	UpdatedAtTS int64
+}
+
 type quotaUsage struct {
 	Used      int `json:"used"`
 	Limit     int `json:"limit"`
@@ -160,6 +169,7 @@ type queueStatusPayload struct {
 	TotalQueued     int    `json:"total_queued"`
 	AvailableTokens int    `json:"available_tokens"`
 	ClaimableNow    int    `json:"claimable_now"`
+	Degraded        bool   `json:"degraded,omitempty"`
 }
 
 type userQueueEntry struct {
@@ -213,10 +223,13 @@ type profilePayload struct {
 }
 
 type runtimeSnapshotPayload struct {
+	User          *profileUserPayload             `json:"user,omitempty"`
 	Quota         quotaUsage                      `json:"quota"`
 	Claims        map[string]int                  `json:"claims"`
 	APIKeys       map[string]apiKeySummaryPayload `json:"api_keys"`
+	Uploads       map[string]int                  `json:"uploads,omitempty"`
 	UploadResults map[string]any                  `json:"upload_results"`
+	Degraded      bool                            `json:"degraded,omitempty"`
 }
 
 func NewService(cfg config.Config, store *database.Store, authService *auth.Service, cache *runtimecache.AppCache, logger *slog.Logger) *Service {
@@ -422,11 +435,8 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 	}
 
 	if initial.Queued != nil {
-		userIDCopy := userID
-		s.invalidateDashboardCache(&userIDCopy)
-		s.notifyQueueUsers(ctx, userID)
+		s.afterQueueMutation(ctx, userID)
 		s.wakeQueuePump()
-		s.primeUserReadCaches(ctx, userID)
 		return initial.Queued, nil
 	}
 
@@ -460,11 +470,8 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 		if err != nil {
 			return nil, err
 		}
-		userIDCopy := userID
-		s.invalidateDashboardCache(&userIDCopy)
-		s.notifyQueueUsers(ctx, userID)
+		s.afterQueueMutation(ctx, userID)
 		s.wakeQueuePump()
-		s.primeUserReadCaches(ctx, userID)
 		return queued, nil
 	}
 
@@ -481,12 +488,12 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 			Remaining: maxInt(0, initial.Limit-usedAfter),
 		},
 	}
-	userIDCopy := userID
-	s.invalidateUserCache(userID)
-	s.invalidateDashboardCache(&userIDCopy)
+	s.invalidateUserQuotaCache(userID)
+	s.invalidateUserClaimsCache(userID)
+	s.invalidateInventoryCache()
+	s.invalidateDashboardClaimCaches()
 	s.invalidateAdminCache()
 	s.notifyQueueUsers(ctx, userID)
-	s.primeUserReadCaches(ctx, userID)
 	return result, nil
 }
 
@@ -508,6 +515,7 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 	}
 
 	affectedUsers := make(map[int64]struct{}, len(queueRows))
+	claimedUsers := make(map[int64]struct{}, len(queueRows))
 	for _, row := range queueRows {
 		result, err := s.advanceQueueRow(ctx, row, policy)
 		if err != nil {
@@ -557,11 +565,22 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 		}
 		if result.Changed {
 			affectedUsers[row.UserID] = struct{}{}
+			if result.Claimed {
+				claimedUsers[row.UserID] = struct{}{}
+			}
 		}
 	}
 
 	if len(affectedUsers) > 0 {
 		s.afterQueueMutation(ctx, mapKeysInt64(affectedUsers)...)
+	}
+	if len(claimedUsers) > 0 {
+		for userID := range claimedUsers {
+			s.invalidateUserQuotaCache(userID)
+			s.invalidateUserClaimsCache(userID)
+		}
+		s.invalidateInventoryCache()
+		s.invalidateDashboardClaimCaches()
 	}
 	return nil
 }
@@ -620,106 +639,282 @@ func (s *Service) GetAPIKeySummary(ctx context.Context, userID int64) (apiKeySum
 }
 
 func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestContext) (profilePayload, error) {
-	return runtimecache.CacheJSON(s.cache, s.userProfileCacheKey(requestContext.UserID, requestContext.IsAdmin), s.cfg.Cache.MeTTL, func() (profilePayload, error) {
-		quota, err := s.GetQuotaUsage(ctx, requestContext.UserID)
-		if err != nil {
-			return profilePayload{}, err
-		}
+	startedAt := time.Now()
+	observedCtx, _ := withSQLMetrics(ctx)
+	var (
+		quotaDuration   time.Duration
+		claimsDuration  time.Duration
+		apiKeysDuration time.Duration
+		loaderExecuted  bool
+	)
 
-		claims, err := s.GetUserClaimTotals(ctx, requestContext.UserID)
-		if err != nil {
-			return profilePayload{}, err
-		}
+	payload, err := runtimecache.CacheJSON(
+		s.cache,
+		s.userProfileCacheKey(requestContext.UserID, requestContext.IsAdmin),
+		s.cfg.Cache.MeTTL,
+		func() (profilePayload, error) {
+			loaderExecuted = true
 
-		apiKeys, err := s.GetAPIKeySummary(ctx, requestContext.UserID)
-		if err != nil {
-			return profilePayload{}, err
-		}
+			stageStartedAt := time.Now()
+			quota, err := s.GetQuotaUsage(observedCtx, requestContext.UserID)
+			quotaDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return profilePayload{}, err
+			}
 
-		return profilePayload{
-			User: profileUserPayload{
-				ID:         requestContext.User.ID,
-				Username:   requestContext.User.Username,
-				Name:       requestContext.User.Name,
-				TrustLevel: requestContext.User.TrustLevel,
-				IsAdmin:    requestContext.User.IsAdmin,
-				IsBanned:   false,
-			},
-			Quota:   quota,
-			Claims:  claims,
-			APIKeys: apiKeys,
-			Uploads: map[string]int{
-				"max_files_per_request": s.cfg.Upload.MaxFilesPerRequest,
-				"max_file_size_bytes":   s.cfg.Upload.MaxFileSizeBytes,
-				"max_success_per_hour":  s.cfg.Upload.MaxSuccessPerHour,
-				"min_trust_level":       s.cfg.LinuxDO.MinTrustLevel,
-			},
-		}, nil
-	})
+			stageStartedAt = time.Now()
+			claims, err := s.GetUserClaimTotals(observedCtx, requestContext.UserID)
+			claimsDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return profilePayload{}, err
+			}
+
+			stageStartedAt = time.Now()
+			apiKeys, err := s.GetAPIKeySummary(observedCtx, requestContext.UserID)
+			apiKeysDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return profilePayload{}, err
+			}
+
+			return profilePayload{
+				User: profileUserPayload{
+					ID:         requestContext.User.ID,
+					Username:   requestContext.User.Username,
+					Name:       requestContext.User.Name,
+					TrustLevel: requestContext.User.TrustLevel,
+					IsAdmin:    requestContext.User.IsAdmin,
+					IsBanned:   false,
+				},
+				Quota:   quota,
+				Claims:  claims,
+				APIKeys: apiKeys,
+				Uploads: map[string]int{
+					"max_files_per_request": s.cfg.Upload.MaxFilesPerRequest,
+					"max_file_size_bytes":   s.cfg.Upload.MaxFileSizeBytes,
+					"max_success_per_hour":  s.cfg.Upload.MaxSuccessPerHour,
+					"min_trust_level":       s.cfg.LinuxDO.MinTrustLevel,
+				},
+			}, nil
+		},
+	)
+
+	s.logger.Info(
+		"get profile",
+		"user_id", requestContext.UserID,
+		"cache_hit", !loaderExecuted,
+		"total_ms", durationMillis(time.Since(startedAt)),
+		"quota_ms", durationMillis(quotaDuration),
+		"claims_ms", durationMillis(claimsDuration),
+		"api_keys_ms", durationMillis(apiKeysDuration),
+		"sql_count", sqlCount(observedCtx),
+		"error", err,
+	)
+	return payload, err
 }
 
 func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtimeSnapshotPayload, error) {
-	return runtimecache.CacheJSON(s.cache, s.userRuntimeSnapshotCacheKey(userID), s.cfg.Cache.MeTTL, func() (runtimeSnapshotPayload, error) {
-		quota, err := s.GetQuotaUsage(ctx, userID)
-		if err != nil {
-			return runtimeSnapshotPayload{}, err
-		}
+	startedAt := time.Now()
+	observedCtx, _ := withSQLMetrics(ctx)
+	var (
+		quotaDuration         time.Duration
+		claimsDuration        time.Duration
+		apiKeysDuration       time.Duration
+		uploadResultsDuration time.Duration
+		loaderExecuted        bool
+	)
 
-		claims, err := s.GetUserClaimTotals(ctx, userID)
-		if err != nil {
-			return runtimeSnapshotPayload{}, err
-		}
+	payload, err := runtimecache.CacheJSON(
+		s.cache,
+		s.userRuntimeSnapshotCacheKey(userID),
+		s.cfg.Cache.MeTTL,
+		func() (runtimeSnapshotPayload, error) {
+			loaderExecuted = true
 
-		apiKeys, err := s.GetAPIKeySummary(ctx, userID)
-		if err != nil {
-			return runtimeSnapshotPayload{}, err
-		}
+			stageStartedAt := time.Now()
+			quota, err := s.GetQuotaUsage(observedCtx, userID)
+			quotaDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return runtimeSnapshotPayload{}, err
+			}
 
-		return runtimeSnapshotPayload{
-			Quota:  quota,
-			Claims: claims,
-			APIKeys: map[string]apiKeySummaryPayload{
-				"summary": apiKeys,
-			},
-			UploadResults: buildUploadResultsSummaryPayload(s.GetUploadResults(userID)),
-		}, nil
-	})
+			stageStartedAt = time.Now()
+			claims, err := s.GetUserClaimTotals(observedCtx, userID)
+			claimsDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return runtimeSnapshotPayload{}, err
+			}
+
+			stageStartedAt = time.Now()
+			apiKeys, err := s.GetAPIKeySummary(observedCtx, userID)
+			apiKeysDuration = time.Since(stageStartedAt)
+			if err != nil {
+				return runtimeSnapshotPayload{}, err
+			}
+
+			stageStartedAt = time.Now()
+			uploadResults := buildUploadResultsSummaryPayload(s.GetUploadResults(userID))
+			uploadResultsDuration = time.Since(stageStartedAt)
+
+			return runtimeSnapshotPayload{
+				Quota:  quota,
+				Claims: claims,
+				APIKeys: map[string]apiKeySummaryPayload{
+					"summary": apiKeys,
+				},
+				Uploads: map[string]int{
+					"max_files_per_request": s.cfg.Upload.MaxFilesPerRequest,
+					"max_file_size_bytes":   s.cfg.Upload.MaxFileSizeBytes,
+					"max_success_per_hour":  s.cfg.Upload.MaxSuccessPerHour,
+					"min_trust_level":       s.cfg.LinuxDO.MinTrustLevel,
+				},
+				UploadResults: uploadResults,
+			}, nil
+		},
+	)
+
+	s.logger.Info(
+		"get runtime snapshot",
+		"user_id", userID,
+		"cache_hit", !loaderExecuted,
+		"total_ms", durationMillis(time.Since(startedAt)),
+		"quota_ms", durationMillis(quotaDuration),
+		"claims_ms", durationMillis(claimsDuration),
+		"api_keys_ms", durationMillis(apiKeysDuration),
+		"upload_results_ms", durationMillis(uploadResultsDuration),
+		"sql_count", sqlCount(observedCtx),
+		"error", err,
+	)
+	return payload, err
 }
 
 func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatusPayload, error) {
+	startedAt := time.Now()
+	observedCtx, _ := withSQLMetrics(ctx)
 	if payload, ok := s.getCachedQueueStatus(userID); ok {
+		s.logger.Info(
+			"get queue status",
+			"user_id", userID,
+			"cache_hit", true,
+			"total_ms", durationMillis(time.Since(startedAt)),
+			"entry_ms", int64(0),
+			"queue_total_ms", int64(0),
+			"inventory_ms", int64(0),
+			"claimable_ms", int64(0),
+			"sql_count", sqlCount(observedCtx),
+		)
 		return payload, nil
 	}
-	payload, err := s.loadQueueStatusSnapshot(ctx, userID)
+
+	var (
+		entryDuration      time.Duration
+		queueTotalDuration time.Duration
+		inventoryDuration  time.Duration
+		claimableDuration  time.Duration
+	)
+
+	payload, err := s.loadQueueStatusSnapshotWithTimings(
+		observedCtx,
+		userID,
+		&entryDuration,
+		&queueTotalDuration,
+		&inventoryDuration,
+		&claimableDuration,
+	)
 	if err != nil {
+		s.logger.Info(
+			"get queue status",
+			"user_id", userID,
+			"cache_hit", false,
+			"total_ms", durationMillis(time.Since(startedAt)),
+			"entry_ms", durationMillis(entryDuration),
+			"queue_total_ms", durationMillis(queueTotalDuration),
+			"inventory_ms", durationMillis(inventoryDuration),
+			"claimable_ms", durationMillis(claimableDuration),
+			"sql_count", sqlCount(observedCtx),
+			"error", err,
+		)
 		return queueStatusPayload{}, err
 	}
-	return s.setQueueStatusSnapshot(userID, payload), nil
+
+	payload = s.setQueueStatusSnapshot(userID, payload)
+	s.logger.Info(
+		"get queue status",
+		"user_id", userID,
+		"cache_hit", false,
+		"total_ms", durationMillis(time.Since(startedAt)),
+		"entry_ms", durationMillis(entryDuration),
+		"queue_total_ms", durationMillis(queueTotalDuration),
+		"inventory_ms", durationMillis(inventoryDuration),
+		"claimable_ms", durationMillis(claimableDuration),
+		"sql_count", sqlCount(observedCtx),
+	)
+	return payload, nil
 }
 
 func (s *Service) loadQueueStatusSnapshot(ctx context.Context, userID int64) (queueStatusPayload, error) {
+	return s.loadQueueStatusSnapshotWithTimings(ctx, userID, nil, nil, nil, nil)
+}
+
+func (s *Service) loadQueueStatusSnapshotWithTimings(
+	ctx context.Context,
+	userID int64,
+	entryDuration *time.Duration,
+	queueTotalDuration *time.Duration,
+	inventoryDuration *time.Duration,
+	claimableDuration *time.Duration,
+) (queueStatusPayload, error) {
+	stageStartedAt := time.Now()
 	entry, err := s.getUserQueueEntry(ctx, userID)
+	if entryDuration != nil {
+		*entryDuration = time.Since(stageStartedAt)
+	}
 	if err != nil {
 		return queueStatusPayload{}, err
 	}
 
+	stageStartedAt = time.Now()
 	totalQueued, err := s.getTotalQueued(ctx, s.store.DB())
+	if queueTotalDuration != nil {
+		*queueTotalDuration = time.Since(stageStartedAt)
+	}
 	if err != nil {
 		return queueStatusPayload{}, err
 	}
 
-	snapshot, err := s.getInventorySnapshot(ctx, s.store.DB())
+	stageStartedAt = time.Now()
+	runtimeState, runtimeExists, err := s.getInventoryRuntimeState(ctx, s.store.DB())
+	if inventoryDuration != nil {
+		*inventoryDuration = time.Since(stageStartedAt)
+	}
 	if err != nil {
 		return queueStatusPayload{}, err
 	}
 
+	availableTokens := 0
+	if runtimeExists {
+		availableTokens = runtimeState.Available
+	} else {
+		stageStartedAt = time.Now()
+		snapshot, snapshotErr := s.getInventorySnapshot(ctx, s.store.DB())
+		if inventoryDuration != nil {
+			*inventoryDuration += time.Since(stageStartedAt)
+		}
+		if snapshotErr != nil {
+			return queueStatusPayload{}, snapshotErr
+		}
+		availableTokens = snapshot["available"]
+	}
+
+	stageStartedAt = time.Now()
 	claimableNow, err := s.countClaimableTokensForUser(ctx, s.store.DB(), userID)
+	if claimableDuration != nil {
+		*claimableDuration = time.Since(stageStartedAt)
+	}
 	if err != nil {
 		return queueStatusPayload{}, err
 	}
 
-	payload := buildQueueStatusPayload(entry, totalQueued, snapshot["available"], claimableNow)
-	return s.setQueueStatusSnapshot(userID, payload), nil
+	return buildQueueStatusPayload(entry, totalQueued, availableTokens, claimableNow), nil
 }
 
 func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTokens int, claimableNow int) queueStatusPayload {
@@ -861,12 +1056,16 @@ func (s *Service) GetDashboardSummary(ctx context.Context, userID int64, window 
 
 func (s *Service) getSystemStatus(ctx context.Context) (map[string]any, error) {
 	return runtimecache.CacheJSON(s.cache, s.dashboardCacheKey("dashboard-system", nil), s.cfg.Cache.DashboardTTL, func() (map[string]any, error) {
-		snapshot, err := s.getInventorySnapshot(ctx, s.store.DB())
+		snapshot, runtimeState, runtimeExists, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
 		if err != nil {
 			return nil, err
 		}
 
 		policy := s.buildInventoryPolicy(snapshot)
+		if runtimeExists {
+			policy.Status = runtimeState.Status
+			policy.MaxClaims = runtimeState.MaxClaims
+		}
 		totalQueued, err := s.getTotalQueued(ctx, s.store.DB())
 		if err != nil {
 			return nil, err
@@ -904,39 +1103,12 @@ func (s *Service) touchSystemIndexTimestamp() {
 
 func (s *Service) getDashboardStats(ctx context.Context, userID int64) (map[string]int, error) {
 	return runtimecache.CacheJSON(s.cache, s.dashboardCacheKey("dashboard-stats", &userID), s.cfg.Cache.DashboardTTL, func() (map[string]int, error) {
-		totalTokens, err := queryCount(ctx, s.store.DB(), `
-			SELECT COUNT(*)
-			FROM tokens
-			WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0
-		`)
-		if err != nil {
-			return nil, err
-		}
-
-		availableTokens, err := queryCount(ctx, s.store.DB(), `
-			SELECT COALESCE(SUM(
-				CASE
-					WHEN claim_count < max_claims THEN max_claims - claim_count
-					ELSE 0
-				END
-			), 0)
-			FROM tokens
-			WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0
-		`)
+		snapshot, _, _, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
 		if err != nil {
 			return nil, err
 		}
 
 		claimedTotal, err := queryCount(ctx, s.store.DB(), `SELECT COUNT(*) FROM token_claims`)
-		if err != nil {
-			return nil, err
-		}
-
-		claimedUnique, err := queryCount(ctx, s.store.DB(), `
-			SELECT COUNT(*)
-			FROM tokens
-			WHERE is_active = 1 AND is_enabled = 1 AND is_banned = 0 AND claim_count > 0
-		`)
 		if err != nil {
 			return nil, err
 		}
@@ -952,10 +1124,10 @@ func (s *Service) getDashboardStats(ctx context.Context, userID int64) (map[stri
 		}
 
 		return map[string]int{
-			"total_tokens":          totalTokens,
-			"available_tokens":      availableTokens,
+			"total_tokens":          snapshot["total"],
+			"available_tokens":      snapshot["available"],
 			"claimed_total":         claimedTotal,
-			"claimed_unique":        claimedUnique,
+			"claimed_unique":        maxInt(0, snapshot["total"]-snapshot["unclaimed"]),
 			"others_claimed_total":  othersClaimedTotal,
 			"others_claimed_unique": othersClaimedUnique,
 		}, nil
@@ -1155,7 +1327,7 @@ func (s *Service) ensureInventoryPolicyTx(ctx context.Context, tx *sql.Tx, refre
 	}
 
 	policy := s.buildInventoryPolicy(snapshot)
-	runtimeStatus, runtimeMaxClaims, runtimeExists, err := s.getRuntimePolicyState(ctx, tx)
+	runtimeState, runtimeExists, err := s.getInventoryRuntimeState(ctx, tx)
 	if err != nil {
 		return inventoryPolicy{}, err
 	}
@@ -1197,8 +1369,9 @@ func (s *Service) ensureInventoryPolicyTx(ctx context.Context, tx *sql.Tx, refre
 		return nil
 	}
 
-	if !runtimeExists || runtimeStatus != policy.Status || runtimeMaxClaims != policy.MaxClaims {
-		now := time.Now().Unix()
+	now := time.Now().Unix()
+	tokensChanged := false
+	if !runtimeExists || runtimeState.Status != policy.Status || runtimeState.MaxClaims != policy.MaxClaims {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE tokens
 			SET max_claims = ?,
@@ -1212,24 +1385,47 @@ func (s *Service) ensureInventoryPolicyTx(ctx context.Context, tx *sql.Tx, refre
 		if err := applyNonHealthyScope(now); err != nil {
 			return inventoryPolicy{}, err
 		}
-
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO inventory_runtime (id, status, max_claims, updated_at_ts)
-			VALUES (1, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				status = excluded.status,
-				max_claims = excluded.max_claims,
-				updated_at_ts = excluded.updated_at_ts
-		`, policy.Status, policy.MaxClaims, now); err != nil {
-			return inventoryPolicy{}, fmt.Errorf("upsert inventory runtime: %w", err)
-		}
+		tokensChanged = true
 	} else if refreshExistingScope {
 		if err := applyNonHealthyScope(time.Now().Unix()); err != nil {
+			return inventoryPolicy{}, err
+		}
+		tokensChanged = true
+	}
+
+	finalSnapshot := snapshot
+	if tokensChanged {
+		finalSnapshot, err = s.getInventorySnapshot(ctx, tx)
+		if err != nil {
+			return inventoryPolicy{}, err
+		}
+	}
+
+	if !runtimeExists ||
+		runtimeState.Status != policy.Status ||
+		runtimeState.MaxClaims != policy.MaxClaims ||
+		runtimeState.Total != finalSnapshot["total"] ||
+		runtimeState.Available != finalSnapshot["available"] ||
+		runtimeState.Unclaimed != finalSnapshot["unclaimed"] {
+		if err := s.upsertInventoryRuntimeState(ctx, tx, finalSnapshot, policy.Status, policy.MaxClaims, now); err != nil {
 			return inventoryPolicy{}, err
 		}
 	}
 
 	return policy, nil
+}
+
+func (s *Service) refreshInventoryRuntimeTx(ctx context.Context, tx *sql.Tx) error {
+	snapshot, err := s.getInventorySnapshot(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	policy := s.buildInventoryPolicy(snapshot)
+	if err := s.upsertInventoryRuntimeState(ctx, tx, snapshot, policy.Status, policy.MaxClaims, time.Now().Unix()); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Service) buildInventoryPolicy(snapshot map[string]int) inventoryPolicy {
@@ -1260,11 +1456,16 @@ func (s *Service) buildInventoryPolicy(snapshot map[string]int) inventoryPolicy 
 }
 
 func (s *Service) getInventoryPolicy(ctx context.Context) (inventoryPolicy, error) {
-	snapshot, err := s.getInventorySnapshot(ctx, s.store.DB())
+	snapshot, runtimeState, runtimeExists, err := s.loadInventorySnapshotForRead(ctx, s.store.DB())
 	if err != nil {
 		return inventoryPolicy{}, err
 	}
-	return s.buildInventoryPolicy(snapshot), nil
+	policy := s.buildInventoryPolicy(snapshot)
+	if runtimeExists {
+		policy.Status = runtimeState.Status
+		policy.MaxClaims = runtimeState.MaxClaims
+	}
+	return policy, nil
 }
 
 func (s *Service) resolveInventoryStatus(unclaimed int) string {
@@ -1317,25 +1518,79 @@ func (s *Service) getInventorySnapshot(ctx context.Context, queryer sqlQueryer) 
 	}, nil
 }
 
-func (s *Service) getRuntimePolicyState(ctx context.Context, queryer sqlQueryer) (string, int, bool, error) {
-	row := queryer.QueryRowContext(ctx, `
-		SELECT status, max_claims
+func (s *Service) loadInventorySnapshotForRead(ctx context.Context, queryer sqlQueryer) (map[string]int, inventoryRuntimeState, bool, error) {
+	runtimeState, runtimeExists, err := s.getInventoryRuntimeState(ctx, queryer)
+	if err != nil {
+		return nil, inventoryRuntimeState{}, false, err
+	}
+	if runtimeExists {
+		return map[string]int{
+			"total":     runtimeState.Total,
+			"available": runtimeState.Available,
+			"unclaimed": runtimeState.Unclaimed,
+		}, runtimeState, true, nil
+	}
+
+	snapshot, err := s.getInventorySnapshot(ctx, queryer)
+	if err != nil {
+		return nil, inventoryRuntimeState{}, false, err
+	}
+	return snapshot, inventoryRuntimeState{}, false, nil
+}
+
+func (s *Service) upsertInventoryRuntimeState(ctx context.Context, queryer sqlQueryer, snapshot map[string]int, status string, maxClaims int, updatedAtTS int64) error {
+	if _, err := execContextCounted(ctx, queryer, `
+		INSERT INTO inventory_runtime (
+			id,
+			status,
+			total_tokens,
+			available_tokens,
+			unclaimed_tokens,
+			max_claims,
+			updated_at_ts
+		)
+		VALUES (1, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			total_tokens = excluded.total_tokens,
+			available_tokens = excluded.available_tokens,
+			unclaimed_tokens = excluded.unclaimed_tokens,
+			max_claims = excluded.max_claims,
+			updated_at_ts = excluded.updated_at_ts
+	`, status, snapshot["total"], snapshot["available"], snapshot["unclaimed"], maxClaims, updatedAtTS); err != nil {
+		return fmt.Errorf("upsert inventory runtime: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) getInventoryRuntimeState(ctx context.Context, queryer sqlQueryer) (inventoryRuntimeState, bool, error) {
+	row := queryRowContextCounted(ctx, queryer, `
+		SELECT status,
+		       total_tokens,
+		       available_tokens,
+		       unclaimed_tokens,
+		       max_claims,
+		       updated_at_ts
 		FROM inventory_runtime
 		WHERE id = 1
 	`)
 
-	var (
-		status    string
-		maxClaims int
-	)
-	if err := row.Scan(&status, &maxClaims); err != nil {
+	var state inventoryRuntimeState
+	if err := row.Scan(
+		&state.Status,
+		&state.Total,
+		&state.Available,
+		&state.Unclaimed,
+		&state.MaxClaims,
+		&state.UpdatedAtTS,
+	); err != nil {
 		if err == sql.ErrNoRows {
-			return "", 0, false, nil
+			return inventoryRuntimeState{}, false, nil
 		}
-		return "", 0, false, fmt.Errorf("load inventory runtime: %w", err)
+		return inventoryRuntimeState{}, false, fmt.Errorf("load inventory runtime: %w", err)
 	}
 
-	return status, maxClaims, true, nil
+	return state, true, nil
 }
 
 func (s *Service) hasPendingQueueTx(ctx context.Context, tx *sql.Tx) (bool, error) {
@@ -1423,7 +1678,7 @@ func (s *Service) getUserQueueEntryTx(ctx context.Context, tx *sql.Tx, userID in
 }
 
 func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer, userID int64) (*userQueueEntry, error) {
-	row := queryer.QueryRowContext(ctx, `
+	row := queryRowContextCounted(ctx, queryer, `
 		SELECT id,
 		       user_id,
 		       api_key_id,
@@ -1473,11 +1728,20 @@ func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer,
 }
 
 func (s *Service) getTotalQueued(ctx context.Context, queryer sqlQueryer) (int, error) {
-	return queryCount(ctx, queryer, `
-		SELECT COUNT(*)
-		FROM claim_queue
-		WHERE status = 'queued' AND remaining > 0
+	row := queryRowContextCounted(ctx, queryer, `
+		SELECT total_queued
+		FROM queue_runtime
+		WHERE id = 1
 	`)
+
+	var totalQueued int
+	if err := row.Scan(&totalQueued); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("load queue runtime: %w", err)
+	}
+	return totalQueued, nil
 }
 
 func (s *Service) remainingHourlyQuota(ctx context.Context, userID int64, limit int) (int, error) {
@@ -1558,7 +1822,7 @@ func withTx[T any](ctx context.Context, db *sql.DB, fn func(*sql.Tx) (T, error))
 
 func queryCount(ctx context.Context, queryer sqlQueryer, query string, args ...any) (int, error) {
 	var count int
-	if err := queryer.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := queryRowContextCounted(ctx, queryer, query, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("query count: %w", err)
 	}
 	return count, nil

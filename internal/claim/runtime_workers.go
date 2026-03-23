@@ -271,8 +271,5 @@ func (s *Service) applyHideClaims(ctx context.Context, userID int64, claimIDs []
 	}
 
 	s.invalidateUserClaimsCache(userID)
-	s.invalidateUserProfileCache(userID)
-	userIDCopy := userID
-	s.invalidateDashboardCache(&userIDCopy)
 	return nil
 }

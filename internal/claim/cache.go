@@ -32,14 +32,36 @@ func (s *Service) dashboardCacheKey(prefix string, userID *int64, parts ...any) 
 		return runtimecache.BuildCacheKey(prefix, arguments...)
 	}
 
-	dashboardVersion := s.cache.ScopeVersion("dashboard")
+	dashboardVersion := s.cache.ScopeVersion(prefix)
 	arguments := []any{fmt.Sprintf("v%d", dashboardVersion)}
 	if userID != nil {
-		userVersion := s.cache.ScopeVersion("dashboard-user", *userID)
-		arguments = append([]any{*userID, fmt.Sprintf("uv%d", userVersion)}, arguments...)
+		arguments = append([]any{*userID}, arguments...)
 	}
 	arguments = append(arguments, parts...)
 	return runtimecache.BuildCacheKey(prefix, arguments...)
+}
+
+func (s *Service) dashboardSummaryCacheKey(userID int64, options dashboardSummaryOptions) string {
+	normalized := normalizeDashboardSummaryOptions(options)
+	return s.snapshotCacheKey(
+		"dashboard-summary",
+		userID,
+		normalized.WindowSeconds,
+		normalized.BucketSeconds,
+		normalized.LeaderboardWindow,
+		normalized.LeaderboardLimit,
+		normalized.RecentLimit,
+		normalized.ContributorLimit,
+		normalized.RecentContributorLimit,
+		fmt.Sprintf("sumv%d", s.cacheScopeVersion("dashboard-summary")),
+		fmt.Sprintf("sv%d", s.cacheScopeVersion("dashboard-stats")),
+		fmt.Sprintf("sysv%d", s.cacheScopeVersion("dashboard-system")),
+		fmt.Sprintf("lbv%d", s.cacheScopeVersion("dashboard-leaderboard")),
+		fmt.Sprintf("rv%d", s.cacheScopeVersion("dashboard-recent")),
+		fmt.Sprintf("cv%d", s.cacheScopeVersion("dashboard-contributors")),
+		fmt.Sprintf("rcv%d", s.cacheScopeVersion("dashboard-recent-contributors")),
+		fmt.Sprintf("tv%d", s.cacheScopeVersion("dashboard-trends")),
+	)
 }
 
 func (s *Service) adminCacheKey(prefix string, parts ...any) string {
@@ -94,7 +116,13 @@ func (s *Service) userClaimRealtimeCacheKey(userID int64) string {
 }
 
 func (s *Service) userQueueCacheKey(userID int64) string {
-	return s.snapshotCacheKey("user-queue", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-queue", userID)))
+	return s.snapshotCacheKey(
+		"user-queue",
+		userID,
+		fmt.Sprintf("uv%d", s.cacheScopeVersion("user-queue", userID)),
+		fmt.Sprintf("qv%d", s.cacheScopeVersion("queue-runtime")),
+		fmt.Sprintf("iv%d", s.cacheScopeVersion("inventory")),
+	)
 }
 
 func (s *Service) userUploadResultsCacheKey(userID int64) string {
@@ -107,8 +135,6 @@ func (s *Service) userBootstrapCacheKey(userID int64, isAdmin bool) string {
 		userID,
 		boolToFlag(isAdmin),
 		fmt.Sprintf("pv%d", s.cacheScopeVersion("user-profile", userID)),
-		fmt.Sprintf("dv%d", s.cacheScopeVersion("dashboard")),
-		fmt.Sprintf("duv%d", s.cacheScopeVersion("dashboard-user", userID)),
 		fmt.Sprintf("crv%d", s.cacheScopeVersion("user-claim-realtime", userID)),
 		fmt.Sprintf("qv%d", s.cacheScopeVersion("user-queue", userID)),
 		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
@@ -186,6 +212,13 @@ func (s *Service) invalidateUserQueueCache(userID int64) {
 	s.cache.BumpScope("user-queue", userID)
 }
 
+func (s *Service) invalidateQueueRuntimeCache() {
+	if s.cache == nil {
+		return
+	}
+	s.cache.BumpScope("queue-runtime")
+}
+
 func (s *Service) invalidateUserUploadResultsCache(userID int64) {
 	if s.cache == nil {
 		return
@@ -215,10 +248,61 @@ func (s *Service) invalidateDashboardCache(userID *int64) {
 	if s.cache == nil {
 		return
 	}
-	s.cache.BumpScope("dashboard")
-	if userID != nil {
-		s.cache.BumpScope("dashboard-user", *userID)
+	for _, scope := range []string{
+		"dashboard-summary",
+		"dashboard-stats",
+		"dashboard-system",
+		"dashboard-leaderboard",
+		"dashboard-recent",
+		"dashboard-contributors",
+		"dashboard-recent-contributors",
+		"dashboard-trends",
+	} {
+		s.cache.BumpScope(scope)
 	}
+	if userID != nil {
+		s.touchSystemIndexTimestamp()
+	}
+}
+
+func (s *Service) bumpDashboardScope(scope string) {
+	if s.cache == nil {
+		return
+	}
+	s.cache.BumpScope(scope)
+	s.cache.BumpScope("dashboard-summary")
+}
+
+func (s *Service) invalidateDashboardQueueCache() {
+	s.bumpDashboardScope("dashboard-system")
+	s.touchSystemIndexTimestamp()
+}
+
+func (s *Service) invalidateDashboardClaimCaches() {
+	s.bumpDashboardScope("dashboard-system")
+	s.bumpDashboardScope("dashboard-stats")
+	s.bumpDashboardScope("dashboard-leaderboard")
+	s.bumpDashboardScope("dashboard-recent")
+	s.bumpDashboardScope("dashboard-trends")
+	s.touchSystemIndexTimestamp()
+}
+
+func (s *Service) invalidateDashboardInventoryCache() {
+	s.bumpDashboardScope("dashboard-system")
+	s.bumpDashboardScope("dashboard-stats")
+	s.touchSystemIndexTimestamp()
+}
+
+func (s *Service) invalidateDashboardContributorCaches() {
+	s.bumpDashboardScope("dashboard-contributors")
+	s.bumpDashboardScope("dashboard-recent-contributors")
+	s.touchSystemIndexTimestamp()
+}
+
+func (s *Service) invalidateDashboardUploadCaches() {
+	s.invalidateDashboardInventoryCache()
+	s.bumpDashboardScope("dashboard-contributors")
+	s.bumpDashboardScope("dashboard-recent-contributors")
 }
 
 func (s *Service) invalidateAdminCache() {
