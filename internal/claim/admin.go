@@ -635,7 +635,7 @@ func (s *Service) CleanupExhaustedTokens(ctx context.Context, mode string) (map[
 	deletedFiles := 0
 	missingFiles := 0
 	for _, item := range exhausted {
-		targetPath, resolveErr := resolveStoredTokenPath(item.FilePath, item.FileName)
+		targetPath, resolveErr := s.resolveStoredTokenPath(item.FilePath, item.FileName)
 		if resolveErr != nil {
 			failed = append(failed, map[string]any{"file_name": item.FileName, "detail": resolveErr.Error()})
 			continue
@@ -796,7 +796,11 @@ func (s *Service) getUserByLinuxDOID(ctx context.Context, linuxDOUserID string) 
 }
 
 func (s *Service) getActiveBanPayload(ctx context.Context, linuxDOUserID string) (*auth.BanPayload, error) {
-	row := s.store.DB().QueryRowContext(ctx, `
+	return s.getActiveBanPayloadQueryer(ctx, s.store.DB(), linuxDOUserID)
+}
+
+func (s *Service) getActiveBanPayloadQueryer(ctx context.Context, queryer sqlQueryer, linuxDOUserID string) (*auth.BanPayload, error) {
+	row := queryer.QueryRowContext(ctx, `
 		SELECT user_bans.id,
 		       user_bans.linuxdo_user_id,
 		       user_bans.username_snapshot,
@@ -1043,19 +1047,25 @@ func buildAdminTokenPayload(id int64, fileName string, filePath string, encoding
 	return payload
 }
 
-func resolveStoredTokenPath(relativePath string, fileName string) (string, error) {
-	if filepath.IsAbs(relativePath) {
-		return relativePath, nil
+func (s *Service) resolveStoredTokenPath(relativePath string, fileName string) (string, error) {
+	trimmedPath := strings.TrimSpace(relativePath)
+	if filepath.IsAbs(trimmedPath) {
+		return trimmedPath, nil
 	}
+
 	baseDir, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("resolve working directory: %w", err)
 	}
-	trimmedPath := strings.TrimSpace(relativePath)
-	if trimmedPath == "" {
-		trimmedPath = filepath.Join("token", fileName)
+	if trimmedPath != "" {
+		return filepath.Join(baseDir, filepath.FromSlash(trimmedPath)), nil
 	}
-	return filepath.Join(baseDir, filepath.FromSlash(trimmedPath)), nil
+
+	trimmedName := filepath.Base(strings.TrimSpace(fileName))
+	if trimmedName != "" && trimmedName != "." && trimmedName != string(filepath.Separator) {
+		return s.tokenFileAbsolutePath(trimmedName), nil
+	}
+	return "", fmt.Errorf("resolve stored token path: missing file path and file name")
 }
 
 func nullableStringOrNil(value string) any {

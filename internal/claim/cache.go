@@ -50,6 +50,14 @@ func (s *Service) adminCacheKey(prefix string, parts ...any) string {
 	return runtimecache.BuildCacheKey(prefix, append([]any{fmt.Sprintf("v%d", version)}, parts...)...)
 }
 
+func (s *Service) adminQueueCacheKey(prefix string, parts ...any) string {
+	if s.cache == nil {
+		return runtimecache.BuildCacheKey(prefix, parts...)
+	}
+	version := s.cache.ScopeVersion("admin-queue")
+	return runtimecache.BuildCacheKey(prefix, append([]any{fmt.Sprintf("v%d", version)}, parts...)...)
+}
+
 func (s *Service) userBasicCacheKey(userID int64, isAdmin bool) string {
 	return s.snapshotCacheKey("user-basic", userID, boolToFlag(isAdmin), fmt.Sprintf("v%d", s.cacheScopeVersion("user-basic", userID)))
 }
@@ -81,6 +89,10 @@ func (s *Service) userRuntimeSnapshotCacheKey(userID int64) string {
 	)
 }
 
+func (s *Service) userClaimRealtimeCacheKey(userID int64) string {
+	return s.snapshotCacheKey("user-claim-realtime", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-claim-realtime", userID)))
+}
+
 func (s *Service) userQueueCacheKey(userID int64) string {
 	return s.snapshotCacheKey("user-queue", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-queue", userID)))
 }
@@ -97,6 +109,7 @@ func (s *Service) userBootstrapCacheKey(userID int64, isAdmin bool) string {
 		fmt.Sprintf("pv%d", s.cacheScopeVersion("user-profile", userID)),
 		fmt.Sprintf("dv%d", s.cacheScopeVersion("dashboard")),
 		fmt.Sprintf("duv%d", s.cacheScopeVersion("dashboard-user", userID)),
+		fmt.Sprintf("crv%d", s.cacheScopeVersion("user-claim-realtime", userID)),
 		fmt.Sprintf("qv%d", s.cacheScopeVersion("user-queue", userID)),
 		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
 	)
@@ -111,6 +124,7 @@ func (s *Service) adminBootstrapCacheKey(userID int64) string {
 		defaultAdminUsersLimit,
 		defaultAdminBansLimit,
 		defaultAdminTokensLimit,
+		defaultAdminQueueLimit,
 	)
 }
 
@@ -214,6 +228,13 @@ func (s *Service) invalidateAdminCache() {
 	s.cache.BumpScope("admin")
 }
 
+func (s *Service) invalidateAdminQueueCache() {
+	if s.cache == nil {
+		return
+	}
+	s.cache.BumpScope("admin-queue")
+}
+
 func (s *Service) invalidateAllRuntimeCache(userID *int64, includeAdmin bool) {
 	if userID == nil {
 		s.touchSystemIndexTimestamp()
@@ -258,9 +279,15 @@ func (s *Service) notifyQueueUsers(ctx context.Context, extraUserIDs ...int64) {
 		if err != nil {
 			s.invalidateUserQueueCache(userID)
 			s.queueEvents.notify(userID)
+			if s.claimEvents != nil {
+				s.claimEvents.notify(userID)
+			}
 			continue
 		}
 		s.setQueueStatusSnapshot(userID, payload)
+		if err := s.syncClaimRealtimeQueueStatus(ctx, userID, payload); err != nil {
+			s.logger.Warn("sync claim realtime queue status", "user_id", userID, "error", err)
+		}
 	}
 }
 

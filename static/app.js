@@ -1,5 +1,29 @@
 import { createLeaderSyncController } from "./app/leader-sync.js?v=20260322f";
+import {
+  applyClaimAcceptedState,
+  applyClaimSnapshotState,
+  buildQueueStatusFromRequest,
+  createInitialClaimRealtimeState,
+} from "./app/claim-realtime.js?v=20260323b";
 import { createSummarySyncController } from "./app/summary-sync.js?v=20260322g";
+
+function createClientTabId() {
+  const storageKey = "token_atlas_tab_id";
+  try {
+    if (typeof window !== "undefined" && window.sessionStorage) {
+      const existing = window.sessionStorage.getItem(storageKey);
+      if (existing && existing.trim()) {
+        return existing.trim();
+      }
+      const created = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      window.sessionStorage.setItem(storageKey, created);
+      return created;
+    }
+  } catch (error) {
+    console.warn("读取标签页标识失败，改用临时标识", error);
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 const state = {
   user: null,
@@ -40,10 +64,13 @@ const state = {
   isUploading: false,
   activeTab: "data",
   queueStream: null,
+  claimRealtimeState: createInitialClaimRealtimeState(),
+  activeClaimRequestId: "",
+  claimStreamConnected: false,
+  claimStreamRetryTimer: null,
+  claimStreamRetryCount: 0,
+  claimStreamError: "",
   uploadStream: null,
-  queuePollTimer: null,
-  queuePollFailureCount: 0,
-  queuePollingActive: false,
   uploadPollTimer: null,
   uploadPollFailureCount: 0,
   uploadResultsDirty: false,
@@ -53,7 +80,7 @@ const state = {
   claimsLoadPromise: null,
   claimsLoadShouldBroadcast: false,
   visibilityHidden: document.visibilityState !== "visible",
-  tabId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  tabId: createClientTabId(),
   broadcastChannel: null,
   crossTabBusMode: "none",
   lastCrossTabMessageId: null,
@@ -70,7 +97,8 @@ const state = {
 };
 
 const LOW_FREQUENCY_REFRESH_MS = 60000;
-const QUEUE_POLL_FAST_MS = 3000;
+const CLAIM_STREAM_RETRY_BASE_MS = 1000;
+const CLAIM_STREAM_RETRY_MAX_MS = 30000;
 const QUEUE_POLL_MAX_BACKOFF_MS = 120000;
 const LEADER_HEARTBEAT_MS = 10000;
 const LEADER_STALE_MS = 30000;
@@ -472,14 +500,6 @@ function applyClaimsPayload(payload) {
   });
   const items = (payload.items || []).filter((item) => !hiddenIds.has(item.claim_id));
   const total = items.length;
-  if (state.claimsInitialized) {
-    const lastTotal = state.lastClaimTotal ?? total;
-    const delta = total - lastTotal;
-    if (delta > 0 && !state.skipNextClaimModal) {
-      showModal("账号已到账", `共 ${delta} 个账号，可能来自排队自动发放或其他会话。`);
-    }
-  }
-  state.skipNextClaimModal = false;
   state.lastClaimTotal = total;
   state.claimsDirty = false;
   state.claimsInitialized = true;
@@ -577,6 +597,154 @@ function applyDashboardSummary(summary) {
   renderTrends();
 }
 
+function logClaimClientEvent(message, details = {}) {
+  const payload = {
+    tab_id: state.tabId,
+    active_request_id: state.activeClaimRequestId || null,
+    ...details,
+  };
+  console.info(`[claim] ${message}`, payload);
+}
+
+function describeClaimTerminalSummary(request) {
+  const granted = request?.granted || 0;
+  const requested = request?.requested || granted;
+  switch (request?.status) {
+    case "succeeded":
+      return `已领取 ${granted} / 请求 ${requested}。`;
+    case "partial":
+      return request.reason_message || `已领取 ${granted} / 请求 ${requested}，仍有 ${request.remaining || 0} 个未完成。`;
+    case "cancelled":
+    case "expired":
+    case "failed":
+      return request.reason_message || "领取请求未成功完成。";
+    default:
+      return "";
+  }
+}
+
+function describeQueuedClaimSummary(request) {
+  const position = request?.queue_position || "-";
+  const total = request?.queue_total || "-";
+  const remaining = request?.remaining ?? request?.requested ?? "-";
+  const modeLabel = state.claimStreamConnected ? "实时推送已连接" : "实时连接中断，正在重连";
+  return `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。${modeLabel}。`;
+}
+
+function updateClaimRequestUI(activeRequest = null, queueRequest = null) {
+  if (activeRequest?.status === "processing") {
+    state.queueStatus = { queued: false };
+    state.queueSticky = false;
+    setClaimQueued(false);
+    setClaimSubmitting(true);
+    elements.claimSummary.textContent = "请求已创建，等待服务器结果推送...";
+    elements.claimSummary.classList.remove("hidden");
+    return;
+  }
+
+  if (queueRequest?.status === "queued") {
+    state.queueStatus = buildQueueStatusFromRequest(queueRequest);
+    state.queueSticky = true;
+    setClaimSubmitting(false);
+    setClaimQueued(true);
+    elements.claimSummary.textContent = describeQueuedClaimSummary(queueRequest);
+    elements.claimSummary.classList.remove("hidden");
+    return;
+  }
+
+  state.queueStatus = { queued: false };
+  state.queueSticky = false;
+  setClaimQueued(false);
+  if (activeRequest?.terminal) {
+    setClaimSubmitting(false);
+    elements.claimSummary.textContent = describeClaimTerminalSummary(activeRequest);
+    elements.claimSummary.classList.remove("hidden");
+    return;
+  }
+  if (state.claimStreamError) {
+    elements.claimSummary.textContent = state.claimStreamError;
+    elements.claimSummary.classList.remove("hidden");
+    return;
+  }
+  if (!state.isClaimSubmitting) {
+    elements.claimSummary.classList.add("hidden");
+  }
+}
+
+function handleClaimRealtimeEffects(effects = []) {
+  const normalized = Array.isArray(effects)
+    ? effects.filter((effect) => effect && typeof effect === "object")
+    : [];
+
+  normalized
+    .filter((effect) => effect.type === "toast")
+    .forEach((effect) => {
+      try {
+        showModal(effect.title, effect.message);
+      } catch (error) {
+        console.error("显示领取结果弹窗失败", error, effect);
+      }
+    });
+
+  normalized
+    .filter((effect) => effect.type === "terminal")
+    .forEach((effect) => {
+      try {
+        logClaimClientEvent("received terminal event", {
+          request_id: effect.requestId,
+          status: effect.status,
+        });
+        logClaimClientEvent("ui loading finished", {
+          request_id: effect.requestId,
+          status: effect.status,
+        });
+        refreshClaimsByLeader("claim-terminal", { requestLeader: false }).catch((error) => {
+          state.claimsDirty = true;
+          if (!handleAccessError(error)) {
+            console.error("刷新领取记录失败", error);
+          }
+        });
+        refreshSummariesByLeader("claim-terminal", { requestLeader: false }).catch((error) => {
+          if (!handleAccessError(error)) {
+            console.error("刷新摘要失败", error);
+          }
+        });
+      } catch (error) {
+        console.error("处理领取终态副作用失败", error, effect);
+      }
+    });
+}
+
+function broadcastClaimRealtimePayload(payload, options = {}) {
+  if (options.broadcast === false) {
+    return;
+  }
+  broadcastMessage("claim_realtime", payload);
+}
+
+function applyClaimRealtimePayload(payload, options = {}) {
+  const result = applyClaimSnapshotState(state.claimRealtimeState, payload || {}, {
+    tabId: state.tabId,
+    activeRequestId: state.activeClaimRequestId,
+    isSubmitting: state.isClaimSubmitting,
+    emitToasts: options.emitToasts !== false,
+  });
+  state.claimRealtimeState = result.state;
+  state.activeClaimRequestId = result.state.activeRequestId || "";
+  if (options.fromStream) {
+    state.claimStreamConnected = true;
+    state.claimStreamError = "";
+    state.claimStreamRetryCount = 0;
+  }
+  updateClaimRequestUI(result.activeRequest, result.queueRequest);
+  if (result.activeRequest?.terminal) {
+    setClaimSubmitting(false);
+  }
+  broadcastClaimRealtimePayload(payload || {}, options);
+  handleClaimRealtimeEffects(result.effects || []);
+  syncQueueRealtimeTransport();
+}
+
 function applyBootstrapPayload(payload) {
   resetCrossTabSummaryState("bootstrap");
   const profile = payload?.profile || {};
@@ -589,7 +757,10 @@ function applyBootstrapPayload(payload) {
   state.uploadResultsLoaded = false;
   state.uploadResultsDirty = false;
   applyApiKeySummary(profile.api_keys || {});
-  applyQueueStatusPayload(payload?.queue_status || { queued: false });
+  applyClaimRealtimePayload(payload?.claim_realtime || { requests: [] }, {
+    broadcast: false,
+    emitToasts: false,
+  });
   renderUser();
   renderQuota();
   renderMyClaims();
@@ -598,13 +769,6 @@ function applyBootstrapPayload(payload) {
   renderUploadResults();
   applyUploadResultsSummaryPayload(payload?.upload_results || {});
 }
-
-async function loadQueueStatus() {
-  const payload = await fetchJson("/me/queue-status");
-  handleQueueStatusPayload(payload || {});
-  return payload;
-}
-
 
 function applyDocsBaseUrl() {
   const baseUrl = window.location.origin;
@@ -615,39 +779,17 @@ function applyDocsBaseUrl() {
 }
 
 function renderQueueStatus() {
-  const status = state.queueStatus;
-  if (!status || !status.queued) {
-    state.isClaimQueued = false;
-    syncClaimButtonState();
-    if (state.queueSticky) {
-      elements.claimSummary.classList.add("hidden");
-      state.queueSticky = false;
-    }
-    return;
-  }
-  state.isClaimQueued = true;
-  syncClaimButtonState();
-  const position = status.position ?? "-";
-  const total = status.total_queued ?? "-";
-  const available = status.available_tokens ?? "-";
-  const claimableNow = status.claimable_now;
-  const remaining = status.remaining ?? status.requested ?? "-";
-  const modeLabel = state.queueStream ? "实时推送" : "低频补偿刷新";
-  let detailText = `当前全局剩余库存 ${available} 次。`;
-  if (Number.isFinite(claimableNow)) {
-    if (claimableNow <= 0) {
-      detailText += " 但你当前可立即领取的不同账号数为 0";
-      detailText += "，同一用户不会重复领取同一个账号，队列会等待新账号进入库存。";
-    } else {
-      detailText += ` 你当前可立即领取的不同账号数约为 ${claimableNow}。`;
-    }
-  }
-  elements.claimSummary.textContent =
-    `已进入排队（第 ${position}/${total} 位，待领取 ${remaining}）。` +
-    detailText +
-    `当前使用${modeLabel}同步状态。`;
-  elements.claimSummary.classList.remove("hidden");
-  state.queueSticky = true;
+  const requests = Object.values(state.claimRealtimeState?.requestsById || {});
+  const activeRequest = state.activeClaimRequestId
+    ? requests.find((request) => request.request_id === state.activeClaimRequestId) || null
+    : null;
+  const queueRequest = requests.find((request) => request.status === "queued") || null;
+  updateClaimRequestUI(activeRequest, queueRequest);
+}
+
+function hasPendingClaimRealtimeRequests() {
+  const requests = Object.values(state.claimRealtimeState?.requestsById || {});
+  return requests.some((request) => request && request.terminal !== true);
 }
 
 async function fetchJson(url, options = {}) {
@@ -1407,26 +1549,6 @@ function mergeClaimResultsOptimistically(items = []) {
   state.lastClaimTotal = merged.length;
 }
 
-function scheduleClaimFollowUpRefreshes(result) {
-  const tasks = [
-    Promise.resolve().then(() => refreshClaimsByLeader("claim-success")),
-    Promise.resolve().then(() => refreshSummariesByLeader("claim-success")),
-  ];
-  if (result?.queued) {
-    tasks.push(Promise.resolve().then(() => loadQueueStatus()));
-  }
-
-  Promise.allSettled(tasks).then((results) => {
-    results.forEach((followUpResult) => {
-      if (followUpResult.status === "rejected") {
-        if (!handleAccessError(followUpResult.reason)) {
-          console.error("领取后的补偿刷新失败", followUpResult.reason);
-        }
-      }
-    });
-  });
-}
-
 function setClaimDownloadAllBusy(busy, count = 0) {
   if (!elements.claimDownloadAll) {
     return;
@@ -2063,70 +2185,35 @@ async function claimTokens() {
   }
 
   setClaimSubmitting(true);
+  setClaimQueued(false);
+  state.activeClaimRequestId = "";
   elements.claimSummary.textContent = "正在申请账号，请稍候...";
   elements.claimSummary.classList.remove("hidden");
+  logClaimClientEvent("submit click", { requested: count });
 
   try {
     const result = await fetchJson("/me/claim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ count }),
+      body: JSON.stringify({ count, client_tab_id: state.tabId }),
     });
-    if (result.granted && result.granted > 0) {
-      state.skipNextClaimModal = true;
-    }
-    state.quota = result.quota || state.quota;
-    renderQuota();
-    if (result.granted && result.granted > 0) {
-      mergeClaimResultsOptimistically(result.items || []);
-      state.claims = {
-        ...(state.claims || {}),
-        total: (state.claims?.total || 0) + result.granted,
-      };
-      renderMyClaims();
-      if (state.stats) {
-        state.stats = {
-          ...state.stats,
-          available_tokens: Math.max(0, (state.stats.available_tokens || 0) - result.granted),
-          claimed_total: (state.stats.claimed_total || 0) + result.granted,
-        };
-        renderStats();
-      }
-    }
-    if (result.queued) {
-      setClaimQueued(true);
-      takePollingLeadership("claim-queue");
-      handleQueueStatusPayload({
-        queued: true,
-        position: result.queue_position,
-        total_queued: result.queue_position ?? state.queueStatus?.total_queued,
-        remaining: result.queue_remaining,
-        requested: result.requested,
-        available_tokens: state.systemStatus?.inventory?.available ?? state.queueStatus?.available_tokens,
-        claimable_now: state.queueStatus?.claimable_now,
-      }, { source: "action" });
-    } else {
-      setClaimQueued(false);
-      state.queueStatus = { queued: false };
-      state.queueSticky = false;
-      const partialRemaining = Math.max(0, (result.requested || 0) - (result.granted || 0));
-      elements.claimSummary.textContent = partialRemaining > 0
-        ? `本次先领取到 ${result.granted} / 请求 ${result.requested}，剩余 ${partialRemaining} 个未自动入队，本小时剩余 ${result.quota.remaining}`
-        : `已领取 ${result.granted} / 请求 ${result.requested}，本小时剩余 ${result.quota.remaining}`;
-      elements.claimSummary.classList.remove("hidden");
-      if (result.granted && result.granted > 0) {
-        showModal("申请成功", `共 ${result.granted} 个账号`);
-      }
-    }
-    renderClaimResults();
-    scheduleClaimFollowUpRefreshes(result);
+    const accepted = applyClaimAcceptedState(state.claimRealtimeState, result || {}, { tabId: state.tabId });
+    state.claimRealtimeState = accepted.state;
+    state.activeClaimRequestId = accepted.state.activeRequestId || "";
+    updateClaimRequestUI(accepted.activeRequest, accepted.queueRequest);
+    syncQueueRealtimeTransport();
+    logClaimClientEvent("request accepted", {
+      request_id: result?.request_id,
+      status: result?.status,
+      queued: Boolean(result?.queued),
+    });
   } catch (error) {
     setClaimQueued(false);
+    setClaimSubmitting(false);
+    state.activeClaimRequestId = "";
     elements.claimSummary.classList.add("hidden");
     elements.claimError.textContent = error.message;
     elements.claimError.classList.remove("hidden");
-  } finally {
-    setClaimSubmitting(false);
   }
 }
 
@@ -2311,8 +2398,11 @@ function handleCrossTabMessage(message) {
     applyRuntimeSnapshotEnvelope(message.payload || {}, { requireVersion: true });
     return;
   }
-  if (message.type === "queue_status") {
-    handleQueueStatusPayload(message.payload || { queued: false }, { broadcast: false, source: "broadcast" });
+  if (message.type === "claim_realtime") {
+    applyClaimRealtimePayload(message.payload || { requests: [] }, {
+      broadcast: false,
+      emitToasts: true,
+    });
     return;
   }
   if (message.type === "upload_results_changed") {
@@ -2365,12 +2455,7 @@ async function runLowFrequencyRefresh() {
   }
   state.refreshing = true;
   try {
-    const bootstrap = await summarySync.loadBootstrapBundle({ broadcast: true });
-    handleQueueStatusPayload(bootstrap?.queue_status || { queued: false }, {
-      broadcast: true,
-      source: "bootstrap",
-      silentRefresh: true,
-    });
+    await summarySync.loadBootstrapBundle({ broadcast: true });
     state.lastLowFrequencyAt = Date.now();
   } catch (error) {
     if (handleAccessError(error)) {
@@ -2383,12 +2468,11 @@ async function runLowFrequencyRefresh() {
   }
 }
 
-function clearQueuePollTimer() {
-  if (state.queuePollTimer) {
-    clearTimeout(state.queuePollTimer);
-    state.queuePollTimer = null;
+function clearClaimStreamRetry() {
+  if (state.claimStreamRetryTimer) {
+    clearTimeout(state.claimStreamRetryTimer);
+    state.claimStreamRetryTimer = null;
   }
-  state.queuePollingActive = false;
 }
 
 function closeQueueStream() {
@@ -2399,111 +2483,44 @@ function closeQueueStream() {
 }
 
 function stopQueueRealtime() {
+  clearClaimStreamRetry();
   closeQueueStream();
-  clearQueuePollTimer();
-  state.queuePollingActive = false;
+  state.claimStreamConnected = false;
 }
 
 function canUseLeaderQueueTransport() {
-  return Boolean(canPerformPrimaryRefreshWork() && !state.visibilityHidden && state.queueStatus?.queued);
-}
-
-function applyQueueStatusPayload(payload) {
-  state.queueStatus = payload || { queued: false };
-  renderQueueStatus();
-}
-
-function broadcastQueueStatus(payload, options = {}) {
-  if (options.broadcast === false) {
-    return;
-  }
-  broadcastMessage("queue_status", payload);
-}
-
-function handleQueueExitTransition(wasQueued, nextQueued, options = {}) {
-  if (!wasQueued || nextQueued || options.silentRefresh) {
-    return;
-  }
-  if (options.source === "broadcast" || !canPerformPrimaryRefreshWork()) {
-    return;
-  }
-  Promise.allSettled([
-    refreshSummariesByLeader("queue-exit", { requestLeader: false }),
-    refreshClaimsByLeader("queue-exit", { requestLeader: false }),
-  ]).then((results) => {
-    results.forEach((result) => {
-      if (result.status === "rejected") {
-        handleAccessError(result.reason);
-      }
-    });
-  });
+  return Boolean(
+    canPerformPrimaryRefreshWork() &&
+    !state.visibilityHidden &&
+    hasPendingClaimRealtimeRequests()
+  );
 }
 
 function syncQueueRealtimeTransport() {
   if (!canUseLeaderQueueTransport()) {
+    state.claimStreamError = "";
     stopQueueRealtime();
     return;
   }
-  if (state.queueStream || state.queuePollingActive) {
+  if (state.queueStream) {
     return;
   }
   startQueueRealtime();
 }
 
-function scheduleQueuePoll(delayMs) {
-  clearQueuePollTimer();
+function scheduleClaimStreamReconnect() {
+  clearClaimStreamRetry();
   if (!canUseLeaderQueueTransport()) {
     return;
   }
-  state.queuePollingActive = true;
-  state.queuePollTimer = setTimeout(() => {
-    pollQueueStatus().catch((error) => {
-      if (!handleAccessError(error)) {
-        const backoff = Math.min(
-          QUEUE_POLL_MAX_BACKOFF_MS,
-          QUEUE_POLL_FAST_MS * (2 ** Math.max(0, state.queuePollFailureCount))
-        );
-        scheduleQueuePoll(backoff);
-      }
-    });
-  }, Math.max(0, delayMs));
-}
-
-function handleQueueStatusPayload(payload, options = {}) {
-  const wasQueued = Boolean(state.queueStatus?.queued);
-  applyQueueStatusPayload(payload || { queued: false });
-  broadcastQueueStatus(state.queueStatus, options);
-  syncQueueRealtimeTransport();
-  handleQueueExitTransition(wasQueued, Boolean(state.queueStatus?.queued), options);
-}
-
-async function pollQueueStatus() {
-  if (!canUseLeaderQueueTransport()) {
-    stopQueueRealtime();
-    return;
-  }
-  const payload = await fetchJson("/me/queue-status");
-  state.queuePollFailureCount = 0;
-  state.queuePollingActive = false;
-  handleQueueStatusPayload(payload || {});
-  if (payload?.queued) {
-    scheduleQueuePoll(QUEUE_POLL_FAST_MS);
-  }
-}
-
-function startQueueFallbackPolling(immediate = false) {
-  closeQueueStream();
-  state.queuePollingActive = false;
-  if (!canUseLeaderQueueTransport()) {
-    return;
-  }
-  const delay = immediate
-    ? 0
-    : Math.min(
-      QUEUE_POLL_MAX_BACKOFF_MS,
-      QUEUE_POLL_FAST_MS * (2 ** Math.max(0, state.queuePollFailureCount))
-    );
-  scheduleQueuePoll(delay);
+  const delay = Math.min(
+    CLAIM_STREAM_RETRY_MAX_MS,
+    CLAIM_STREAM_RETRY_BASE_MS * (2 ** Math.max(0, state.claimStreamRetryCount))
+  );
+  state.claimStreamRetryTimer = setTimeout(() => {
+    state.claimStreamRetryTimer = null;
+    startQueueRealtime();
+  }, delay);
 }
 
 function startQueueRealtime() {
@@ -2512,22 +2529,32 @@ function startQueueRealtime() {
     return;
   }
   if (typeof EventSource === "undefined") {
-    startQueueFallbackPolling(true);
+    state.claimStreamConnected = false;
+    state.claimStreamError = "当前浏览器不支持实时推送连接。";
+    updateClaimRequestUI();
     return;
   }
   if (state.queueStream) {
     return;
   }
-  clearQueuePollTimer();
   const stream = new EventSource("/me/queue-stream");
   state.queueStream = stream;
-  stream.addEventListener("queue_status", (event) => {
+  stream.addEventListener("stream_status", () => {
+    state.claimStreamConnected = true;
+    state.claimStreamError = "";
+    state.claimStreamRetryCount = 0;
+    updateClaimRequestUI();
+  });
+  stream.addEventListener("claim_snapshot", (event) => {
     try {
       const payload = JSON.parse(event.data || "{}");
-      state.queuePollFailureCount = 0;
-      handleQueueStatusPayload(payload || {});
+      applyClaimRealtimePayload(payload || { requests: [] }, {
+        fromStream: true,
+        broadcast: true,
+        emitToasts: true,
+      });
     } catch (error) {
-      console.error("解析队列事件失败", error);
+      console.error("解析领取实时事件失败", error);
     }
   });
   stream.onerror = () => {
@@ -2535,8 +2562,11 @@ function startQueueRealtime() {
       return;
     }
     closeQueueStream();
-    state.queuePollFailureCount += 1;
-    startQueueFallbackPolling(false);
+    state.claimStreamConnected = false;
+    state.claimStreamRetryCount += 1;
+    state.claimStreamError = "实时连接中断，正在重连...";
+    updateClaimRequestUI();
+    scheduleClaimStreamReconnect();
   };
 }
 

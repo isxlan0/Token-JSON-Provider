@@ -189,6 +189,7 @@ func (s *Service) linuxDOCallback(c echo.Context) error {
 				dbUserID, err = s.upsertUser(c.Request().Context(), *user)
 				if err == nil {
 					sessionState.Auth = &SessionAuth{
+						SessionID:  randomState(),
 						Method:     "linuxdo",
 						UserID:     dbUserID,
 						LoggedInAt: isoformatNow(),

@@ -121,6 +121,21 @@ func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 		}
 	}
 
+	queueColumns := tableColumnSet(t, store.DB(), "claim_queue")
+	for _, columnName := range []string{
+		"queue_rank",
+		"cancel_reason",
+		"cancelled_at_ts",
+		"cancelled_by_user_id",
+		"last_error_reason",
+		"last_error_at_ts",
+		"failure_count",
+	} {
+		if _, ok := queueColumns[columnName]; !ok {
+			t.Fatalf("missing migrated claim_queue column %s", columnName)
+		}
+	}
+
 	var (
 		accountID       string
 		accessTokenHash string

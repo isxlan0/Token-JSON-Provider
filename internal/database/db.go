@@ -108,7 +108,13 @@ var schemaStatements = []string{
 		queue_rank INTEGER NOT NULL,
 		enqueued_at_ts INTEGER NOT NULL,
 		request_id TEXT NOT NULL,
-		status TEXT NOT NULL
+		status TEXT NOT NULL,
+		cancel_reason TEXT,
+		cancelled_at_ts INTEGER,
+		cancelled_by_user_id INTEGER,
+		last_error_reason TEXT,
+		last_error_at_ts INTEGER,
+		failure_count INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE TABLE IF NOT EXISTS inventory_runtime (
 		id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -358,40 +364,59 @@ func ensureQueueColumns(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 
-	if _, ok := columns["queue_rank"]; ok {
-		return nil
-	}
-
-	if _, err := tx.ExecContext(ctx, `ALTER TABLE claim_queue ADD COLUMN queue_rank INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return fmt.Errorf("add claim_queue.queue_rank: %w", err)
-	}
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id
-		FROM claim_queue
-		WHERE status = 'queued' AND remaining > 0
-		ORDER BY enqueued_at_ts ASC, id ASC
-	`)
-	if err != nil {
-		return fmt.Errorf("select queued rows: %w", err)
-	}
-	defer rows.Close()
-
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return fmt.Errorf("scan queued row id: %w", err)
+	if _, ok := columns["queue_rank"]; !ok {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE claim_queue ADD COLUMN queue_rank INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add claim_queue.queue_rank: %w", err)
 		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate queued rows: %w", err)
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id
+			FROM claim_queue
+			WHERE status = 'queued' AND remaining > 0
+			ORDER BY enqueued_at_ts ASC, id ASC
+		`)
+		if err != nil {
+			return fmt.Errorf("select queued rows: %w", err)
+		}
+		defer rows.Close()
+
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("scan queued row id: %w", err)
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate queued rows: %w", err)
+		}
+
+		for index, id := range ids {
+			if _, err := tx.ExecContext(ctx, `UPDATE claim_queue SET queue_rank = ? WHERE id = ?`, index+1, id); err != nil {
+				return fmt.Errorf("backfill claim_queue.queue_rank for id %d: %w", id, err)
+			}
+		}
+		columns["queue_rank"] = struct{}{}
 	}
 
-	for index, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE claim_queue SET queue_rank = ? WHERE id = ?`, index+1, id); err != nil {
-			return fmt.Errorf("backfill claim_queue.queue_rank for id %d: %w", id, err)
+	definitions := []struct {
+		name       string
+		definition string
+	}{
+		{name: "cancel_reason", definition: "TEXT"},
+		{name: "cancelled_at_ts", definition: "INTEGER"},
+		{name: "cancelled_by_user_id", definition: "INTEGER"},
+		{name: "last_error_reason", definition: "TEXT"},
+		{name: "last_error_at_ts", definition: "INTEGER"},
+		{name: "failure_count", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, definition := range definitions {
+		if _, ok := columns[definition.name]; ok {
+			continue
+		}
+		statement := fmt.Sprintf(`ALTER TABLE claim_queue ADD COLUMN %s %s`, definition.name, definition.definition)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("add claim_queue.%s: %w", definition.name, err)
 		}
 	}
 

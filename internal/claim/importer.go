@@ -88,7 +88,7 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 		return false, err
 	}
 
-	relativePath := filepath.ToSlash(filepath.Join("token", filepath.Base(path)))
+	relativePath := s.tokenFileRelativePath(filepath.Base(path))
 	now := time.Now().Unix()
 	healthyMaxClaims := s.cfg.Inventory.Limits.Healthy.MaxClaims
 	accountID := normalizedUploadString(normalized, "account_id")
@@ -150,6 +150,10 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 			if effectiveMaxClaims <= 0 {
 				effectiveMaxClaims = healthyMaxClaims
 			}
+			nextIsActive := 1
+			if isBanned == 1 {
+				nextIsActive = 0
+			}
 			isAvailable := 0
 			if isEnabled == 1 && isBanned == 0 && claimCount < effectiveMaxClaims {
 				isAvailable = 1
@@ -159,7 +163,7 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 				existingPath != relativePath ||
 				existingEncoding != encoding ||
 				existingContent != contentJSON ||
-				isActive != 1
+				isActive != nextIsActive
 
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE tokens
@@ -169,12 +173,12 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 				    content_json = ?,
 				    account_id = COALESCE(NULLIF(account_id, ''), ?),
 				    access_token_hash = COALESCE(NULLIF(access_token_hash, ''), ?),
-				    is_active = 1,
+				    is_active = ?,
 				    is_available = ?,
 				    updated_at_ts = ?,
 				    last_seen_at_ts = ?
 				WHERE id = ?
-			`, relativePath, fileHash, encoding, contentJSON, accountID, accessTokenHash, isAvailable, now, now, tokenID); err != nil {
+			`, relativePath, fileHash, encoding, contentJSON, accountID, accessTokenHash, nextIsActive, isAvailable, now, now, tokenID); err != nil {
 				return false, fmt.Errorf("update token file: %w", err)
 			}
 			if _, err := s.ensureInventoryPolicyTx(ctx, tx, true); err != nil {

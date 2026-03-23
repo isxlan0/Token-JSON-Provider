@@ -19,6 +19,7 @@ const (
 	envLinuxDOMinTrustLevel     = "TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL"
 	envLinuxDOAllowedIDs        = "TOKEN_INDEX_LINUXDO_ALLOWED_IDS"
 	envDBPath                   = "TOKEN_DB_PATH"
+	envTokenFilesDir            = "TOKEN_FILES_DIR"
 	envAdminIdentities          = "TOKEN_INDEX_ADMIN_IDENTITIES"
 	envAdminIDsAlias            = "TOKEN_INDEX_ADMIN_IDS"
 	envHealthyThreshold         = "TOKEN_HEALTHY_THRESHOLD"
@@ -65,6 +66,7 @@ var knownEnvKeys = []string{
 	envLinuxDOMinTrustLevel,
 	envLinuxDOAllowedIDs,
 	envDBPath,
+	envTokenFilesDir,
 	envAdminIdentities,
 	envAdminIDsAlias,
 	envHealthyThreshold,
@@ -104,6 +106,7 @@ type Config struct {
 	Session   SessionConfig
 	LinuxDO   LinuxDOConfig
 	Database  DatabaseConfig
+	Files     FilesConfig
 	Cache     CacheConfig
 	Inventory InventoryConfig
 	APIKeys   APIKeyConfig
@@ -127,6 +130,10 @@ type LinuxDOConfig struct {
 
 type DatabaseConfig struct {
 	Path string
+}
+
+type FilesConfig struct {
+	TokenDir string
 }
 
 type CacheConfig struct {
@@ -232,6 +239,9 @@ func loadFromPath(path string) (Config, error) {
 		},
 		Database: DatabaseConfig{
 			Path: source.databasePath(baseDir),
+		},
+		Files: FilesConfig{
+			TokenDir: source.tokenFilesDir(baseDir),
 		},
 		Cache: CacheConfig{
 			Backend:       strings.ToLower(source.cleanedString(envCacheBackend, "auto")),
@@ -374,6 +384,17 @@ func (s envSource) databasePath(baseDir string) string {
 		return filepath.Join(baseDir, "token_atlas.db")
 	}
 	return value
+}
+
+func (s envSource) tokenFilesDir(baseDir string) string {
+	value := s.rawTrimmed(envTokenFilesDir, "")
+	if value == "" {
+		return filepath.Join(baseDir, "token")
+	}
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value)
+	}
+	return filepath.Clean(filepath.Join(baseDir, value))
 }
 
 func (s envSource) adminIdentityRaw() string {

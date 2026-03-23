@@ -90,7 +90,7 @@ func (s *Service) handleTokenFileEvent(ctx context.Context, event fsnotify.Event
 			s.logger.Error("deactivate token file after watcher event", "error", err, "file_name", fileName)
 		}
 	case event.Has(fsnotify.Create), event.Has(fsnotify.Write), event.Has(fsnotify.Chmod):
-		s.enqueueTokenImport(fileName, "watch")
+		s.enqueueTokenImport(ctx, fileName, "watch")
 	}
 }
 
@@ -100,7 +100,7 @@ func (s *Service) pollTokenDirectoryChanges(ctx context.Context, previous map[st
 		old, ok := previous[fileName]
 		if !ok || old != stat {
 			if !s.shouldIgnoreInternalTokenWrite(fileName) {
-				s.enqueueTokenImport(fileName, "poll")
+				s.enqueueTokenImport(ctx, fileName, "poll")
 			}
 		}
 	}

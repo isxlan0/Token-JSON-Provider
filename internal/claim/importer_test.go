@@ -76,7 +76,7 @@ func TestTokenImportLoopRetriesUntilJSONWriteCompletes(t *testing.T) {
 		t.Fatalf("write partial token file: %v", err)
 	}
 
-	service.enqueueTokenImport(fileName, "watch")
+	service.enqueueTokenImport(context.Background(), fileName, "watch")
 
 	time.Sleep(125 * time.Millisecond)
 

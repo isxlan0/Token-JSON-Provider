@@ -116,6 +116,10 @@
   align-items: center;
 }
 
+.admin-toolbar-queue {
+  grid-template-columns: minmax(240px, 1fr) repeat(4, auto);
+}
+
 .admin-search-input,
 .admin-select {
   padding-left: 1rem;
@@ -150,6 +154,10 @@
 
 .token-list,
 .ban-list {
+  grid-template-columns: 1fr;
+}
+
+.queue-list {
   grid-template-columns: 1fr;
 }
 
@@ -202,6 +210,42 @@
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+.admin-toggle-group {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.queue-card-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.queue-card-block {
+  background: var(--bg-main);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 0.85rem;
+}
+
+.queue-card-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.queue-card-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.queue-card-reason {
+  border-left: 3px solid var(--border-base);
+  padding-left: 0.75rem;
 }
 
 .admin-detail {

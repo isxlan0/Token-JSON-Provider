@@ -95,9 +95,9 @@
       to { transform: rotate(360deg); }
     }
   </style>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260322m">
-  <link rel="stylesheet" href="/assets/admin.css?v=20260322k">
-  <script src="/assets/admin.js?v=20260322m" defer></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=20260323a">
+  <link rel="stylesheet" href="/assets/admin.css?v=20260323a">
+  <script src="/assets/admin.js?v=20260323a" defer></script>
 </head>
 
 <body class="light-theme admin-body">
@@ -173,6 +173,7 @@
             <button id="admin-tab-users" class="nav-item active" type="button">用户管理</button>
             <button id="admin-tab-bans" class="nav-item" type="button">封禁记录</button>
             <button id="admin-tab-tokens" class="nav-item" type="button">Token 管理</button>
+            <button id="admin-tab-queue" class="nav-item" type="button">排队管理</button>
             <button id="admin-tab-policy" class="nav-item" type="button">额度策略</button>
           </nav>
         </div>
@@ -264,6 +265,32 @@
           </div>
           <div id="admin-token-list" class="admin-list token-list"></div>
           <div id="admin-token-pager" class="admin-pager"></div>
+        </section>
+
+        <section id="admin-view-queue" class="admin-view">
+          <div class="admin-toolbar card admin-toolbar-queue">
+            <input id="admin-queue-search" class="form-input admin-search-input" type="text"
+              placeholder="搜索队列 ID / 用户 ID / 用户名 / 请求 ID">
+            <select id="admin-queue-status" class="form-input admin-select">
+              <option value="queued" selected>仅当前排队</option>
+              <option value="all">全部状态</option>
+              <option value="cancelled">仅已取消</option>
+              <option value="expired">仅已过期</option>
+            </select>
+            <select id="admin-queue-limit" class="form-input admin-select admin-limit-select">
+              <option value="20">每页 20</option>
+              <option value="50" selected>每页 50</option>
+              <option value="100">每页 100</option>
+            </select>
+            <div class="admin-toggle-group">
+              <button id="admin-queue-show-all" class="btn btn-primary btn-inline" type="button">全部队列</button>
+              <button id="admin-queue-show-abnormal" class="btn btn-outline btn-inline" type="button">仅查看异常项</button>
+              <button id="admin-queue-show-timeout" class="btn btn-outline btn-inline" type="button">仅查看超时项</button>
+            </div>
+            <button id="admin-queue-refresh" class="btn btn-outline" type="button">刷新队列</button>
+          </div>
+          <div id="admin-queue-list" class="admin-list queue-list"></div>
+          <div id="admin-queue-pager" class="admin-pager"></div>
         </section>
 
         <section id="admin-view-policy" class="admin-view">

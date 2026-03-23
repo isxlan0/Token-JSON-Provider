@@ -23,3 +23,5 @@ token_atlas.db*
 .runtime/
 *.log
 cmd/server/*.go.[0-9]*
+.gotmp/*
+.pycache-check/*

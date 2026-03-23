@@ -82,15 +82,21 @@ type UserTokenClaim struct {
 }
 
 type ClaimQueueItem struct {
-	ID           int64
-	UserID       int64
-	APIKeyID     sql.NullInt64
-	Requested    int64
-	Remaining    int64
-	QueueRank    int64
-	EnqueuedAtTS int64
-	RequestID    string
-	Status       string
+	ID                int64
+	UserID            int64
+	APIKeyID          sql.NullInt64
+	Requested         int64
+	Remaining         int64
+	QueueRank         int64
+	EnqueuedAtTS      int64
+	RequestID         string
+	Status            string
+	CancelReason      sql.NullString
+	CancelledAtTS     sql.NullInt64
+	CancelledByUserID sql.NullInt64
+	LastErrorReason   sql.NullString
+	LastErrorAtTS     sql.NullInt64
+	FailureCount      int64
 }
 
 type UserBan struct {

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -52,10 +51,9 @@ func (s *Service) hideClaimsWorkerLoop(ctx context.Context) {
 }
 
 func (s *Service) tokenImportLoop(ctx context.Context) {
-	if err := s.ensureTokenDir(); err != nil {
-		s.logger.Error("ensure token directory", "error", err)
+	if !s.awaitStartupReconcile(ctx) {
+		return
 	}
-	s.startupReconcileTokenFiles(ctx)
 
 	for {
 		if ctx.Err() != nil {
@@ -147,10 +145,6 @@ func (s *Service) ensureTokenDir() error {
 	return os.MkdirAll(s.tokenDirPath(), 0o755)
 }
 
-func (s *Service) tokenDirPath() string {
-	return filepath.Join(".", "token")
-}
-
 func (s *Service) startupReconcileTokenFiles(ctx context.Context) {
 	if _, err := s.reconcileTokenFiles(ctx); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -161,10 +155,61 @@ func (s *Service) startupReconcileTokenFiles(ctx context.Context) {
 	}
 }
 
-func (s *Service) enqueueTokenImport(fileName string, reason string) {
+func (s *Service) awaitStartupReconcile(ctx context.Context) bool {
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			s.markStartupReconcileCanceled(ctx.Err())
+			return false
+		}
+
+		s.markStartupReconcileAttempt(attempt)
+		tokenSummary, err := s.reconcileTokenFiles(ctx)
+		if err == nil {
+			queueSummary, queueErr := s.startupReconcileQueue(ctx)
+			if queueErr == nil {
+				s.markStartupReady(mergeStartupReconcileSummary(tokenSummary, queueSummary))
+				return true
+			}
+			err = queueErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.logger.Info("startup reconcile token files cancelled")
+			s.markStartupReconcileCanceled(err)
+			return false
+		}
+
+		s.markStartupReconcileError(err)
+		s.logger.Error("startup reconcile token files", "error", err, "attempt", attempt)
+
+		timer := time.NewTimer(startupReconcileRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			s.markStartupReconcileCanceled(ctx.Err())
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+func mergeStartupReconcileSummary(tokenSummary map[string]int, queueSummary map[string]int) map[string]int {
+	merged := cloneIntMap(tokenSummary)
+	if merged == nil {
+		merged = make(map[string]int)
+	}
+	for key, value := range queueSummary {
+		merged["queue_"+key] = value
+	}
+	return merged
+}
+
+func (s *Service) enqueueTokenImport(ctx context.Context, fileName string, reason string) {
 	trimmed := strings.TrimSpace(fileName)
 	if trimmed == "" {
 		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	s.tokenImportMu.Lock()
@@ -177,21 +222,8 @@ func (s *Service) enqueueTokenImport(fileName string, reason string) {
 
 	select {
 	case s.tokenImportCh <- tokenImportRequest{fileName: trimmed, reason: reason}:
-	default:
-		go func() {
-			timer := time.NewTimer(100 * time.Millisecond)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				select {
-				case s.tokenImportCh <- tokenImportRequest{fileName: trimmed, reason: reason}:
-				default:
-					s.tokenImportMu.Lock()
-					delete(s.tokenImportPending, trimmed)
-					s.tokenImportMu.Unlock()
-				}
-			}
-		}()
+	case <-ctx.Done():
+		s.finishTokenImport(trimmed)
 	}
 }
 

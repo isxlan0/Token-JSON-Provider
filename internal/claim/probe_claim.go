@@ -122,12 +122,21 @@ func (s *Service) recordProbeStatus(ctx context.Context, tokenID int64, statusTe
 
 func (s *Service) markTokenBanned(ctx context.Context, tokenID int64, reason string) error {
 	now := time.Now().Unix()
-	_, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (int, error) {
+	fileName, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (string, error) {
+		row := tx.QueryRowContext(ctx, `SELECT file_name FROM tokens WHERE id = ?`, tokenID)
+		var fileName string
+		if err := row.Scan(&fileName); err != nil {
+			if err == sql.ErrNoRows {
+				return "", fmt.Errorf("load token %d for ban: %w", tokenID, err)
+			}
+			return "", fmt.Errorf("load token %d file name for ban: %w", tokenID, err)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE tokens
 			SET is_banned = 1,
 			    is_enabled = 0,
 			    is_available = 0,
+			    is_active = 0,
 			    banned_at_ts = COALESCE(banned_at_ts, ?),
 			    ban_reason = ?,
 			    last_probe_at_ts = ?,
@@ -136,15 +145,19 @@ func (s *Service) markTokenBanned(ctx context.Context, tokenID int64, reason str
 			    updated_at_ts = ?
 			WHERE id = ?
 		`, now, reason, now, now, tokenID); err != nil {
-			return 0, fmt.Errorf("mark token banned %d: %w", tokenID, err)
+			return "", fmt.Errorf("mark token banned %d: %w", tokenID, err)
 		}
 		if _, err := s.ensureInventoryPolicyTx(ctx, tx, true); err != nil {
-			return 0, err
+			return "", err
 		}
-		return 0, nil
+		return fileName, nil
 	})
 	if err != nil {
 		return err
+	}
+
+	if deleteErr := s.removeTokenFileNow(fileName); deleteErr != nil {
+		s.scheduleTokenFileDeleteRetry(fileName, reason, deleteErr)
 	}
 
 	s.invalidateAllRuntimeCache(nil, true)

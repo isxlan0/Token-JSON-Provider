@@ -350,7 +350,7 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 			}))
 
 			s.markInternalTokenWrite(targetName)
-			absolutePath, relativePath, writeErr := writeUploadedTokenFile(targetName, task.ContentJSON)
+			absolutePath, relativePath, writeErr := s.writeUploadedTokenFile(targetName, task.ContentJSON)
 			if writeErr != nil {
 				s.logger.Error("write uploaded token file", "error", writeErr, "file_name", targetName)
 				break
@@ -931,8 +931,8 @@ func buildUploadedFileName(accountID string, uploadedAtTS int64) (string, error)
 	return fmt.Sprintf("upload-%d-%s-%s.json", uploadedAtTS, hex.EncodeToString(accountHash[:])[:8], suffix[:6]), nil
 }
 
-func writeUploadedTokenFile(fileName string, contentJSON string) (string, string, error) {
-	tokenDir := filepath.Join(".", "token")
+func (s *Service) writeUploadedTokenFile(fileName string, contentJSON string) (string, string, error) {
+	tokenDir := s.tokenDirPath()
 	if err := os.MkdirAll(tokenDir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create token directory: %w", err)
 	}
@@ -942,7 +942,7 @@ func writeUploadedTokenFile(fileName string, contentJSON string) (string, string
 		return "", "", fmt.Errorf("write uploaded token file: %w", err)
 	}
 
-	return absolutePath, filepath.ToSlash(filepath.Join("token", filepath.Base(fileName))), nil
+	return absolutePath, s.tokenFileRelativePath(fileName), nil
 }
 
 func pendingUploadKeys(accountID string, accessTokenHash string) []string {

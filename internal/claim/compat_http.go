@@ -228,9 +228,18 @@ func (s *Service) getHealth(c echo.Context) error {
 	}
 	inventory, _ := system["inventory"].(map[string]any)
 	index, _ := system["index"].(map[string]any)
-	return c.JSON(http.StatusOK, map[string]any{
-		"status":      "ok",
+	ready := s.isStartupReady()
+	statusCode := http.StatusOK
+	statusText := "ok"
+	if !ready {
+		statusCode = http.StatusServiceUnavailable
+		statusText = "starting"
+	}
+	return c.JSON(statusCode, map[string]any{
+		"status":      statusText,
+		"ready":       ready,
 		"token_count": inventory["total"],
 		"updated_at":  index["updated_at"],
+		"startup":     s.startupHealthPayload(),
 	})
 }

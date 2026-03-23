@@ -7,7 +7,24 @@ import (
 	"strings"
 )
 
+const runtimeRootEnv = "TOKEN_ATLAS_RUNTIME_ROOT"
+
 func prepareRuntimeRoot() (string, error) {
+	if configured := strings.TrimSpace(os.Getenv(runtimeRootEnv)); configured != "" {
+		root, err := filepath.Abs(configured)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s=%q: %w", runtimeRootEnv, configured, err)
+		}
+		root = filepath.Clean(root)
+		if !looksLikeRuntimeRoot(root) {
+			return "", fmt.Errorf("%s=%q is not a valid project root", runtimeRootEnv, root)
+		}
+		if err := os.Chdir(root); err != nil {
+			return "", fmt.Errorf("switch working directory to %q: %w", root, err)
+		}
+		return root, nil
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("resolve working directory: %w", err)
@@ -20,7 +37,7 @@ func prepareRuntimeRoot() (string, error) {
 
 	root := resolveRuntimeRoot(cwd, executablePath)
 	if root == "" {
-		root = cwd
+		return "", fmt.Errorf("resolve project root failed; start from the project root or set %s", runtimeRootEnv)
 	}
 
 	if err := os.Chdir(root); err != nil {
@@ -53,17 +70,17 @@ func resolveRuntimeRoot(cwd string, executablePath string) string {
 		candidates = append(candidates, normalized)
 	}
 
-	appendCandidate(cwd)
-	if isBinDir(cwd) {
-		appendCandidate(filepath.Dir(cwd))
-	}
-
 	if executablePath != "" {
 		executableDir := filepath.Dir(executablePath)
 		appendCandidate(executableDir)
 		if isBinDir(executableDir) {
 			appendCandidate(filepath.Dir(executableDir))
 		}
+	}
+
+	appendCandidate(cwd)
+	if isBinDir(cwd) {
+		appendCandidate(filepath.Dir(cwd))
 	}
 
 	for _, candidate := range candidates {
@@ -84,8 +101,7 @@ func looksLikeRuntimeRoot(dir string) bool {
 		return false
 	}
 
-	return isDir(filepath.Join(dir, "token")) ||
-		isDir(filepath.Join(dir, "cmd")) ||
+	return isFile(filepath.Join(dir, "go.mod")) ||
 		isFile(filepath.Join(dir, ".env")) ||
 		isFile(filepath.Join(dir, ".env.example"))
 }

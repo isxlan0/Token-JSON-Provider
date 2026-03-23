@@ -27,6 +27,10 @@ type tokenCleanupPayload struct {
 	Mode string `json:"mode"`
 }
 
+type adminQueueCancelPayload struct {
+	Reason string `json:"reason"`
+}
+
 func (s *Service) getQueueStream(c echo.Context) error {
 	requestContext, ok := auth.RequestContextFromEcho(c)
 	if !ok {
@@ -45,11 +49,11 @@ func (s *Service) getQueueStream(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Streaming unsupported.")
 	}
 
-	subscription, lastVersion := s.queueEvents.subscribe(requestContext.UserID)
-	defer s.queueEvents.unsubscribe(subscription)
+	subscription, lastVersion := s.claimEvents.subscribe(requestContext.UserID)
+	defer s.claimEvents.unsubscribe(subscription)
 
 	writeStatus := func() error {
-		payload, err := s.GetQueueStatus(c.Request().Context(), requestContext.UserID)
+		payload, err := s.GetClaimRealtimeSnapshot(c.Request().Context(), requestContext.UserID, requestContext.SessionID)
 		if err != nil {
 			return err
 		}
@@ -57,12 +61,17 @@ func (s *Service) getQueueStream(c echo.Context) error {
 		if err != nil {
 			return err
 		}
-		if _, err := response.Write([]byte("event: queue_status\ndata: " + string(body) + "\n\n")); err != nil {
+		if _, err := response.Write([]byte("event: claim_snapshot\ndata: " + string(body) + "\n\n")); err != nil {
 			return err
 		}
 		flusher.Flush()
 		return nil
 	}
+
+	if _, err := response.Write([]byte("event: stream_status\ndata: {\"status\":\"ready\",\"transport\":\"sse\"}\n\n")); err != nil {
+		return nil
+	}
+	flusher.Flush()
 
 	if err := writeStatus(); err != nil {
 		return err
@@ -367,6 +376,116 @@ func (s *Service) adminListTokens(c echo.Context) error {
 		return err
 	}
 	return c.JSON(http.StatusOK, payload)
+}
+
+func (s *Service) adminListQueue(c echo.Context) error {
+	search := c.QueryParam("search")
+	statusFilter := c.QueryParam("status")
+	onlyFilter := c.QueryParam("only")
+	limit := parseBoundedInt(c.QueryParam("limit"), 100, 1, 200)
+	offset := parseBoundedInt(c.QueryParam("offset"), 0, 0, 1<<30)
+	payload, err := s.cachedAdminQueuePage(c.Request().Context(), search, statusFilter, onlyFilter, limit, offset)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, payload)
+}
+
+func (s *Service) adminRefreshQueue(c echo.Context) error {
+	result, err := s.RefreshQueue(c.Request().Context())
+	if err != nil {
+		return mapDatabaseBusyError(c, err)
+	}
+	s.primeAdminDefaultReadCaches(c.Request().Context())
+	return c.JSON(http.StatusOK, result)
+}
+
+func (s *Service) adminCancelQueueEntry(c echo.Context) error {
+	var payload adminQueueCancelPayload
+	if c.Request().ContentLength > 0 {
+		if err := c.Bind(&payload); err != nil && err != io.EOF {
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid JSON body.")
+		}
+	}
+
+	requestContext, ok := auth.RequestContextFromEcho(c)
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
+	}
+
+	queueID, err := strconv.ParseInt(c.Param("queue_id"), 10, 64)
+	if err != nil || queueID <= 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid queue id.")
+	}
+
+	trimmedReason := strings.TrimSpace(payload.Reason)
+	if trimmedReason == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "取消原因必填。")
+	}
+
+	entry, err := s.cancelQueueEntry(c.Request().Context(), queueID, queueStatusCancelled, "admin:"+trimmedReason, &requestContext.UserID)
+	if err != nil {
+		return mapDatabaseBusyError(c, err)
+	}
+	if entry == nil {
+		return echo.NewHTTPError(http.StatusNotFound, "Queue entry not found.")
+	}
+
+	s.primeAdminDefaultReadCaches(c.Request().Context())
+	return c.JSON(http.StatusOK, map[string]any{
+		"ok":            true,
+		"queue_id":      entry.ID,
+		"user_id":       entry.UserID,
+		"status":        queueStatusCancelled,
+		"cancel_reason": "admin:" + trimmedReason,
+	})
+}
+
+func (s *Service) adminCancelUserQueue(c echo.Context) error {
+	var payload adminQueueCancelPayload
+	if c.Request().ContentLength > 0 {
+		if err := c.Bind(&payload); err != nil && err != io.EOF {
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid JSON body.")
+		}
+	}
+
+	requestContext, ok := auth.RequestContextFromEcho(c)
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
+	}
+
+	targetUserID, err := strconv.ParseInt(c.Param("user_id"), 10, 64)
+	if err != nil || targetUserID <= 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid user id.")
+	}
+
+	trimmedReason := strings.TrimSpace(payload.Reason)
+	if trimmedReason == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "取消原因必填。")
+	}
+
+	items, err := s.cancelQueuedEntriesByUser(c.Request().Context(), targetUserID, queueStatusCancelled, "admin:"+trimmedReason, &requestContext.UserID)
+	if err != nil {
+		return mapDatabaseBusyError(c, err)
+	}
+	if len(items) == 0 {
+		return echo.NewHTTPError(http.StatusNotFound, "No active queue entries for this user.")
+	}
+
+	queueIDs := make([]int64, 0, len(items))
+	for _, item := range items {
+		queueIDs = append(queueIDs, item.ID)
+	}
+
+	s.primeAdminDefaultReadCaches(c.Request().Context())
+	return c.JSON(http.StatusOK, map[string]any{
+		"ok":            true,
+		"user_id":       targetUserID,
+		"cancelled":     len(items),
+		"queue_ids":     queueIDs,
+		"status":        queueStatusCancelled,
+		"cancel_reason": "admin:" + trimmedReason,
+	})
 }
 
 func (s *Service) adminActivateToken(c echo.Context) error {

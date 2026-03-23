@@ -1,6 +1,6 @@
 # Token Atlas
 
-基于 LinuxDo OAuth2 的 JSON 账号分发服务。把可分发的 `.json` 文件放到 `token/` 目录，用户登录后可领取账号，并通过 API Key 下载对应 JSON。
+基于 LinuxDo OAuth2 的 JSON 账号分发服务。把可分发的 `.json` 文件放到 `TOKEN_FILES_DIR` 指向的目录中，默认是项目根目录下的 `token/`。用户登录后可领取账号，并通过 API Key 下载对应 JSON。
 
 当前默认运行的是 Go 重构版服务，旧版 Python 主程序已归档到 `legacy_python_backend/`，仅作留档。
 
@@ -49,6 +49,9 @@ TOKEN_INDEX_ADMIN_IDENTITIES=
 # 数据库路径（默认 ./token_atlas.db）
 TOKEN_DB_PATH=
 
+# Token 文件目录（默认项目根目录下的 token）
+TOKEN_FILES_DIR=token
+
 # 领取额度与分发规则
 TOKEN_CLAIM_HOURLY_LIMIT=50
 TOKEN_CLAIM_BATCH_LIMIT=50
@@ -87,9 +90,9 @@ python .\start.py
 ./bin/token-atlas-linux-amd64
 ```
 
-`start.py` 会自动按当前系统与架构选择对应二进制；如果没有 `bin/` 目录，则会回退到项目根目录查找同名文件。
+`start.py` 会自动按当前系统与架构选择对应二进制；如果没有 `bin/` 目录，则会回退到项目根目录查找同名文件。无论从哪个入口启动，工作目录都会固定到项目根目录，不再依赖“当前目录大概差不多”。
 
-如果需要同时启动 `GptCodexApi/runner.py`，保留原有 `.env` 配置即可，`start.py` 会按需创建 `.venv` 并安装 `GptCodexApi/requirements.txt`。
+如果需要同时启动 `GptCodexApi/runner.py`，保留原有 `.env` 配置即可，`start.py` 会按需创建 `.venv` 并安装 `GptCodexApi/requirements.txt`。Go 服务和 `GptCodexApi` 会共用项目根目录 `.env` 中的 `TOKEN_FILES_DIR` 配置。
 
 服务默认监听 `0.0.0.0:8000`，浏览器访问：
 
@@ -170,6 +173,6 @@ curl -L http://127.0.0.1:8000/api/download/123 `
 - `cmd/server/`：Go 服务入口
 - `internal/`：Go 版核心业务逻辑
 - `legacy_python_backend/`：归档的旧版 Python 主程序
-- `token/`：账号 JSON 文件
+- `token/`：默认账号 JSON 文件目录，可通过 `TOKEN_FILES_DIR` 改为其他路径
 - `static/`：前端页面资源
 - `.env.example`：配置模板

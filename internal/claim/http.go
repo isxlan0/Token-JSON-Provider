@@ -10,7 +10,8 @@ import (
 )
 
 type claimRequestPayload struct {
-	Count int `json:"count"`
+	Count       int    `json:"count"`
+	ClientTabID string `json:"client_tab_id,omitempty"`
 }
 
 type hideClaimsPayload struct {
@@ -61,6 +62,10 @@ func (s *Service) RegisterRoutes(e *echo.Echo) {
 	admin.POST("/tokens/:token_id/activate", s.adminActivateToken)
 	admin.POST("/tokens/:token_id/deactivate", s.adminDeactivateToken)
 	admin.POST("/tokens/cleanup-exhausted", s.adminCleanupExhaustedTokens)
+	admin.GET("/queue", s.adminListQueue)
+	admin.POST("/queue/refresh", s.adminRefreshQueue)
+	admin.POST("/queue/:queue_id/cancel", s.adminCancelQueueEntry)
+	admin.POST("/queue/users/:user_id/cancel", s.adminCancelUserQueue)
 	admin.GET("/policy", s.adminGetPolicy)
 
 	e.GET("/json", s.getJSONIndex, s.auth.RequireAPIKeyMiddleware)
@@ -215,7 +220,17 @@ func (s *Service) claimBySession(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
-	result, err := s.claimFromPayload(c, requestContext.UserID, nil)
+	payload := claimRequestPayload{Count: 1}
+	if c.Request().ContentLength > 0 {
+		if err := c.Bind(&payload); err != nil && err != io.EOF {
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid JSON body.")
+		}
+	}
+	if payload.Count < 1 {
+		return echo.NewHTTPError(http.StatusBadRequest, "count must be greater than or equal to 1")
+	}
+
+	result, err := s.CreateClaimRequest(c.Request().Context(), requestContext, nil, payload.Count, payload.ClientTabID)
 	if err != nil {
 		return err
 	}
@@ -229,14 +244,14 @@ func (s *Service) claimByAPIKey(c echo.Context) error {
 	}
 
 	apiKeyID := record.APIKeyID
-	result, err := s.claimFromPayload(c, record.UserID, &apiKeyID)
+	result, err := s.claimResultFromPayload(c, record.UserID, &apiKeyID)
 	if err != nil {
 		return err
 	}
 	return c.JSON(http.StatusOK, result)
 }
 
-func (s *Service) claimFromPayload(c echo.Context, userID int64, apiKeyID *int64) (*claimResult, error) {
+func (s *Service) claimResultFromPayload(c echo.Context, userID int64, apiKeyID *int64) (*claimResult, error) {
 	payload := claimRequestPayload{Count: 1}
 	if c.Request().ContentLength > 0 {
 		if err := c.Bind(&payload); err != nil && err != io.EOF {

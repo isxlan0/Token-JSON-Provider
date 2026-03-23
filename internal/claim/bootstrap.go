@@ -36,9 +36,15 @@ func (s *Service) buildBootstrapPayload(ctx context.Context, requestContext *aut
 		return nil, err
 	}
 
+	claimRealtime, err := s.GetClaimRealtimeSnapshot(ctx, requestContext.UserID, requestContext.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
 	return map[string]any{
 		"profile":        profile,
 		"dashboard":      dashboard,
+		"claim_realtime": claimRealtime,
 		"queue_status":   queueStatus,
 		"upload_results": buildUploadResultsSummaryPayload(s.GetUploadResults(requestContext.UserID)),
 	}, nil
@@ -76,6 +82,20 @@ func (s *Service) cachedAdminTokensPage(ctx context.Context, search string, stat
 	})
 }
 
+func (s *Service) cachedAdminQueuePage(ctx context.Context, search string, statusFilter string, onlyFilter string, limit int, offset int) (map[string]any, error) {
+	cacheKey := s.adminQueueCacheKey(
+		"admin-queue",
+		strings.ToLower(strings.TrimSpace(search)),
+		strings.ToLower(strings.TrimSpace(statusFilter)),
+		strings.ToLower(strings.TrimSpace(onlyFilter)),
+		limit,
+		offset,
+	)
+	return runtimecache.CacheJSON(s.cache, cacheKey, s.cfg.Cache.AdminTTL, func() (map[string]any, error) {
+		return s.ListQueueForAdmin(ctx, search, statusFilter, onlyFilter, limit, offset)
+	})
+}
+
 func (s *Service) buildAdminBootstrapPayload(ctx context.Context, requestContext *auth.RequestContext) (map[string]any, error) {
 	me, err := s.GetAdminMe(ctx, requestContext)
 	if err != nil {
@@ -97,6 +117,11 @@ func (s *Service) buildAdminBootstrapPayload(ctx context.Context, requestContext
 		return nil, err
 	}
 
+	queue, err := s.cachedAdminQueuePage(ctx, "", "queued", adminQueueOnlyAll, defaultAdminQueueLimit, 0)
+	if err != nil {
+		return nil, err
+	}
+
 	policy, err := s.GetAdminPolicy(ctx)
 	if err != nil {
 		return nil, err
@@ -107,6 +132,7 @@ func (s *Service) buildAdminBootstrapPayload(ctx context.Context, requestContext
 		"users":  users,
 		"bans":   bans,
 		"tokens": tokens,
+		"queue":  queue,
 		"policy": policy,
 	}, nil
 }
@@ -123,7 +149,7 @@ func (s *Service) GetAdminBootstrap(ctx context.Context, requestContext *auth.Re
 }
 
 func (s *Service) warmReadCaches(ctx context.Context) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || !s.waitForStartupReady(ctx) {
 		return
 	}
 
@@ -184,6 +210,9 @@ func (s *Service) primeAdminDefaultReadCaches(ctx context.Context) {
 	if _, err := s.cachedAdminTokensPage(ctx, "", "", defaultAdminTokensLimit, 0); err != nil {
 		s.logger.Warn("warm admin tokens cache", "error", err)
 	}
+	if _, err := s.cachedAdminQueuePage(ctx, "", "queued", adminQueueOnlyAll, defaultAdminQueueLimit, 0); err != nil {
+		s.logger.Warn("warm admin queue cache", "error", err)
+	}
 	if _, err := s.GetAdminPolicy(ctx); err != nil {
 		s.logger.Warn("warm admin policy cache", "error", err)
 	}
@@ -237,7 +266,11 @@ func (s *Service) buildRequestContextForUserID(ctx context.Context, userID int64
 }
 
 func (s *Service) getUserByID(ctx context.Context, userID int64) (*database.User, error) {
-	row := s.store.DB().QueryRowContext(ctx, `
+	return s.getUserByIDQueryer(ctx, s.store.DB(), userID)
+}
+
+func (s *Service) getUserByIDQueryer(ctx context.Context, queryer sqlQueryer, userID int64) (*database.User, error) {
+	row := queryer.QueryRowContext(ctx, `
 		SELECT id, linuxdo_user_id, linuxdo_username, linuxdo_name, trust_level, created_at_ts, last_login_at_ts
 		FROM users
 		WHERE id = ?

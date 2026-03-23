@@ -44,12 +44,13 @@ type LinuxDOUser struct {
 }
 
 type RequestContext struct {
-	UserID   int64 `json:"user_id"`
-	DBUser   *database.User
-	User     UserPayload `json:"user"`
-	IsAdmin  bool        `json:"is_admin"`
-	Ban      *BanPayload `json:"ban"`
-	IsBanned bool        `json:"is_banned"`
+	UserID    int64 `json:"user_id"`
+	SessionID string `json:"session_id,omitempty"`
+	DBUser    *database.User
+	User      UserPayload `json:"user"`
+	IsAdmin   bool        `json:"is_admin"`
+	Ban       *BanPayload `json:"ban"`
+	IsBanned  bool        `json:"is_banned"`
 }
 
 type UserPayload struct {
@@ -255,12 +256,13 @@ func (s *Service) getRequestContext(c echo.Context) (*RequestContext, error) {
 	}
 
 	return &RequestContext{
-		UserID:   dbUser.ID,
-		DBUser:   dbUser,
-		User:     userPayload,
-		IsAdmin:  userPayload.IsAdmin,
-		Ban:      ban,
-		IsBanned: ban != nil,
+		UserID:    dbUser.ID,
+		SessionID: strings.TrimSpace(sessionState.Auth.SessionID),
+		DBUser:    dbUser,
+		User:      userPayload,
+		IsAdmin:   userPayload.IsAdmin,
+		Ban:       ban,
+		IsBanned:  ban != nil,
 	}, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestStartupReconcileTokenFilesLogsInfoOnCancel(t *testing.T) {
@@ -63,6 +64,40 @@ func TestReconcileTokenFilesReturnsCancelBeforeScanning(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected cancelled reconcile to skip imports, got %d tokens", count)
+	}
+}
+
+func TestEnqueueTokenImportWaitsForChannelCapacity(t *testing.T) {
+	service, _ := newClaimTestService(t)
+	service.tokenImportCh = make(chan tokenImportRequest, 1)
+	service.tokenImportCh <- tokenImportRequest{fileName: "busy.json", reason: "existing"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		service.enqueueTokenImport(ctx, "queued.json", "watch")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("expected enqueue to block while channel is full")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	<-service.tokenImportCh
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected enqueue to finish after channel capacity is available")
+	}
+
+	request := <-service.tokenImportCh
+	if request.fileName != "queued.json" || request.reason != "watch" {
+		t.Fatalf("unexpected queued request: %+v", request)
 	}
 }
 

@@ -22,6 +22,9 @@ type userEventSubscription struct {
 type queueStatusEventBroker = userEventBroker
 type queueStatusSubscription = userEventSubscription
 
+type claimRealtimeEventBroker = userEventBroker
+type claimRealtimeSubscription = userEventSubscription
+
 type uploadResultsEventBroker = userEventBroker
 type uploadResultsSubscription = userEventSubscription
 
@@ -32,6 +35,10 @@ func newUserEventBroker() *userEventBroker {
 }
 
 func newQueueStatusEventBroker() *queueStatusEventBroker {
+	return newUserEventBroker()
+}
+
+func newClaimRealtimeEventBroker() *claimRealtimeEventBroker {
 	return newUserEventBroker()
 }
 

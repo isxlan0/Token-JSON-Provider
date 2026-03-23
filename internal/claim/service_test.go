@@ -89,6 +89,35 @@ func TestQueuedClaimCanBeFulfilledByQueuePump(t *testing.T) {
 	}
 }
 
+func TestGetQueueStatusCachesMissAndReusesSnapshot(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10021", "queue-cache-user")
+	insertTestQueuedEntry(t, store, userID, nil, 2, 2, 1, "queue-cache-row", time.Now().Add(-time.Minute).Unix())
+
+	first, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get first queue status: %v", err)
+	}
+	if !first.Queued || first.QueueID <= 0 {
+		t.Fatalf("expected queued snapshot on first read, got %+v", first)
+	}
+
+	if _, err := store.DB().Exec(`DELETE FROM claim_queue WHERE id = ?`, first.QueueID); err != nil {
+		t.Fatalf("delete queue row after first snapshot: %v", err)
+	}
+
+	second, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get second queue status: %v", err)
+	}
+	if !second.Queued || second.QueueID != first.QueueID {
+		t.Fatalf("expected second queue status to be served from cache, got first=%+v second=%+v", first, second)
+	}
+}
+
 func TestServiceStopWaitsForWorkersToExit(t *testing.T) {
 	service, _ := newClaimTestService(t)
 
@@ -246,9 +275,51 @@ func TestAdminBootstrapIncludesDefaultDatasets(t *testing.T) {
 		t.Fatalf("admin bootstrap tokens payload unexpected: %#v", payload["tokens"])
 	}
 
+	queue, ok := payload["queue"].(map[string]any)
+	if !ok || queue["limit"] != defaultAdminQueueLimit {
+		t.Fatalf("admin bootstrap queue payload unexpected: %#v", payload["queue"])
+	}
+
 	policy, ok := payload["policy"].(map[string]any)
 	if !ok || policy["system"] == nil {
 		t.Fatalf("admin bootstrap policy payload unexpected: %#v", payload["policy"])
+	}
+}
+
+func TestAdminQueueCacheUsesDedicatedScope(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10022", "admin-queue-cache-user")
+	insertTestQueuedEntry(t, store, userID, nil, 1, 1, 1, "admin-queue-cache-row-1", time.Now().Add(-time.Minute).Unix())
+
+	first, err := service.cachedAdminQueuePage(ctx, "", "queued", adminQueueOnlyAll, 50, 0)
+	if err != nil {
+		t.Fatalf("load first cached admin queue page: %v", err)
+	}
+	if intFromAny(first["total"]) != 1 {
+		t.Fatalf("expected first admin queue total to be 1, got %+v", first)
+	}
+
+	insertTestQueuedEntry(t, store, userID, nil, 1, 1, 2, "admin-queue-cache-row-2", time.Now().Unix())
+	service.invalidateAdminCache()
+
+	second, err := service.cachedAdminQueuePage(ctx, "", "queued", adminQueueOnlyAll, 50, 0)
+	if err != nil {
+		t.Fatalf("load second cached admin queue page: %v", err)
+	}
+	if intFromAny(second["total"]) != 1 {
+		t.Fatalf("expected generic admin invalidation to keep queue cache warm, got %+v", second)
+	}
+
+	service.invalidateAdminQueueCache()
+	third, err := service.cachedAdminQueuePage(ctx, "", "queued", adminQueueOnlyAll, 50, 0)
+	if err != nil {
+		t.Fatalf("load refreshed admin queue page: %v", err)
+	}
+	if intFromAny(third["total"]) != 2 {
+		t.Fatalf("expected queue-specific invalidation to refresh cache, got %+v", third)
 	}
 }
 
@@ -297,6 +368,9 @@ func newClaimTestService(t *testing.T) (*Service, *database.Store) {
 		},
 		LinuxDO: config.LinuxDOConfig{
 			MinTrustLevel: 0,
+		},
+		Files: config.FilesConfig{
+			TokenDir: filepath.Join(t.TempDir(), "tokens"),
 		},
 		Upload: config.UploadConfig{
 			MaxFilesPerRequest: 10,

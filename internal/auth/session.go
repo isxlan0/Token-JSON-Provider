@@ -33,6 +33,7 @@ type SessionState struct {
 }
 
 type SessionAuth struct {
+	SessionID  string              `json:"session_id,omitempty"`
 	Method     string              `json:"method"`
 	UserID     int64               `json:"user_id"`
 	LoggedInAt string              `json:"logged_in_at"`

@@ -20,6 +20,7 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 		"TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL=-4\n" +
 		"TOKEN_INDEX_LINUXDO_ALLOWED_IDS= 12, 34 \n" +
 		"TOKEN_DB_PATH=\n" +
+		"TOKEN_FILES_DIR=data/token-files\n" +
 		"TOKEN_INDEX_ADMIN_IDS=123,@RootUser\n" +
 		"TOKEN_CACHE_BACKEND=REDIS\n" +
 		"TOKEN_CACHE_DEFAULT_TTL_SEC=0\n" +
@@ -58,6 +59,9 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 	if cfg.Database.Path != filepath.Join(dir, "token_atlas.db") {
 		t.Fatalf("unexpected database path: %q", cfg.Database.Path)
 	}
+	if cfg.Files.TokenDir != filepath.Join(dir, "data", "token-files") {
+		t.Fatalf("unexpected token files dir: %q", cfg.Files.TokenDir)
+	}
 	if cfg.Cache.Backend != "redis" {
 		t.Fatalf("unexpected cache backend: %q", cfg.Cache.Backend)
 	}
@@ -95,6 +99,7 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	envBody := "" +
 		"PORT=8000\n" +
 		"TOKEN_INDEX_ADMIN_IDENTITIES=456,@file-user\n" +
+		"TOKEN_FILES_DIR=file-token-dir\n" +
 		"TOKEN_CACHE_BACKEND=memory\n"
 
 	if err := os.WriteFile(envPath, []byte(envBody), 0o644); err != nil {
@@ -104,6 +109,7 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	t.Setenv(envPort, "9001")
 	t.Setenv(envAdminIdentities, "@process-user")
 	t.Setenv(envCacheBackend, "AUTO")
+	t.Setenv(envTokenFilesDir, filepath.Join(dir, "process-token-dir"))
 
 	cfg, err := loadFromPath(envPath)
 	if err != nil {
@@ -115,6 +121,9 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	}
 	if cfg.Cache.Backend != "auto" {
 		t.Fatalf("unexpected cache backend: %q", cfg.Cache.Backend)
+	}
+	if cfg.Files.TokenDir != filepath.Join(dir, "process-token-dir") {
+		t.Fatalf("unexpected token files dir: %q", cfg.Files.TokenDir)
 	}
 	if len(cfg.APIKeys.AdminIdentities.IDs) != 0 {
 		t.Fatalf("expected process env to replace file admin identities")
@@ -152,6 +161,9 @@ func TestLoadFromPathUsesOneHourCacheDefaults(t *testing.T) {
 	}
 	if cfg.Cache.DashboardTTL != 3600 {
 		t.Fatalf("unexpected dashboard ttl: %d", cfg.Cache.DashboardTTL)
+	}
+	if cfg.Files.TokenDir != filepath.Join(dir, "token") {
+		t.Fatalf("unexpected token files dir default: %q", cfg.Files.TokenDir)
 	}
 }
 
