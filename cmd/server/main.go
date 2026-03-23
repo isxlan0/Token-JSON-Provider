@@ -66,7 +66,10 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	store, err := dbstore.Open(cfg.Database.Path)
+	store, err := dbstore.OpenWithOptions(cfg.Database.Path, dbstore.OpenOptions{
+		MaxOpenConns: cfg.Database.MaxOpenConns,
+		MaxIdleConns: cfg.Database.MaxIdleConns,
+	})
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -127,7 +130,16 @@ func run(logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 
 	go func() {
-		logger.Info("starting go server", "addr", addr, "db_path", cfg.Database.Path, "runtime_root", runtimeRoot)
+		dbStats := store.DB().Stats()
+		logger.Info(
+			"starting go server",
+			"addr", addr,
+			"db_path", cfg.Database.Path,
+			"db_max_open_connections", dbStats.MaxOpenConnections,
+			"db_max_idle_connections", cfg.Database.MaxIdleConns,
+			"cache_backend", appCache.BackendName(),
+			"runtime_root", runtimeRoot,
+		)
 		errCh <- e.Start(addr)
 	}()
 

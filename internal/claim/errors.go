@@ -12,6 +12,8 @@ import (
 
 var errCorruptClaimData = errors.New("stored claim content is corrupted")
 
+var errDatabaseBusyWaitExceeded = errors.New("database busy wait exceeded")
+
 const (
 	dbBusyRetryAttempts  = 4
 	dbBusyRetryBaseDelay = 200 * time.Millisecond
@@ -46,6 +48,9 @@ func mapDatabaseBusyError(c echo.Context, err error) error {
 func isDatabaseBusyError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errDatabaseBusyWaitExceeded) {
+		return true
 	}
 
 	message := strings.ToLower(err.Error())
@@ -91,4 +96,51 @@ func runWithDatabaseBusyRetry[T any](ctx context.Context, fn func() (T, error)) 
 	}
 
 	return zero, nil
+}
+
+func wrapDatabaseBusyWaitError(waitErr error, cause error) error {
+	switch {
+	case waitErr == nil && cause == nil:
+		return errDatabaseBusyWaitExceeded
+	case waitErr == nil:
+		return errors.Join(errDatabaseBusyWaitExceeded, cause)
+	case cause == nil:
+		return errors.Join(errDatabaseBusyWaitExceeded, waitErr)
+	default:
+		return errors.Join(errDatabaseBusyWaitExceeded, waitErr, cause)
+	}
+}
+
+func waitForDatabaseAvailability[T any](ctx context.Context, onBusy func(attempt int), fn func() (T, error)) (T, error) {
+	var zero T
+	var lastErr error
+
+	for attempt := 0; attempt < dbBusyRetryAttempts; attempt++ {
+		value, err := fn()
+		if err == nil {
+			return value, nil
+		}
+		if !isDatabaseBusyError(err) {
+			return zero, err
+		}
+		lastErr = err
+		if onBusy != nil {
+			onBusy(attempt + 1)
+		}
+
+		if attempt+1 >= dbBusyRetryAttempts {
+			return zero, wrapDatabaseBusyWaitError(nil, lastErr)
+		}
+
+		delay := dbBusyRetryDelay(attempt + 1)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, wrapDatabaseBusyWaitError(ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
+
+	return zero, wrapDatabaseBusyWaitError(nil, lastErr)
 }

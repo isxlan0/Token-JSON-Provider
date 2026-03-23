@@ -67,6 +67,40 @@ func TestInitCreatesSchemaAndIndexes(t *testing.T) {
 	}
 }
 
+func TestOpenUsesConfiguredSQLiteConnectionPoolDefaults(t *testing.T) {
+	store := openTempStore(t)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	stats := store.DB().Stats()
+	if stats.MaxOpenConnections != defaultSQLiteMaxOpenConns {
+		t.Fatalf("expected sqlite max open connections to be %d, got %d", defaultSQLiteMaxOpenConns, stats.MaxOpenConnections)
+	}
+	if stats.MaxIdleClosed != 0 {
+		t.Fatalf("unexpected max idle closed count on fresh store: %d", stats.MaxIdleClosed)
+	}
+}
+
+func TestOpenWithOptionsUsesConfiguredSQLiteConnectionPool(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "configured.db")
+	store, err := OpenWithOptions(dbPath, OpenOptions{
+		MaxOpenConns: 5,
+		MaxIdleConns: 3,
+	})
+	if err != nil {
+		t.Fatalf("open configured store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	stats := store.DB().Stats()
+	if stats.MaxOpenConnections != 5 {
+		t.Fatalf("expected sqlite max open connections to be 5, got %d", stats.MaxOpenConnections)
+	}
+}
+
 func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 	db := openSQLite(t, dbPath)

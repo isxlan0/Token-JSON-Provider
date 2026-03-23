@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -270,8 +271,10 @@ func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int
 				recentContributorsResult.Degraded ||
 				trendsResult.Degraded
 			degradedReason := ""
+			payloadDataSource := dataSourceLive
 			if degraded {
 				degradedReason = degradedReasonPartialData
+				payloadDataSource = dataSourceStale
 			}
 
 			return annotateDashboardPayload(map[string]any{
@@ -282,15 +285,21 @@ func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int
 				"recent_contributors": recentContributorsPayload,
 				"trends":              trendsPayload,
 				"system":              systemPayload,
-			}, dataSourceLive, isoformatNow(), "", degradedReason, degraded), nil
+			}, payloadDataSource, isoformatNow(), "", degradedReason, degraded), nil
 		},
 	)
 	payload := payloadResult.Value
 	if payload != nil {
 		payloadDegraded, _ := payload["degraded"].(bool)
+		finalDataSource := payloadResult.DataSource
+		if embeddedDataSource, ok := payload["data_source"].(string); ok && strings.TrimSpace(embeddedDataSource) != "" {
+			if payloadResult.DataSource == dataSourceLive || payloadDegraded {
+				finalDataSource = embeddedDataSource
+			}
+		}
 		payload = annotateDashboardPayload(
 			payload,
-			payloadResult.DataSource,
+			finalDataSource,
 			payloadResult.GeneratedAt,
 			payloadResult.StaleAt,
 			payloadResult.DegradedReason,
@@ -298,11 +307,10 @@ func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int
 		)
 	}
 
-	s.logger.Info(
-		"get dashboard summary",
+	logArgs := []any{
 		"user_id", userID,
 		"cache_state", cacheStateLabel(payloadResult.CacheState),
-		"data_source", payloadResult.DataSource,
+		"data_source", payload["data_source"],
 		"total_ms", durationMillis(time.Since(startedAt)),
 		"stats_ms", durationMillis(statsDuration),
 		"system_ms", durationMillis(systemDuration),
@@ -341,7 +349,12 @@ func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int
 		"contributors_error", contributorsError,
 		"recent_contributors_error", recentContributorsError,
 		"trends_error", trendsError,
-		"error", err,
+	}
+	logArgs = append(logArgs, s.dbStatsLogArgs()...)
+	logArgs = append(logArgs, "error", err)
+	s.logger.Info(
+		"get dashboard summary",
+		logArgs...,
 	)
 	return payload, err
 }

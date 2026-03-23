@@ -19,6 +19,8 @@ const (
 	envLinuxDOMinTrustLevel     = "TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL"
 	envLinuxDOAllowedIDs        = "TOKEN_INDEX_LINUXDO_ALLOWED_IDS"
 	envDBPath                   = "TOKEN_DB_PATH"
+	envDBMaxOpenConns           = "TOKEN_DB_MAX_OPEN_CONNS"
+	envDBMaxIdleConns           = "TOKEN_DB_MAX_IDLE_CONNS"
 	envTokenFilesDir            = "TOKEN_FILES_DIR"
 	envAdminIdentities          = "TOKEN_INDEX_ADMIN_IDENTITIES"
 	envAdminIDsAlias            = "TOKEN_INDEX_ADMIN_IDS"
@@ -66,6 +68,8 @@ var knownEnvKeys = []string{
 	envLinuxDOMinTrustLevel,
 	envLinuxDOAllowedIDs,
 	envDBPath,
+	envDBMaxOpenConns,
+	envDBMaxIdleConns,
 	envTokenFilesDir,
 	envAdminIdentities,
 	envAdminIDsAlias,
@@ -129,7 +133,9 @@ type LinuxDOConfig struct {
 }
 
 type DatabaseConfig struct {
-	Path string
+	Path         string
+	MaxOpenConns int
+	MaxIdleConns int
 }
 
 type FilesConfig struct {
@@ -238,7 +244,9 @@ func loadFromPath(path string) (Config, error) {
 			AllowedIDs:    splitToSet(source.rawTrimmed(envLinuxDOAllowedIDs, "")),
 		},
 		Database: DatabaseConfig{
-			Path: source.databasePath(baseDir),
+			Path:         source.databasePath(baseDir),
+			MaxOpenConns: maxInt(1, source.cleanedInt(envDBMaxOpenConns, 8)),
+			MaxIdleConns: maxInt(1, source.cleanedInt(envDBMaxIdleConns, 8)),
 		},
 		Files: FilesConfig{
 			TokenDir: source.tokenFilesDir(baseDir),

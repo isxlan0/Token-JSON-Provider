@@ -2,6 +2,7 @@ package claim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,9 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+
+	"token-atlas/internal/config"
+	"token-atlas/internal/runtimecache"
 )
 
 func TestServiceStartMarksReadyAfterInitialReconcile(t *testing.T) {
@@ -46,6 +50,7 @@ func TestServiceStartMarksReadyAfterInitialReconcile(t *testing.T) {
 
 func TestHealthReportsServiceUnavailableUntilStartupReady(t *testing.T) {
 	service, _ := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
 	e := echo.New()
 
 	request := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -66,6 +71,19 @@ func TestHealthReportsServiceUnavailableUntilStartupReady(t *testing.T) {
 	}
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected ok after ready, got %d", recorder.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode health payload: %v", err)
+	}
+	cachePayload, ok := payload["cache"].(map[string]any)
+	if !ok || cachePayload["backend"] != "memory" {
+		t.Fatalf("expected health payload to expose memory cache backend, got %#v", payload["cache"])
+	}
+	databasePayload, ok := payload["database"].(map[string]any)
+	if !ok || intFromAny(databasePayload["max_open_connections"]) <= 0 {
+		t.Fatalf("expected health payload to expose database stats, got %#v", payload["database"])
 	}
 }
 

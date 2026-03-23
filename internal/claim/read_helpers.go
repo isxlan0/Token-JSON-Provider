@@ -230,6 +230,63 @@ func isReadDegradeError(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || isDatabaseBusyError(err)
 }
 
+func (s *Service) dbStatsLogArgs() []any {
+	if s == nil || s.store == nil || s.store.DB() == nil {
+		return nil
+	}
+
+	stats := s.store.DB().Stats()
+	return []any{
+		"db_open_connections", stats.OpenConnections,
+		"db_in_use_connections", stats.InUse,
+		"db_idle_connections", stats.Idle,
+		"db_max_open_connections", stats.MaxOpenConnections,
+		"db_config_max_idle_connections", s.cfg.Database.MaxIdleConns,
+		"db_wait_count", stats.WaitCount,
+		"db_wait_duration_ms", durationMillis(stats.WaitDuration),
+	}
+}
+
+func (s *Service) databaseStatsPayload() map[string]any {
+	if s == nil || s.store == nil || s.store.DB() == nil {
+		return map[string]any{}
+	}
+
+	stats := s.store.DB().Stats()
+	return map[string]any{
+		"open_connections":     stats.OpenConnections,
+		"in_use_connections":   stats.InUse,
+		"idle_connections":     stats.Idle,
+		"max_open_connections": stats.MaxOpenConnections,
+		"max_idle_connections": s.cfg.Database.MaxIdleConns,
+		"wait_count":           stats.WaitCount,
+		"wait_duration_ms":     durationMillis(stats.WaitDuration),
+		"max_idle_closed":      stats.MaxIdleClosed,
+		"max_lifetime_closed":  stats.MaxLifetimeClosed,
+		"max_idle_time_closed": stats.MaxIdleTimeClosed,
+	}
+}
+
+func (s *Service) cacheStatsPayload() map[string]any {
+	if s == nil || s.cache == nil {
+		return map[string]any{
+			"backend": "disabled",
+		}
+	}
+
+	stats := s.cache.StatsSnapshot()
+	return map[string]any{
+		"backend":             stats.BackendName,
+		"local_hits":          stats.LocalHits,
+		"backend_hits":        stats.BackendHits,
+		"misses":              stats.Misses,
+		"sets":                stats.Sets,
+		"deletes":             stats.Deletes,
+		"scope_version_reads": stats.ScopeVersionReads,
+		"scope_bumps":         stats.ScopeBumps,
+	}
+}
+
 func (s *Service) defaultUploadPolicyPayload() map[string]int {
 	return map[string]int{
 		"max_files_per_request": s.cfg.Upload.MaxFilesPerRequest,
@@ -533,6 +590,10 @@ func getCachedJSON[T any](cache *runtimecache.AppCache, key string) (T, bool) {
 
 func (s *Service) getCachedRuntimeSnapshot(userID int64) (runtimeSnapshotPayload, bool) {
 	return getCachedJSON[runtimeSnapshotPayload](s.cache, s.userRuntimeSnapshotCacheKey(userID))
+}
+
+func (s *Service) getCachedStaleRuntimeSnapshot(userID int64) (staleReadEnvelope[runtimeSnapshotPayload], bool) {
+	return getCachedJSON[staleReadEnvelope[runtimeSnapshotPayload]](s.cache, s.userRuntimeSnapshotStaleCacheKey(userID))
 }
 
 func (s *Service) getCachedProfile(userID int64, isAdmin bool) (profilePayload, bool) {

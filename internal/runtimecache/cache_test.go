@@ -88,3 +88,37 @@ func TestCacheJSONWithStateMemoryHit(t *testing.T) {
 		t.Fatalf("unexpected memory hit payload: %#v", value)
 	}
 }
+
+func TestAppCacheUsesFrontCacheForHotSnapshotKeys(t *testing.T) {
+	cache := &AppCache{
+		backendName: "redis",
+		backend:     newMemoryBackend(),
+		frontCache:  newMemoryBackend(),
+		flights:     make(map[string]*cacheFlight),
+	}
+
+	if err := cache.backend.setText("snapshot:user-runtime-snapshot:42", `{"value":19}`, time.Minute); err != nil {
+		t.Fatalf("seed backend cache entry: %v", err)
+	}
+
+	raw, ok := cache.GetText("snapshot:user-runtime-snapshot:42")
+	if !ok || raw != `{"value":19}` {
+		t.Fatalf("expected backend hit to return seeded payload, got ok=%v raw=%q", ok, raw)
+	}
+
+	if _, ok := cache.frontCache.getText("snapshot:user-runtime-snapshot:42"); !ok {
+		t.Fatal("expected backend read to populate front cache")
+	}
+
+	if _, ok := cache.GetText("snapshot:user-runtime-snapshot:42"); !ok {
+		t.Fatal("expected front cache hit on second read")
+	}
+
+	stats := cache.StatsSnapshot()
+	if stats.BackendHits != 1 {
+		t.Fatalf("expected one backend hit, got %+v", stats)
+	}
+	if stats.LocalHits != 1 {
+		t.Fatalf("expected one local hit, got %+v", stats)
+	}
+}

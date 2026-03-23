@@ -54,6 +54,17 @@ func (s *Service) GetBootstrap(ctx context.Context, requestContext *auth.Request
 				profile.Uploads = runtimeSnapshot.Uploads
 			}
 			profileSource = dataSourceCache
+		} else if stale, ok := s.getCachedStaleRuntimeSnapshot(requestContext.UserID); ok {
+			profile = s.defaultProfilePayload(requestContext)
+			profile.Quota = stale.Value.Quota
+			profile.Claims = stale.Value.Claims
+			if summary, ok := stale.Value.APIKeys["summary"]; ok {
+				profile.APIKeys = summary
+			}
+			if stale.Value.Uploads != nil {
+				profile.Uploads = stale.Value.Uploads
+			}
+			profileSource = dataSourceStale
 		}
 	}
 	profileDuration = time.Since(profileStartedAt)

@@ -181,7 +181,12 @@ func (s *Service) getRuntimeSnapshot(c echo.Context) error {
 		if !isReadDegradeError(err) {
 			return err
 		}
-		if cached, ok := s.getCachedRuntimeSnapshot(requestContext.UserID); ok {
+		if stale, ok := s.getCachedStaleRuntimeSnapshot(requestContext.UserID); ok {
+			payload = stale.Value
+			payload.DataSource = dataSourceStale
+			payload.GeneratedAt = stale.GeneratedAt
+			payload.StaleAt = staleTimestamp(stale.GeneratedAt)
+		} else if cached, ok := s.getCachedRuntimeSnapshot(requestContext.UserID); ok {
 			payload = cached
 			payload.DataSource = dataSourceCache
 			payload.StaleAt = staleTimestamp(payload.GeneratedAt)

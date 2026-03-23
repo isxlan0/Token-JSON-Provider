@@ -2,15 +2,22 @@ package claim
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"token-atlas/internal/auth"
+	"token-atlas/internal/config"
 	proberuntime "token-atlas/internal/probe"
+	"token-atlas/internal/runtimecache"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestQueueUploadBatchAcceptsAndPreservesExtraFields(t *testing.T) {
@@ -77,6 +84,298 @@ func TestQueueUploadBatchAcceptsAndPreservesExtraFields(t *testing.T) {
 	extra, ok := payload["extra"].(map[string]any)
 	if !ok || extra["region"] != "hk" {
 		t.Fatalf("expected extra field to be preserved, got %#v", payload["extra"])
+	}
+}
+
+func TestUploadWaitsForDatabaseAvailabilityBeforeAccepting(t *testing.T) {
+	service, store := newClaimTestService(t)
+	probe := newBlockingProbe()
+	service.probe = probe
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.Start(ctx)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	userID := insertTestUser(t, store, "20011", "db-wait-uploader")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "20011",
+			Username:   "db-wait-uploader",
+			Name:       "DB Wait Uploader",
+			TrustLevel: 2,
+		},
+	}
+
+	files := []uploadFileInput{{
+		Name:          "db-wait.json",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(`{"account_id":"acct-db-wait","access_token":"token-db-wait","refresh_token":"refresh-db-wait"}`)),
+	}}
+
+	result, err := service.QueueUploadBatch(context.Background(), requestContext, files)
+	if err != nil {
+		t.Fatalf("queue upload batch: %v", err)
+	}
+	if got := result["summary"].(map[string]int)["queued"]; got != 1 {
+		t.Fatalf("expected initial queued summary, got %+v", result["summary"])
+	}
+
+	probe.waitUntilStarted(t)
+
+	releaseLock := holdSQLiteWriteLock(t, store.DB())
+	lockReleased := false
+	defer func() {
+		if !lockReleased {
+			releaseLock()
+		}
+	}()
+
+	probe.release()
+
+	waitingItem := waitForUploadItem(t, service, userID, 15*time.Second, func(item map[string]any) bool {
+		return item["status"] == "processing" && item["stage"] == "waiting_db"
+	})
+	if waitingItem["stage_label"] != "等待入库" {
+		t.Fatalf("expected waiting_db stage label, got %#v", waitingItem)
+	}
+
+	waitingSummary := service.GetUploadResults(userID)["summary"].(map[string]int)
+	if waitingSummary["processing"] != 1 {
+		t.Fatalf("expected processing summary while database is locked, got %+v", waitingSummary)
+	}
+	if waitingSummary["db_busy"] != 0 {
+		t.Fatalf("expected db_busy summary to remain 0 while task waits, got %+v", waitingSummary)
+	}
+
+	entries, err := os.ReadDir(service.cfg.Files.TokenDir)
+	if err != nil {
+		t.Fatalf("read token dir while waiting: %v", err)
+	}
+	tempCount := 0
+	finalCount := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case strings.HasSuffix(name, ".uploading"):
+			tempCount++
+		case strings.HasSuffix(name, ".json"):
+			finalCount++
+		}
+	}
+	if tempCount != 1 || finalCount != 0 {
+		t.Fatalf("expected exactly one temp upload file and no final json while waiting, got temp=%d final=%d entries=%v", tempCount, finalCount, entries)
+	}
+
+	releaseLock()
+	lockReleased = true
+
+	acceptedItem := waitForUploadItem(t, service, userID, 15*time.Second, func(item map[string]any) bool {
+		return item["status"] == "accepted"
+	})
+	if acceptedItem["stage"] != "accepted" {
+		t.Fatalf("expected accepted upload item after lock release, got %#v", acceptedItem)
+	}
+
+	var storedCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM tokens WHERE account_id = 'acct-db-wait'`).Scan(&storedCount); err != nil {
+		t.Fatalf("query stored upload count: %v", err)
+	}
+	if storedCount != 1 {
+		t.Fatalf("expected uploaded token to be stored exactly once, got %d", storedCount)
+	}
+
+	entries, err = os.ReadDir(service.cfg.Files.TokenDir)
+	if err != nil {
+		t.Fatalf("read token dir after accept: %v", err)
+	}
+	tempCount = 0
+	finalPath := ""
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case strings.HasSuffix(name, ".uploading"):
+			tempCount++
+		case strings.HasSuffix(name, ".json"):
+			finalPath = filepath.Join(service.cfg.Files.TokenDir, name)
+		}
+	}
+	if tempCount != 0 {
+		t.Fatalf("expected temp upload files to be cleaned after accept, got entries=%v", entries)
+	}
+	if finalPath == "" {
+		t.Fatalf("expected promoted final upload file after accept, got entries=%v", entries)
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Fatalf("stat promoted upload file: %v", err)
+	}
+}
+
+func TestUploadMarksDatabaseBusyWhenStoreWindowExpires(t *testing.T) {
+	service, store := newClaimTestService(t)
+	probe := newBlockingProbe()
+	service.probe = probe
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stopCancel()
+		if err := service.Stop(stopCtx); err != nil {
+			t.Fatalf("stop service: %v", err)
+		}
+	}()
+	service.Start(ctx)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	userID := insertTestUser(t, store, "20012", "db-timeout-uploader")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "20012",
+			Username:   "db-timeout-uploader",
+			Name:       "DB Timeout Uploader",
+			TrustLevel: 2,
+		},
+	}
+
+	files := []uploadFileInput{{
+		Name:          "db-timeout.json",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(`{"account_id":"acct-db-timeout","access_token":"token-db-timeout","refresh_token":"refresh-db-timeout"}`)),
+	}}
+
+	if _, err := service.QueueUploadBatch(context.Background(), requestContext, files); err != nil {
+		t.Fatalf("queue upload batch: %v", err)
+	}
+
+	probe.waitUntilStarted(t)
+
+	releaseLock := holdSQLiteWriteLock(t, store.DB())
+	defer releaseLock()
+	probe.release()
+
+	busyItem := waitForUploadItem(t, service, userID, 15*time.Second, func(item map[string]any) bool {
+		return item["status"] == "db_busy"
+	})
+	if busyItem["stage"] != "waiting_db" {
+		t.Fatalf("expected db_busy item to stay on waiting_db stage, got %#v", busyItem)
+	}
+
+	summary := service.GetUploadResults(userID)["summary"].(map[string]int)
+	if summary["db_busy"] != 1 {
+		t.Fatalf("expected db_busy summary to be 1 after timeout, got %+v", summary)
+	}
+
+	var storedCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM tokens WHERE account_id = 'acct-db-timeout'`).Scan(&storedCount); err != nil {
+		t.Fatalf("query stored upload count after db busy timeout: %v", err)
+	}
+	if storedCount != 0 {
+		t.Fatalf("expected no token record after db busy timeout, got %d", storedCount)
+	}
+
+	entries, err := os.ReadDir(service.cfg.Files.TokenDir)
+	if err != nil {
+		t.Fatalf("read token dir after db busy timeout: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".uploading") {
+			t.Fatalf("expected temp upload file cleanup after db busy timeout, got entries=%v", entries)
+		}
+	}
+}
+
+func TestUploadPromoteFailureRollsBackRuntimeAndInvalidatesInventory(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	service.promoteTokenFile = func(string, string) error {
+		return errors.New("disk full")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stopCancel()
+		if err := service.Stop(stopCtx); err != nil {
+			t.Fatalf("stop service: %v", err)
+		}
+	}()
+	service.Start(ctx)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	userID := insertTestUser(t, store, "20013", "promote-fail-uploader")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "20013",
+			Username:   "promote-fail-uploader",
+			Name:       "Promote Fail Uploader",
+			TrustLevel: 2,
+		},
+	}
+
+	inventoryVersionBefore := service.cacheScopeVersion("inventory")
+
+	files := []uploadFileInput{{
+		Name:          "promote-fail.json",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(`{"account_id":"acct-promote-fail","access_token":"token-promote-fail","refresh_token":"refresh-promote-fail"}`)),
+	}}
+
+	if _, err := service.QueueUploadBatch(context.Background(), requestContext, files); err != nil {
+		t.Fatalf("queue upload batch: %v", err)
+	}
+
+	failedItem := waitForUploadItem(t, service, userID, 5*time.Second, func(item map[string]any) bool {
+		return item["status"] == "probe_failed" && item["stage"] == "processing_failed"
+	})
+	if failedItem["reason"] != "库存文件落盘失败，请稍后重试" {
+		t.Fatalf("unexpected failed upload item: %#v", failedItem)
+	}
+
+	var storedCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM tokens WHERE account_id = 'acct-promote-fail'`).Scan(&storedCount); err != nil {
+		t.Fatalf("query stored upload count after promote failure: %v", err)
+	}
+	if storedCount != 0 {
+		t.Fatalf("expected token row to be rolled back after promote failure, got %d", storedCount)
+	}
+
+	var (
+		status          string
+		totalTokens     int
+		availableTokens int
+		unclaimedTokens int
+	)
+	if err := store.DB().QueryRow(`
+		SELECT status, total_tokens, available_tokens, unclaimed_tokens
+		FROM inventory_runtime
+		WHERE id = 1
+	`).Scan(&status, &totalTokens, &availableTokens, &unclaimedTokens); err != nil {
+		t.Fatalf("query inventory runtime after promote failure: %v", err)
+	}
+	if totalTokens != 0 || availableTokens != 0 || unclaimedTokens != 0 {
+		t.Fatalf("expected inventory runtime rollback after promote failure, got status=%q total=%d available=%d unclaimed=%d", status, totalTokens, availableTokens, unclaimedTokens)
+	}
+
+	if inventoryVersionAfter := service.cacheScopeVersion("inventory"); inventoryVersionAfter <= inventoryVersionBefore {
+		t.Fatalf("expected inventory cache scope to be invalidated after promote rollback, before=%d after=%d", inventoryVersionBefore, inventoryVersionAfter)
+	}
+
+	entries, err := os.ReadDir(service.cfg.Files.TokenDir)
+	if err != nil {
+		t.Fatalf("read token dir after promote failure: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") || strings.HasSuffix(entry.Name(), ".uploading") {
+			t.Fatalf("expected promote failure to leave no token files behind, got entries=%v", entries)
+		}
 	}
 }
 
@@ -353,6 +652,99 @@ func pushTempWorkingDir(t *testing.T) func() {
 			t.Fatalf("restore working directory: %v", err)
 		}
 	}
+}
+
+func waitForUploadItem(t *testing.T, service *Service, userID int64, timeout time.Duration, predicate func(map[string]any) bool) map[string]any {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		payload := service.GetUploadResults(userID)
+		items, _ := payload["items"].([]map[string]any)
+		for _, item := range items {
+			if predicate(item) {
+				return item
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("upload item did not reach expected state in time: %#v", payload)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func holdSQLiteWriteLock(t *testing.T, db *sql.DB) func() {
+	t.Helper()
+
+	dbPath := sqliteDatabasePath(t, db)
+	lockerDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite locker db: %v", err)
+	}
+	lockerDB.SetMaxOpenConns(1)
+	lockerDB.SetMaxIdleConns(1)
+
+	conn, err := lockerDB.Conn(context.Background())
+	if err != nil {
+		_ = lockerDB.Close()
+		t.Fatalf("open sqlite locker connection: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `PRAGMA busy_timeout = 50`); err != nil {
+		_ = conn.Close()
+		_ = lockerDB.Close()
+		t.Fatalf("set sqlite locker busy_timeout: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `PRAGMA journal_mode = WAL`); err != nil {
+		_ = conn.Close()
+		_ = lockerDB.Close()
+		t.Fatalf("set sqlite locker journal mode: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		_ = lockerDB.Close()
+		t.Fatalf("begin immediate sqlite locker transaction: %v", err)
+	}
+
+	return func() {
+		if _, err := conn.ExecContext(context.Background(), `ROLLBACK`); err != nil && !strings.Contains(err.Error(), "no transaction is active") {
+			t.Fatalf("rollback sqlite locker transaction: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("close sqlite locker connection: %v", err)
+		}
+		if err := lockerDB.Close(); err != nil {
+			t.Fatalf("close sqlite locker db: %v", err)
+		}
+	}
+}
+
+func sqliteDatabasePath(t *testing.T, db *sql.DB) string {
+	t.Helper()
+
+	rows, err := db.Query(`PRAGMA database_list`)
+	if err != nil {
+		t.Fatalf("query sqlite database_list: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			seq  int
+			name string
+			path string
+		)
+		if err := rows.Scan(&seq, &name, &path); err != nil {
+			t.Fatalf("scan sqlite database_list row: %v", err)
+		}
+		if name == "main" && strings.TrimSpace(path) != "" {
+			return path
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate sqlite database_list rows: %v", err)
+	}
+	t.Fatal("sqlite main database path not found")
+	return ""
 }
 
 type blockingProbe struct {

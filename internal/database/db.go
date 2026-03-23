@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,13 @@ import (
 )
 
 const busyTimeoutMS = 1_500
+
+const defaultSQLiteMaxOpenConns = 8
+
+type OpenOptions struct {
+	MaxOpenConns int
+	MaxIdleConns int
+}
 
 var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS users (
@@ -216,6 +222,10 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+func OpenWithOptions(path string, options OpenOptions) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("database path is empty")
@@ -226,8 +236,8 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite database %q: %w", path, err)
 	}
 
-	maxOpen := sqliteMaxOpenConns()
-	maxIdle := sqliteMaxIdleConns(maxOpen)
+	maxOpen := sqliteMaxOpenConns(options.MaxOpenConns)
+	maxIdle := sqliteMaxIdleConns(options.MaxIdleConns, maxOpen)
 	db.SetMaxOpenConns(maxOpen)
 	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(0)
@@ -357,22 +367,24 @@ func sqliteDSN(path string) string {
 	return path + "?" + query.Encode()
 }
 
-func sqliteMaxOpenConns() int {
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 4 {
-		return 4
+func sqliteMaxOpenConns(configured int) int {
+	if configured <= 0 {
+		return defaultSQLiteMaxOpenConns
 	}
-	if workers > 8 {
-		return 8
-	}
-	return workers
+	return configured
 }
 
-func sqliteMaxIdleConns(maxOpen int) int {
-	if maxOpen <= 4 {
-		return maxOpen
+func sqliteMaxIdleConns(configured int, maxOpen int) int {
+	if configured > 0 {
+		if maxOpen > 0 && configured > maxOpen {
+			return maxOpen
+		}
+		return configured
 	}
-	return 4
+	if maxOpen <= 0 {
+		return 1
+	}
+	return maxOpen
 }
 
 func ensureClaimColumns(ctx context.Context, tx *sql.Tx) error {

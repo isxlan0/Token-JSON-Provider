@@ -240,6 +240,8 @@ func (s *Service) getHealth(c echo.Context) error {
 		"ready":       ready,
 		"token_count": inventory["total"],
 		"updated_at":  index["updated_at"],
+		"cache":       s.cacheStatsPayload(),
+		"database":    s.databaseStatsPayload(),
 		"startup":     s.startupHealthPayload(),
 	})
 }

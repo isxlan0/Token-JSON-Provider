@@ -20,6 +20,8 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 		"TOKEN_INDEX_LINUXDO_MIN_TRUST_LEVEL=-4\n" +
 		"TOKEN_INDEX_LINUXDO_ALLOWED_IDS= 12, 34 \n" +
 		"TOKEN_DB_PATH=\n" +
+		"TOKEN_DB_MAX_OPEN_CONNS=11\n" +
+		"TOKEN_DB_MAX_IDLE_CONNS=7\n" +
 		"TOKEN_FILES_DIR=data/token-files\n" +
 		"TOKEN_INDEX_ADMIN_IDS=123,@RootUser\n" +
 		"TOKEN_CACHE_BACKEND=REDIS\n" +
@@ -58,6 +60,12 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 	}
 	if cfg.Database.Path != filepath.Join(dir, "token_atlas.db") {
 		t.Fatalf("unexpected database path: %q", cfg.Database.Path)
+	}
+	if cfg.Database.MaxOpenConns != 11 {
+		t.Fatalf("unexpected database max open conns: %d", cfg.Database.MaxOpenConns)
+	}
+	if cfg.Database.MaxIdleConns != 7 {
+		t.Fatalf("unexpected database max idle conns: %d", cfg.Database.MaxIdleConns)
 	}
 	if cfg.Files.TokenDir != filepath.Join(dir, "data", "token-files") {
 		t.Fatalf("unexpected token files dir: %q", cfg.Files.TokenDir)
@@ -100,7 +108,8 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 		"PORT=8000\n" +
 		"TOKEN_INDEX_ADMIN_IDENTITIES=456,@file-user\n" +
 		"TOKEN_FILES_DIR=file-token-dir\n" +
-		"TOKEN_CACHE_BACKEND=memory\n"
+		"TOKEN_CACHE_BACKEND=memory\n" +
+		"TOKEN_DB_MAX_OPEN_CONNS=6\n"
 
 	if err := os.WriteFile(envPath, []byte(envBody), 0o644); err != nil {
 		t.Fatalf("write env file: %v", err)
@@ -110,6 +119,7 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	t.Setenv(envAdminIdentities, "@process-user")
 	t.Setenv(envCacheBackend, "AUTO")
 	t.Setenv(envTokenFilesDir, filepath.Join(dir, "process-token-dir"))
+	t.Setenv(envDBMaxIdleConns, "5")
 
 	cfg, err := loadFromPath(envPath)
 	if err != nil {
@@ -124,6 +134,12 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	}
 	if cfg.Files.TokenDir != filepath.Join(dir, "process-token-dir") {
 		t.Fatalf("unexpected token files dir: %q", cfg.Files.TokenDir)
+	}
+	if cfg.Database.MaxOpenConns != 6 {
+		t.Fatalf("unexpected database max open conns: %d", cfg.Database.MaxOpenConns)
+	}
+	if cfg.Database.MaxIdleConns != 5 {
+		t.Fatalf("unexpected database max idle conns: %d", cfg.Database.MaxIdleConns)
 	}
 	if len(cfg.APIKeys.AdminIdentities.IDs) != 0 {
 		t.Fatalf("expected process env to replace file admin identities")

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"token-atlas/internal/runtimecache"
 )
@@ -110,7 +111,12 @@ func (s *Service) userBasicCacheKey(userID int64, isAdmin bool) string {
 }
 
 func (s *Service) userQuotaCacheKey(userID int64) string {
-	return s.snapshotCacheKey("user-quota", userID, fmt.Sprintf("v%d", s.cacheScopeVersion("user-quota", userID)))
+	return s.snapshotCacheKey(
+		"user-quota",
+		userID,
+		fmt.Sprintf("v%d", s.cacheScopeVersion("user-quota", userID)),
+		fmt.Sprintf("ipv%d", s.inventoryPolicyScopeVersion()),
+	)
 }
 
 func (s *Service) userClaimSummaryCacheKey(userID int64) string {
@@ -118,7 +124,13 @@ func (s *Service) userClaimSummaryCacheKey(userID int64) string {
 }
 
 func (s *Service) userProfileCacheKey(userID int64, isAdmin bool) string {
-	return s.snapshotCacheKey("user-profile", userID, boolToFlag(isAdmin), fmt.Sprintf("v%d", s.cacheScopeVersion("user-profile", userID)))
+	return s.snapshotCacheKey(
+		"user-profile",
+		userID,
+		boolToFlag(isAdmin),
+		fmt.Sprintf("v%d", s.cacheScopeVersion("user-profile", userID)),
+		fmt.Sprintf("ipv%d", s.inventoryPolicyScopeVersion()),
+	)
 }
 
 func (s *Service) userAPIKeySummaryCacheKey(userID int64) string {
@@ -133,7 +145,12 @@ func (s *Service) userRuntimeSnapshotCacheKey(userID int64) string {
 		fmt.Sprintf("cv%d", s.cacheScopeVersion("user-claims-summary", userID)),
 		fmt.Sprintf("akv%d", s.cacheScopeVersion("user-apikey-summary", userID)),
 		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
+		fmt.Sprintf("ipv%d", s.inventoryPolicyScopeVersion()),
 	)
+}
+
+func (s *Service) userRuntimeSnapshotStaleCacheKey(userID int64) string {
+	return s.snapshotCacheKey("user-runtime-snapshot-stale", userID)
 }
 
 func (s *Service) userClaimRealtimeCacheKey(userID int64) string {
@@ -261,6 +278,7 @@ func (s *Service) invalidateInventoryCache() {
 		return
 	}
 	s.cache.BumpScope("inventory")
+	s.syncInventoryPolicyScopeAsync()
 }
 
 func (s *Service) invalidateUserCache(userID int64) {
@@ -367,6 +385,58 @@ func (s *Service) cacheScopeVersion(scope string, parts ...any) int64 {
 		return 1
 	}
 	return s.cache.ScopeVersion(scope, parts...)
+}
+
+func inventoryPolicySignature(state inventoryRuntimeState, exists bool) string {
+	if !exists {
+		return "missing"
+	}
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(state.Status), state.MaxClaims)
+}
+
+func (s *Service) inventoryPolicyStateCacheKey() string {
+	return runtimecache.BuildCacheKey("inventory-policy-state")
+}
+
+func (s *Service) inventoryPolicyScopeVersion() int64 {
+	if s.cache == nil {
+		return 1
+	}
+	if _, ok := s.cache.GetText(s.inventoryPolicyStateCacheKey()); !ok {
+		s.syncInventoryPolicyScopeAsync()
+	}
+	return s.cache.ScopeVersion("inventory-policy")
+}
+
+func (s *Service) syncInventoryPolicyScope(ctx context.Context) {
+	if s.cache == nil || s.store == nil || s.store.DB() == nil {
+		return
+	}
+
+	state, exists, err := s.getInventoryRuntimeState(ctx, s.store.DB())
+	if err != nil {
+		s.logger.Warn("sync inventory policy scope", "error", err)
+		return
+	}
+
+	key := s.inventoryPolicyStateCacheKey()
+	nextSignature := inventoryPolicySignature(state, exists)
+	if currentSignature, ok := s.cache.GetText(key); ok && strings.TrimSpace(currentSignature) == nextSignature {
+		return
+	}
+
+	s.cache.SetText(key, nextSignature, 0)
+	s.cache.BumpScope("inventory-policy")
+}
+
+func (s *Service) syncInventoryPolicyScopeAsync() {
+	if s.cache == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s.syncInventoryPolicyScope(ctx)
 }
 
 func (s *Service) notifyQueueUsers(ctx context.Context, extraUserIDs ...int64) {

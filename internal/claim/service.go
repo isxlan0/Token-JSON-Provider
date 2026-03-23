@@ -84,6 +84,7 @@ type Service struct {
 	tokenDeleteMu      sync.Mutex
 	tokenDeletePending map[string]struct{}
 	removeTokenFile    func(string) error
+	promoteTokenFile   func(string, string) error
 }
 
 type claimProbe interface {
@@ -301,6 +302,7 @@ func NewService(cfg config.Config, store *database.Store, authService *auth.Serv
 		tokenInternalWrites:  make(map[string]time.Time),
 		tokenDeletePending:   make(map[string]struct{}),
 		removeTokenFile:      os.Remove,
+		promoteTokenFile:     os.Rename,
 	}
 }
 
@@ -741,8 +743,7 @@ func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestCo
 		},
 	)
 
-	s.logger.Info(
-		"get profile",
+	logArgs := []any{
 		"user_id", requestContext.UserID,
 		"cache_state", cacheStateLabel(cacheState),
 		"total_ms", durationMillis(time.Since(startedAt)),
@@ -753,14 +754,18 @@ func (s *Service) GetProfile(ctx context.Context, requestContext *auth.RequestCo
 		"claims_sql_count", claimsSQLCount,
 		"api_keys_sql_count", apiKeysSQLCount,
 		"cumulative_sql_count", sumSQLCounts(quotaSQLCount, claimsSQLCount, apiKeysSQLCount),
-		"error", err,
+	}
+	logArgs = append(logArgs, s.dbStatsLogArgs()...)
+	logArgs = append(logArgs, "error", err)
+	s.logger.Info(
+		"get profile",
+		logArgs...,
 	)
 	return payload, err
 }
 
 func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtimeSnapshotPayload, error) {
 	startedAt := time.Now()
-	liveGeneratedAt := ""
 	var (
 		quotaDuration         time.Duration
 		claimsDuration        time.Duration
@@ -772,46 +777,48 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 		uploadResultsSQLCount int64
 	)
 
-	payload, cacheState, err := runtimecache.CacheJSONWithState(
-		s.cache,
+	result, err := loadCachedReadResult(
+		ctx,
+		s,
 		s.userRuntimeSnapshotCacheKey(userID),
+		s.userRuntimeSnapshotStaleCacheKey(userID),
 		s.cfg.Cache.MeTTL,
-		func() (runtimeSnapshotPayload, error) {
-			quotaStage := startObservedReadStage(ctx)
-			quota, err := s.GetQuotaUsage(quotaStage.Context(), userID)
+		func(loadCtx context.Context) (runtimeSnapshotPayload, error) {
+			quotaStage := startObservedReadStage(loadCtx)
+			quota, quotaErr := s.GetQuotaUsage(quotaStage.Context(), userID)
 			quotaDuration = quotaStage.Duration()
 			quotaSQLCount = quotaStage.SQLCount()
-			if err != nil {
-				return runtimeSnapshotPayload{}, err
+			if quotaErr != nil {
+				return runtimeSnapshotPayload{}, quotaErr
 			}
 
-			claimsStage := startObservedReadStage(ctx)
-			claims, err := s.GetUserClaimTotals(claimsStage.Context(), userID)
+			claimsStage := startObservedReadStage(loadCtx)
+			claims, claimsErr := s.GetUserClaimTotals(claimsStage.Context(), userID)
 			claimsDuration = claimsStage.Duration()
 			claimsSQLCount = claimsStage.SQLCount()
-			if err != nil {
-				return runtimeSnapshotPayload{}, err
+			if claimsErr != nil {
+				return runtimeSnapshotPayload{}, claimsErr
 			}
 
-			apiKeysStage := startObservedReadStage(ctx)
-			apiKeys, err := s.GetAPIKeySummary(apiKeysStage.Context(), userID)
+			apiKeysStage := startObservedReadStage(loadCtx)
+			apiKeys, apiKeysErr := s.GetAPIKeySummary(apiKeysStage.Context(), userID)
 			apiKeysDuration = apiKeysStage.Duration()
 			apiKeysSQLCount = apiKeysStage.SQLCount()
-			if err != nil {
-				return runtimeSnapshotPayload{}, err
+			if apiKeysErr != nil {
+				return runtimeSnapshotPayload{}, apiKeysErr
 			}
 
-			uploadResultsStage := startObservedReadStage(ctx)
+			uploadResultsStage := startObservedReadStage(loadCtx)
 			uploadResults := buildUploadResultsSummaryPayload(s.GetUploadResults(userID))
 			uploadResultsDuration = uploadResultsStage.Duration()
 			uploadResultsSQLCount = uploadResultsStage.SQLCount()
 
-			liveGeneratedAt = isoformatNow()
+			generatedAt := isoformatNow()
 			return runtimeSnapshotPayload{
 				Quota:       quota,
 				Claims:      claims,
 				DataSource:  dataSourceLive,
-				GeneratedAt: liveGeneratedAt,
+				GeneratedAt: generatedAt,
 				APIKeys: map[string]apiKeySummaryPayload{
 					"summary": apiKeys,
 				},
@@ -825,24 +832,21 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 			}, nil
 		},
 	)
+	payload := result.Value
 	if err == nil {
-		switch cacheState {
-		case runtimecache.CacheStateMiss:
-			if strings.TrimSpace(payload.GeneratedAt) == "" {
-				payload.GeneratedAt = liveGeneratedAt
-			}
-			payload.DataSource = dataSourceLive
-			payload.StaleAt = ""
-		case runtimecache.CacheStateMemoryHit, runtimecache.CacheStateFlightShared:
-			payload.DataSource = dataSourceCache
-			payload.StaleAt = ""
+		payload.DataSource = result.DataSource
+		if strings.TrimSpace(result.GeneratedAt) != "" {
+			payload.GeneratedAt = result.GeneratedAt
 		}
+		payload.StaleAt = result.StaleAt
+		payload.Degraded = result.Degraded
+		payload.DegradedReason = result.DegradedReason
 	}
 
-	s.logger.Info(
-		"get runtime snapshot",
+	logArgs := []any{
 		"user_id", userID,
-		"cache_state", cacheStateLabel(cacheState),
+		"cache_state", cacheStateLabel(result.CacheState),
+		"data_source", payload.DataSource,
 		"total_ms", durationMillis(time.Since(startedAt)),
 		"quota_ms", durationMillis(quotaDuration),
 		"claims_ms", durationMillis(claimsDuration),
@@ -853,7 +857,12 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 		"api_keys_sql_count", apiKeysSQLCount,
 		"upload_results_sql_count", uploadResultsSQLCount,
 		"cumulative_sql_count", sumSQLCounts(quotaSQLCount, claimsSQLCount, apiKeysSQLCount, uploadResultsSQLCount),
-		"error", err,
+	}
+	logArgs = append(logArgs, s.dbStatsLogArgs()...)
+	logArgs = append(logArgs, "error", err)
+	s.logger.Info(
+		"get runtime snapshot",
+		logArgs...,
 	)
 	return payload, err
 }
@@ -872,8 +881,7 @@ func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatus
 	if payload, ok := s.getCachedQueueStatus(userID); ok {
 		payload = withQueueStatusMetadata(payload, dataSourceCache, payload.GeneratedAt, "", "", false)
 		payload = s.attachCachedClaimableNow(userID, payload)
-		s.logger.Info(
-			"get queue status",
+		logArgs := []any{
 			"user_id", userID,
 			"cache_state", string(runtimecache.CacheStateMemoryHit),
 			"data_source", payload.DataSource,
@@ -888,6 +896,11 @@ func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatus
 			"inventory_sql_count", int64(0),
 			"claimable_sql_count", int64(0),
 			"cumulative_sql_count", int64(0),
+		}
+		logArgs = append(logArgs, s.dbStatsLogArgs()...)
+		s.logger.Info(
+			"get queue status",
+			logArgs...,
 		)
 		return payload, nil
 	}
@@ -895,8 +908,44 @@ func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatus
 	var metrics queueStatusReadMetrics
 	payload, err := s.loadQueueStatusSnapshotWithMetrics(ctx, userID, &metrics)
 	if err != nil {
-		s.logger.Info(
-			"get queue status",
+		if isReadDegradeError(err) {
+			if stalePayload, ok := s.getCachedStaleQueueStatus(userID); ok {
+				payload = withQueueStatusMetadata(
+					stalePayload,
+					dataSourceStale,
+					stalePayload.GeneratedAt,
+					staleTimestamp(stalePayload.GeneratedAt),
+					degradedReasonForError(err),
+					true,
+				)
+				payload = s.attachCachedClaimableNow(userID, payload)
+				logArgs := []any{
+					"user_id", userID,
+					"cache_state", string(runtimecache.CacheStateMiss),
+					"data_source", payload.DataSource,
+					"claimable_now_state", payload.ClaimableNowState,
+					"total_ms", durationMillis(time.Since(startedAt)),
+					"entry_ms", durationMillis(metrics.EntryDuration),
+					"queue_total_ms", durationMillis(metrics.QueueTotalDuration),
+					"inventory_ms", durationMillis(metrics.InventoryDuration),
+					"claimable_ms", int64(0),
+					"entry_sql_count", metrics.EntrySQLCount,
+					"queue_total_sql_count", metrics.QueueTotalSQLCount,
+					"inventory_sql_count", metrics.InventorySQLCount,
+					"claimable_sql_count", int64(0),
+					"cumulative_sql_count", sumSQLCounts(metrics.EntrySQLCount, metrics.QueueTotalSQLCount, metrics.InventorySQLCount),
+				}
+				logArgs = append(logArgs, s.dbStatsLogArgs()...)
+				logArgs = append(logArgs, "error", err)
+				s.logger.Info(
+					"get queue status",
+					logArgs...,
+				)
+				return payload, nil
+			}
+		}
+
+		logArgs := []any{
 			"user_id", userID,
 			"cache_state", string(runtimecache.CacheStateMiss),
 			"data_source", dataSourceUnavailable,
@@ -911,7 +960,12 @@ func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatus
 			"inventory_sql_count", metrics.InventorySQLCount,
 			"claimable_sql_count", int64(0),
 			"cumulative_sql_count", sumSQLCounts(metrics.EntrySQLCount, metrics.QueueTotalSQLCount, metrics.InventorySQLCount),
-			"error", err,
+		}
+		logArgs = append(logArgs, s.dbStatsLogArgs()...)
+		logArgs = append(logArgs, "error", err)
+		s.logger.Info(
+			"get queue status",
+			logArgs...,
 		)
 		return queueStatusPayload{}, err
 	}
@@ -919,8 +973,7 @@ func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatus
 	payload = s.setQueueStatusSnapshot(userID, payload)
 	payload = withQueueStatusMetadata(payload, dataSourceLive, payload.GeneratedAt, "", "", false)
 	payload = s.attachCachedClaimableNow(userID, payload)
-	s.logger.Info(
-		"get queue status",
+	logArgs := []any{
 		"user_id", userID,
 		"cache_state", string(runtimecache.CacheStateMiss),
 		"data_source", payload.DataSource,
@@ -935,6 +988,11 @@ func (s *Service) GetQueueStatus(ctx context.Context, userID int64) (queueStatus
 		"inventory_sql_count", metrics.InventorySQLCount,
 		"claimable_sql_count", int64(0),
 		"cumulative_sql_count", sumSQLCounts(metrics.EntrySQLCount, metrics.QueueTotalSQLCount, metrics.InventorySQLCount),
+	}
+	logArgs = append(logArgs, s.dbStatsLogArgs()...)
+	s.logger.Info(
+		"get queue status",
+		logArgs...,
 	)
 	return payload, nil
 }
@@ -1246,8 +1304,7 @@ func (s *Service) loadSystemStatus(ctx context.Context) (map[string]any, error) 
 
 	policy := s.buildInventoryPolicy(snapshot)
 	if runtimeExists {
-		policy.Status = runtimeState.Status
-		policy.MaxClaims = runtimeState.MaxClaims
+		policy = s.buildInventoryPolicyForStatus(snapshot, runtimeState.Status)
 	}
 	totalQueued, err := s.getTotalQueued(ctx, s.store.DB())
 	if err != nil {
@@ -1646,10 +1703,20 @@ func (s *Service) refreshInventoryRuntimeTx(ctx context.Context, tx *sql.Tx) err
 }
 
 func (s *Service) buildInventoryPolicy(snapshot map[string]int) inventoryPolicy {
-	status := s.resolveInventoryStatus(snapshot["unclaimed"])
+	return s.buildInventoryPolicyForStatus(snapshot, "")
+}
+
+func (s *Service) buildInventoryPolicyForStatus(snapshot map[string]int, status string) inventoryPolicy {
+	resolvedStatus := status
+	switch resolvedStatus {
+	case "healthy", "warning", "critical":
+	default:
+		resolvedStatus = s.resolveInventoryStatus(snapshot["unclaimed"])
+	}
+
 	hourlyLimit := s.cfg.Inventory.Limits.Healthy.Hourly
 	maxClaims := s.cfg.Inventory.Limits.Healthy.MaxClaims
-	switch status {
+	switch resolvedStatus {
 	case "warning":
 		hourlyLimit = s.cfg.Inventory.Limits.Warning.Hourly
 		maxClaims = s.cfg.Inventory.Limits.Warning.MaxClaims
@@ -1659,7 +1726,7 @@ func (s *Service) buildInventoryPolicy(snapshot map[string]int) inventoryPolicy 
 	}
 
 	return inventoryPolicy{
-		Status:    status,
+		Status:    resolvedStatus,
 		Unclaimed: snapshot["unclaimed"],
 		Thresholds: map[string]int{
 			"healthy":  s.cfg.Inventory.Thresholds.Healthy,
@@ -1679,8 +1746,7 @@ func (s *Service) getInventoryPolicy(ctx context.Context) (inventoryPolicy, erro
 	}
 	policy := s.buildInventoryPolicy(snapshot)
 	if runtimeExists {
-		policy.Status = runtimeState.Status
-		policy.MaxClaims = runtimeState.MaxClaims
+		policy = s.buildInventoryPolicyForStatus(snapshot, runtimeState.Status)
 	}
 	return policy, nil
 }

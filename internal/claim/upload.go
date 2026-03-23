@@ -27,6 +27,13 @@ var (
 	errUploadRateLimited = errors.New("upload rate limited")
 )
 
+const (
+	uploadPrecheckTimeout = 2 * time.Second
+	uploadConflictTimeout = 2 * time.Second
+	uploadStoreTimeout    = 10 * time.Second
+	uploadRollbackTimeout = 10 * time.Second
+)
+
 type uploadFileInput struct {
 	Name          string `json:"name"`
 	ContentBase64 string `json:"content_base64"`
@@ -122,8 +129,14 @@ func (s *Service) QueueUploadBatch(ctx context.Context, requestContext *auth.Req
 		return nil, echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("单次最多上传 %d 个文件。", maxFiles))
 	}
 
-	uploadedCount, err := s.countRecentSuccessfulUploads(ctx, requestContext.UserID)
+	precheckCtx, precheckCancel := context.WithTimeout(ctx, uploadPrecheckTimeout)
+	defer precheckCancel()
+
+	uploadedCount, err := s.countRecentSuccessfulUploads(precheckCtx, requestContext.UserID)
 	if err != nil {
+		if isDatabaseBusyError(err) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, errors.Join(errDatabaseBusyWaitExceeded, err)
+		}
 		return nil, err
 	}
 	if remaining := maxInt(0, s.cfg.Upload.MaxSuccessPerHour-uploadedCount); remaining <= 0 {
@@ -242,19 +255,35 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 		RecordEvent: true,
 	})
 
-	conflict, err := s.getUploadedTokenConflict(ctx, task.AccountID, task.AccessTokenHash)
+	conflictCtx, conflictCancel := context.WithTimeout(ctx, uploadConflictTimeout)
+	conflict, err := s.getUploadedTokenConflict(conflictCtx, task.AccountID, task.AccessTokenHash)
+	conflictCancel()
 	switch {
-	case err != nil && isDatabaseBusyError(err):
-		resultItem = buildUploadStatePatch(uploadStateSpec{
-			Status:      "db_busy",
-			Reason:      "数据库正忙，本文件尚未处理，请稍后重试。",
-			Stage:       "db_busy",
-			StageLabel:  "数据库繁忙",
-			Detail:      "数据库仍在处理其他任务，本次文件暂未入库。",
-			AccountID:   task.AccountID,
-			RecordEvent: true,
-		})
 	case err != nil:
+		if isDatabaseBusyError(err) || errors.Is(err, context.DeadlineExceeded) {
+			resultItem = buildUploadStatePatch(uploadStateSpec{
+				Status:      "db_busy",
+				Reason:      "数据库正忙，请稍后重试",
+				Stage:       "waiting_db",
+				StageLabel:  "等待入库",
+				Detail:      "数据库在限定时间内仍未空闲，本次文件未完成入库。",
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			})
+			break
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			resultItem = buildUploadStatePatch(uploadStateSpec{
+				Status:      "probe_failed",
+				Reason:      "后台处理已取消，请稍后重试",
+				Stage:       "processing_failed",
+				StageLabel:  "处理取消",
+				Detail:      "服务停止或请求已取消，本次文件尚未成功入库。",
+				AccountID:   task.AccountID,
+				RecordEvent: true,
+			})
+			break
+		}
 		s.logger.Error("check upload conflict", "error", err, "account_id", task.AccountID)
 	case conflict != nil:
 		resultItem = buildUploadStatePatch(uploadStateSpec{
@@ -349,14 +378,13 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 				RecordEvent: true,
 			}))
 
-			s.markInternalTokenWrite(targetName)
-			absolutePath, relativePath, writeErr := s.writeUploadedTokenFile(targetName, task.ContentJSON)
+			tempPath, absolutePath, relativePath, writeErr := s.writeUploadedTokenTempFile(targetName, task.ContentJSON)
 			if writeErr != nil {
 				s.logger.Error("write uploaded token file", "error", writeErr, "file_name", targetName)
 				break
 			}
 
-			created, createErr := s.createUploadedToken(ctx, uploadedTokenCreateParams{
+			created, createErr := s.waitForUploadedTokenStore(ctx, task, uploadedTokenCreateParams{
 				FileName:         targetName,
 				FilePath:         relativePath,
 				ContentJSON:      task.ContentJSON,
@@ -367,7 +395,9 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 				HourlyLimit:      task.HourlyLimit,
 			})
 			if createErr != nil {
-				_ = os.Remove(absolutePath)
+				if removeErr := s.cleanupUploadedTokenTempFile(tempPath); removeErr != nil {
+					s.logger.Error("cleanup uploaded token temp file", "error", removeErr, "file_name", targetName)
+				}
 				switch {
 				case errors.Is(createErr, errUploadDuplicate):
 					resultItem = buildUploadStatePatch(uploadStateSpec{
@@ -389,13 +419,23 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 						AccountID:   task.AccountID,
 						RecordEvent: true,
 					})
-				case isDatabaseBusyError(createErr):
+				case isDatabaseBusyError(createErr) || errors.Is(createErr, context.DeadlineExceeded):
 					resultItem = buildUploadStatePatch(uploadStateSpec{
 						Status:      "db_busy",
-						Reason:      "数据库正忙，本文件尚未处理，请稍后重试。",
-						Stage:       "db_busy",
-						StageLabel:  "数据库繁忙",
-						Detail:      "文件已生成，但数据库暂时繁忙，未完成入库登记。",
+						Reason:      "数据库正忙，请稍后重试",
+						Stage:       "waiting_db",
+						StageLabel:  "等待入库",
+						Detail:      "数据库在限定时间内仍未空闲，本次文件未完成入库。",
+						AccountID:   task.AccountID,
+						RecordEvent: true,
+					})
+				case errors.Is(createErr, context.Canceled), errors.Is(createErr, context.DeadlineExceeded):
+					resultItem = buildUploadStatePatch(uploadStateSpec{
+						Status:      "probe_failed",
+						Reason:      "后台处理已取消，请稍后重试",
+						Stage:       "processing_failed",
+						StageLabel:  "处理取消",
+						Detail:      "等待数据库写入期间处理被取消，本次文件未完成入库。",
 						AccountID:   task.AccountID,
 						RecordEvent: true,
 					})
@@ -403,6 +443,38 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 					s.logger.Error("create uploaded token", "error", createErr, "file_name", targetName)
 				}
 			} else {
+				s.markInternalTokenWrite(targetName)
+				if promoteErr := s.promoteUploadedTokenFile(tempPath, absolutePath); promoteErr != nil {
+					s.logger.Error("promote uploaded token file", "error", promoteErr, "file_name", targetName, "token_id", created.TokenID)
+
+					rollbackCtx, cancel := context.WithTimeout(context.Background(), uploadRollbackTimeout)
+					rollbackErr := s.rollbackUploadedTokenRecord(rollbackCtx, created.TokenID)
+					cancel()
+					if rollbackErr != nil {
+						s.logger.Error("rollback uploaded token after file promote failure", "error", rollbackErr, "file_name", targetName, "token_id", created.TokenID)
+					} else {
+						s.invalidateDashboardUploadCaches()
+						s.invalidateAdminCache()
+						s.invalidateInventoryCache()
+						s.notifyQueueUsers(ctx, task.UserID)
+						s.invalidateUserUploadResultsCache(task.UserID)
+					}
+					if cleanupErr := s.cleanupUploadedTokenTempFile(tempPath); cleanupErr != nil {
+						s.logger.Error("cleanup uploaded token temp file after promote failure", "error", cleanupErr, "file_name", targetName)
+					}
+
+					resultItem = buildUploadStatePatch(uploadStateSpec{
+						Status:      "probe_failed",
+						Reason:      "库存文件落盘失败，请稍后重试",
+						Stage:       "processing_failed",
+						StageLabel:  "处理失败",
+						Detail:      "数据库记录已回滚，库存文件未能完成落盘。",
+						AccountID:   task.AccountID,
+						RecordEvent: true,
+					})
+					break
+				}
+
 				resultItem = buildUploadStatePatch(uploadStateSpec{
 					Status:      "accepted",
 					Reason:      "校验通过，已加入可领取库存",
@@ -807,6 +879,46 @@ func (s *Service) createUploadedToken(ctx context.Context, params uploadedTokenC
 	})
 }
 
+func (s *Service) waitForUploadedTokenStore(ctx context.Context, task uploadTask, params uploadedTokenCreateParams) (createdUploadedToken, error) {
+	storeCtx, cancel := context.WithTimeout(ctx, uploadStoreTimeout)
+	defer cancel()
+
+	waitNotified := false
+	return waitForDatabaseAvailability(storeCtx, func(attempt int) {
+		if waitNotified {
+			return
+		}
+		waitNotified = true
+		s.pushUploadTaskProgress(task, buildUploadStatePatch(uploadStateSpec{
+			Status:      "processing",
+			Reason:      "数据库正忙，正在等待入库窗口。",
+			Stage:       "waiting_db",
+			StageLabel:  "等待入库",
+			Detail:      "数据库正忙，正在等待写入窗口；若超出限制时间，本次入库会返回失败。",
+			AccountID:   task.AccountID,
+			RecordEvent: true,
+		}))
+	}, func() (createdUploadedToken, error) {
+		return s.createUploadedToken(storeCtx, params)
+	})
+}
+
+func (s *Service) rollbackUploadedTokenRecord(ctx context.Context, tokenID int64) error {
+	_, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (struct{}, error) {
+		if _, execErr := tx.ExecContext(ctx, `DELETE FROM tokens WHERE id = ?`, tokenID); execErr != nil {
+			return struct{}{}, fmt.Errorf("delete uploaded token %d: %w", tokenID, execErr)
+		}
+		if _, policyErr := s.ensureInventoryPolicyTx(ctx, tx, true); policyErr != nil {
+			return struct{}{}, policyErr
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		return fmt.Errorf("rollback uploaded token %d: %w", tokenID, err)
+	}
+	return nil
+}
+
 func (s *Service) getUploadedTokenConflictTx(ctx context.Context, tx *sql.Tx, accountID string, accessTokenHash string) (bool, error) {
 	row := tx.QueryRowContext(ctx, `
 		SELECT 1
@@ -930,18 +1042,38 @@ func buildUploadedFileName(accountID string, uploadedAtTS int64) (string, error)
 	return fmt.Sprintf("upload-%d-%s-%s.json", uploadedAtTS, hex.EncodeToString(accountHash[:])[:8], suffix[:6]), nil
 }
 
-func (s *Service) writeUploadedTokenFile(fileName string, contentJSON string) (string, string, error) {
+func (s *Service) writeUploadedTokenTempFile(fileName string, contentJSON string) (string, string, string, error) {
 	tokenDir := s.tokenDirPath()
 	if err := os.MkdirAll(tokenDir, 0o755); err != nil {
-		return "", "", fmt.Errorf("create token directory: %w", err)
+		return "", "", "", fmt.Errorf("create token directory: %w", err)
 	}
 
-	absolutePath := filepath.Join(tokenDir, filepath.Base(fileName))
-	if err := os.WriteFile(absolutePath, []byte(contentJSON), 0o644); err != nil {
-		return "", "", fmt.Errorf("write uploaded token file: %w", err)
+	baseName := filepath.Base(fileName)
+	absolutePath := filepath.Join(tokenDir, baseName)
+	tempPath := absolutePath + ".uploading"
+	if err := os.WriteFile(tempPath, []byte(contentJSON), 0o644); err != nil {
+		return "", "", "", fmt.Errorf("write uploaded token temp file: %w", err)
 	}
 
-	return absolutePath, s.tokenFileRelativePath(fileName), nil
+	return tempPath, absolutePath, s.tokenFileRelativePath(baseName), nil
+}
+
+func (s *Service) promoteUploadedTokenFile(tempPath string, absolutePath string) error {
+	promote := s.promoteTokenFile
+	if promote == nil {
+		promote = os.Rename
+	}
+	if err := promote(tempPath, absolutePath); err != nil {
+		return fmt.Errorf("promote uploaded token file: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) cleanupUploadedTokenTempFile(tempPath string) error {
+	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove uploaded token temp file: %w", err)
+	}
+	return nil
 }
 
 func pendingUploadKeys(accountID string, accessTokenHash string) []string {

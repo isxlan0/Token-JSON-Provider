@@ -118,6 +118,42 @@ func TestGetQueueStatusCachesMissAndReusesSnapshot(t *testing.T) {
 	}
 }
 
+func TestGetQueueStatusUsesStaleSnapshotWhenRefreshTimesOut(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "100211", "queue-stale-user")
+	insertTestQueuedEntry(t, store, userID, nil, 2, 2, 1, "queue-stale-row", time.Now().Add(-time.Minute).Unix())
+
+	first, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get first queue status: %v", err)
+	}
+	if first.DataSource != dataSourceLive {
+		t.Fatalf("expected first queue status to be live, got %+v", first)
+	}
+
+	service.invalidateUserQueueCache(userID)
+
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	second, err := service.GetQueueStatus(expiredCtx, userID)
+	if err != nil {
+		t.Fatalf("get stale queue status: %v", err)
+	}
+	if second.DataSource != dataSourceStale {
+		t.Fatalf("expected stale queue status data source, got %+v", second)
+	}
+	if second.QueueID != first.QueueID {
+		t.Fatalf("expected stale queue status to preserve queue row, first=%+v second=%+v", first, second)
+	}
+	if !second.Degraded || second.DegradedReason != degradedReasonReadTimeout {
+		t.Fatalf("expected degraded stale queue status, got %+v", second)
+	}
+}
+
 func TestGetQueueStatusDefersClaimableNowOnMainPath(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
@@ -289,6 +325,202 @@ func TestRuntimeSnapshotCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
 	}
 }
 
+func TestGetQuotaUsageRefreshesWhenInventoryPolicyChanges(t *testing.T) {
+	service, store := newClaimTestServiceFromEnv(t, claimQuotaRefreshTestEnvBody())
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10041", "quota-refresh-user")
+	insertTestToken(t, store, "quota-refresh-a.json", `{"access_token":"quota-refresh-a","refresh_token":"quota-refresh-a-r","account_id":"acct-quota-refresh-a"}`, 0, 1)
+	disabledTokenID := insertTestToken(t, store, "quota-refresh-b.json", `{"access_token":"quota-refresh-b","refresh_token":"quota-refresh-b-r","account_id":"acct-quota-refresh-b"}`, 0, 1)
+	setTestTokenEnabledState(t, store, disabledTokenID, false)
+
+	first, err := service.GetQuotaUsage(ctx, userID)
+	if err != nil {
+		t.Fatalf("get first quota usage: %v", err)
+	}
+	if first.Limit != service.cfg.Inventory.Limits.Warning.Hourly {
+		t.Fatalf("expected warning quota limit %d, got %d", service.cfg.Inventory.Limits.Warning.Hourly, first.Limit)
+	}
+
+	if _, err := service.SetTokenEnabled(ctx, disabledTokenID, true); err != nil {
+		t.Fatalf("enable second token: %v", err)
+	}
+
+	second, err := service.GetQuotaUsage(ctx, userID)
+	if err != nil {
+		t.Fatalf("get refreshed quota usage: %v", err)
+	}
+	if second.Limit != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected healthy quota limit %d after inventory refresh, got %d", service.cfg.Inventory.Limits.Healthy.Hourly, second.Limit)
+	}
+	if second.Remaining != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected healthy remaining quota %d after inventory refresh, got %d", service.cfg.Inventory.Limits.Healthy.Hourly, second.Remaining)
+	}
+}
+
+func TestGetRuntimeSnapshotRefreshesQuotaWhenInventoryPolicyChanges(t *testing.T) {
+	service, store := newClaimTestServiceFromEnv(t, claimQuotaRefreshTestEnvBody())
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10042", "runtime-refresh-user")
+	insertTestToken(t, store, "runtime-refresh-a.json", `{"access_token":"runtime-refresh-a","refresh_token":"runtime-refresh-a-r","account_id":"acct-runtime-refresh-a"}`, 0, 1)
+	disabledTokenID := insertTestToken(t, store, "runtime-refresh-b.json", `{"access_token":"runtime-refresh-b","refresh_token":"runtime-refresh-b-r","account_id":"acct-runtime-refresh-b"}`, 0, 1)
+	setTestTokenEnabledState(t, store, disabledTokenID, false)
+
+	first, err := service.GetRuntimeSnapshot(ctx, userID)
+	if err != nil {
+		t.Fatalf("get first runtime snapshot: %v", err)
+	}
+	if first.Quota.Limit != service.cfg.Inventory.Limits.Warning.Hourly {
+		t.Fatalf("expected warning runtime quota limit %d, got %d", service.cfg.Inventory.Limits.Warning.Hourly, first.Quota.Limit)
+	}
+
+	if _, err := service.SetTokenEnabled(ctx, disabledTokenID, true); err != nil {
+		t.Fatalf("enable second token: %v", err)
+	}
+
+	second, err := service.GetRuntimeSnapshot(ctx, userID)
+	if err != nil {
+		t.Fatalf("get refreshed runtime snapshot: %v", err)
+	}
+	if second.DataSource != dataSourceLive {
+		t.Fatalf("expected refreshed runtime snapshot to be live after inventory change, got %q", second.DataSource)
+	}
+	if second.Quota.Limit != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected healthy runtime quota limit %d after inventory refresh, got %d", service.cfg.Inventory.Limits.Healthy.Hourly, second.Quota.Limit)
+	}
+	if second.Quota.Remaining != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected healthy runtime remaining quota %d after inventory refresh, got %d", service.cfg.Inventory.Limits.Healthy.Hourly, second.Quota.Remaining)
+	}
+}
+
+func TestGetRuntimeSnapshotUsesStaleSnapshotWhenRefreshTimesOut(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	userID := insertTestUser(t, store, "100421", "runtime-stale-user")
+
+	first, err := service.GetRuntimeSnapshot(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("get first runtime snapshot: %v", err)
+	}
+	if first.DataSource != dataSourceLive {
+		t.Fatalf("expected first runtime snapshot to be live, got %+v", first)
+	}
+
+	service.invalidateUserQuotaCache(userID)
+
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	second, err := service.GetRuntimeSnapshot(expiredCtx, userID)
+	if err != nil {
+		t.Fatalf("get stale runtime snapshot: %v", err)
+	}
+	if second.DataSource != dataSourceStale {
+		t.Fatalf("expected stale runtime snapshot data source, got %+v", second)
+	}
+	if second.GeneratedAt != first.GeneratedAt {
+		t.Fatalf("expected stale runtime snapshot to preserve generated_at, first=%q second=%q", first.GeneratedAt, second.GeneratedAt)
+	}
+	if !second.Degraded || second.DegradedReason != degradedReasonReadTimeout {
+		t.Fatalf("expected degraded stale runtime snapshot, got %+v", second)
+	}
+}
+
+func TestInventoryCacheInvalidationDoesNotBustOtherUsersRuntimeSnapshot(t *testing.T) {
+	service, store := newClaimTestServiceFromEnv(t, claimPolicyTestEnvBody())
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	claimerID := insertTestUser(t, store, "100422", "claimer")
+	observerID := insertTestUser(t, store, "100423", "observer")
+	insertTestToken(t, store, "inventory-bump.json", `{"access_token":"inventory-bump","refresh_token":"inventory-bump-r","account_id":"acct-inventory-bump"}`, 0, 1)
+	if _, err := service.ensureInventoryPolicy(ctx, true); err != nil {
+		t.Fatalf("prime inventory policy runtime: %v", err)
+	}
+	service.syncInventoryPolicyScope(ctx)
+
+	first, err := service.GetRuntimeSnapshot(ctx, observerID)
+	if err != nil {
+		t.Fatalf("get observer runtime snapshot: %v", err)
+	}
+	if first.DataSource != dataSourceLive {
+		t.Fatalf("expected first observer runtime snapshot to be live, got %+v", first)
+	}
+
+	runtimeKeyBefore := service.userRuntimeSnapshotCacheKey(observerID)
+	quotaKeyBefore := service.userQuotaCacheKey(observerID)
+	profileKeyBefore := service.userProfileCacheKey(observerID, false)
+
+	if _, err := service.ClaimTokens(ctx, claimerID, nil, 1); err != nil {
+		t.Fatalf("claim token to bump inventory: %v", err)
+	}
+
+	if runtimeKeyAfter := service.userRuntimeSnapshotCacheKey(observerID); runtimeKeyAfter != runtimeKeyBefore {
+		t.Fatalf("expected observer runtime snapshot key to remain stable across inventory-only bump, before=%q after=%q", runtimeKeyBefore, runtimeKeyAfter)
+	}
+	if quotaKeyAfter := service.userQuotaCacheKey(observerID); quotaKeyAfter != quotaKeyBefore {
+		t.Fatalf("expected observer quota key to remain stable across inventory-only bump, before=%q after=%q", quotaKeyBefore, quotaKeyAfter)
+	}
+	if profileKeyAfter := service.userProfileCacheKey(observerID, false); profileKeyAfter != profileKeyBefore {
+		t.Fatalf("expected observer profile key to remain stable across inventory-only bump, before=%q after=%q", profileKeyBefore, profileKeyAfter)
+	}
+
+	second, err := service.GetRuntimeSnapshot(ctx, observerID)
+	if err != nil {
+		t.Fatalf("get observer runtime snapshot after inventory bump: %v", err)
+	}
+	if second.DataSource != dataSourceCache {
+		t.Fatalf("expected observer runtime snapshot to stay hot in cache after another user's claim, got %+v", second)
+	}
+}
+
+func TestGetProfileRefreshesQuotaWhenInventoryPolicyChanges(t *testing.T) {
+	service, store := newClaimTestServiceFromEnv(t, claimQuotaRefreshTestEnvBody())
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10043", "profile-refresh-user")
+	insertTestToken(t, store, "profile-refresh-a.json", `{"access_token":"profile-refresh-a","refresh_token":"profile-refresh-a-r","account_id":"acct-profile-refresh-a"}`, 0, 1)
+	disabledTokenID := insertTestToken(t, store, "profile-refresh-b.json", `{"access_token":"profile-refresh-b","refresh_token":"profile-refresh-b-r","account_id":"acct-profile-refresh-b"}`, 0, 1)
+	setTestTokenEnabledState(t, store, disabledTokenID, false)
+
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "10043",
+			Username:   "profile-refresh-user",
+			Name:       "profile-refresh-user",
+			TrustLevel: 2,
+		},
+	}
+
+	first, err := service.GetProfile(ctx, requestContext)
+	if err != nil {
+		t.Fatalf("get first profile: %v", err)
+	}
+	if first.Quota.Limit != service.cfg.Inventory.Limits.Warning.Hourly {
+		t.Fatalf("expected warning profile quota limit %d, got %d", service.cfg.Inventory.Limits.Warning.Hourly, first.Quota.Limit)
+	}
+
+	if _, err := service.SetTokenEnabled(ctx, disabledTokenID, true); err != nil {
+		t.Fatalf("enable second token: %v", err)
+	}
+
+	second, err := service.GetProfile(ctx, requestContext)
+	if err != nil {
+		t.Fatalf("get refreshed profile: %v", err)
+	}
+	if second.Quota.Limit != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected healthy profile quota limit %d after inventory refresh, got %d", service.cfg.Inventory.Limits.Healthy.Hourly, second.Quota.Limit)
+	}
+	if second.Quota.Remaining != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected healthy profile remaining quota %d after inventory refresh, got %d", service.cfg.Inventory.Limits.Healthy.Hourly, second.Quota.Remaining)
+	}
+}
+
 func TestAdminBootstrapIncludesDefaultDatasets(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
@@ -454,6 +686,95 @@ func TestGetBootstrapReadsStaleDashboardEnvelope(t *testing.T) {
 	}
 }
 
+func TestBuildInventoryPolicyForStatusMapsConfiguredLimits(t *testing.T) {
+	service, _ := newClaimTestServiceFromEnv(t, claimPolicyTestEnvBody())
+
+	testCases := []struct {
+		name   string
+		status string
+		want   config.InventoryStatusLimit
+	}{
+		{name: "healthy", status: "healthy", want: service.cfg.Inventory.Limits.Healthy},
+		{name: "warning", status: "warning", want: service.cfg.Inventory.Limits.Warning},
+		{name: "critical", status: "critical", want: service.cfg.Inventory.Limits.Critical},
+	}
+
+	snapshot := map[string]int{
+		"unclaimed": 701,
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := service.buildInventoryPolicyForStatus(snapshot, tc.status)
+			if policy.Status != tc.status {
+				t.Fatalf("expected status %q, got %q", tc.status, policy.Status)
+			}
+			if policy.HourlyLimit != tc.want.Hourly {
+				t.Fatalf("expected hourly limit %d for status %q, got %d", tc.want.Hourly, tc.status, policy.HourlyLimit)
+			}
+			if policy.MaxClaims != tc.want.MaxClaims {
+				t.Fatalf("expected max claims %d for status %q, got %d", tc.want.MaxClaims, tc.status, policy.MaxClaims)
+			}
+		})
+	}
+}
+
+func TestGetInventoryPolicyUsesRuntimeStatusAsSingleSourceOfTruth(t *testing.T) {
+	service, store := newClaimTestServiceFromEnv(t, claimPolicyTestEnvBody())
+	ctx := context.Background()
+
+	insertInventoryRuntimeState(t, store, "warning", 900, 900, 701, 99, 1000)
+	if got := service.resolveInventoryStatus(701); got != "healthy" {
+		t.Fatalf("expected setup snapshot to resolve healthy before runtime override, got %q", got)
+	}
+
+	policy, err := service.getInventoryPolicy(ctx)
+	if err != nil {
+		t.Fatalf("get inventory policy: %v", err)
+	}
+
+	expected := service.cfg.Inventory.Limits.Warning
+	if policy.Status != "warning" {
+		t.Fatalf("expected warning status from runtime state, got %q", policy.Status)
+	}
+	if policy.HourlyLimit != expected.Hourly {
+		t.Fatalf("expected warning hourly limit %d from config, got %d", expected.Hourly, policy.HourlyLimit)
+	}
+	if policy.MaxClaims != expected.MaxClaims {
+		t.Fatalf("expected warning max claims %d from config, got %d", expected.MaxClaims, policy.MaxClaims)
+	}
+}
+
+func TestLoadSystemStatusUsesRuntimeStatusAsSingleSourceOfTruth(t *testing.T) {
+	service, store := newClaimTestServiceFromEnv(t, claimPolicyTestEnvBody())
+	ctx := context.Background()
+
+	insertInventoryRuntimeState(t, store, "critical", 900, 900, 701, 77, 1000)
+	if got := service.resolveInventoryStatus(701); got != "healthy" {
+		t.Fatalf("expected setup snapshot to resolve healthy before runtime override, got %q", got)
+	}
+
+	payload, err := service.loadSystemStatus(ctx)
+	if err != nil {
+		t.Fatalf("load system status: %v", err)
+	}
+
+	health, ok := payload["health"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected health payload: %#v", payload["health"])
+	}
+	expected := service.cfg.Inventory.Limits.Critical
+	if health["status"] != "critical" {
+		t.Fatalf("expected critical health status, got %#v", health["status"])
+	}
+	if intFromAny(health["hourly_limit"]) != expected.Hourly {
+		t.Fatalf("expected critical hourly limit %d from config, got %#v", expected.Hourly, health["hourly_limit"])
+	}
+	if intFromAny(health["max_claims"]) != expected.MaxClaims {
+		t.Fatalf("expected critical max claims %d from config, got %#v", expected.MaxClaims, health["max_claims"])
+	}
+}
+
 func newClaimTestService(t *testing.T) (*Service, *database.Store) {
 	t.Helper()
 
@@ -516,6 +837,132 @@ func newClaimTestService(t *testing.T) (*Service, *database.Store) {
 	return service, store
 }
 
+func newClaimTestServiceFromEnv(t *testing.T, envBody string) (*Service, *database.Store) {
+	t.Helper()
+
+	restoreWD := pushTempWorkingDir(t)
+	t.Cleanup(restoreWD)
+	unsetClaimTestEnvKeys(t)
+
+	if err := os.WriteFile(".env", []byte(envBody), 0o644); err != nil {
+		t.Fatalf("write test .env: %v", err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config from .env: %v", err)
+	}
+
+	store, err := database.OpenWithOptions(cfg.Database.Path, database.OpenOptions{
+		MaxOpenConns: cfg.Database.MaxOpenConns,
+		MaxIdleConns: cfg.Database.MaxIdleConns,
+	})
+	if err != nil {
+		t.Fatalf("open test database from env config: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatalf("init test database from env config: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	service := NewService(cfg, store, nil, nil, logger)
+	service.probe = alwaysOKProbe{}
+	return service, store
+}
+
+func claimPolicyTestEnvBody() string {
+	return `TOKEN_DB_PATH=claim-policy-test.db
+TOKEN_FILES_DIR=tokens
+TOKEN_HEALTHY_THRESHOLD=1000
+TOKEN_WARNING_THRESHOLD=500
+TOKEN_CRITICAL_THRESHOLD=100
+TOKEN_HOURLY_LIMIT_HEALTHY=41
+TOKEN_HOURLY_LIMIT_WARNING=23
+TOKEN_HOURLY_LIMIT_CRITICAL=17
+TOKEN_MAX_CLAIMS_HEALTHY=4
+TOKEN_MAX_CLAIMS_WARNING=7
+TOKEN_MAX_CLAIMS_CRITICAL=9
+TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE=all_unfinished
+TOKEN_APIKEY_MAX_PER_USER=5
+TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE=60
+TOKEN_UPLOAD_MAX_FILES_PER_REQUEST=10
+TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES=10240
+TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR=20
+`
+}
+
+func claimQuotaRefreshTestEnvBody() string {
+	return `TOKEN_DB_PATH=claim-quota-refresh.db
+TOKEN_FILES_DIR=tokens
+TOKEN_HEALTHY_THRESHOLD=2
+TOKEN_WARNING_THRESHOLD=2
+TOKEN_CRITICAL_THRESHOLD=1
+TOKEN_HOURLY_LIMIT_HEALTHY=30
+TOKEN_HOURLY_LIMIT_WARNING=20
+TOKEN_HOURLY_LIMIT_CRITICAL=15
+TOKEN_MAX_CLAIMS_HEALTHY=1
+TOKEN_MAX_CLAIMS_WARNING=2
+TOKEN_MAX_CLAIMS_CRITICAL=3
+TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE=all_unfinished
+TOKEN_APIKEY_MAX_PER_USER=5
+TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE=60
+TOKEN_UPLOAD_MAX_FILES_PER_REQUEST=10
+TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES=10240
+TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR=20
+`
+}
+
+func unsetClaimTestEnvKeys(t *testing.T) {
+	t.Helper()
+
+	keys := []string{
+		"TOKEN_DB_PATH",
+		"TOKEN_FILES_DIR",
+		"TOKEN_HEALTHY_THRESHOLD",
+		"TOKEN_WARNING_THRESHOLD",
+		"TOKEN_CRITICAL_THRESHOLD",
+		"TOKEN_HOURLY_LIMIT_HEALTHY",
+		"TOKEN_HOURLY_LIMIT_WARNING",
+		"TOKEN_HOURLY_LIMIT_CRITICAL",
+		"TOKEN_MAX_CLAIMS_HEALTHY",
+		"TOKEN_MAX_CLAIMS_WARNING",
+		"TOKEN_MAX_CLAIMS_CRITICAL",
+		"TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE",
+		"TOKEN_APIKEY_MAX_PER_USER",
+		"TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE",
+		"TOKEN_UPLOAD_MAX_FILES_PER_REQUEST",
+		"TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES",
+		"TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR",
+	}
+
+	snapshot := make(map[string]*string, len(keys))
+	for _, key := range keys {
+		if value, ok := os.LookupEnv(key); ok {
+			copied := value
+			snapshot[key] = &copied
+		} else {
+			snapshot[key] = nil
+		}
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset env %s: %v", key, err)
+		}
+	}
+
+	t.Cleanup(func() {
+		for key, value := range snapshot {
+			if value == nil {
+				_ = os.Unsetenv(key)
+				continue
+			}
+			_ = os.Setenv(key, *value)
+		}
+	})
+}
+
 func insertTestUser(t *testing.T, store *database.Store, linuxDOUserID string, username string) int64 {
 	t.Helper()
 
@@ -573,6 +1020,46 @@ func insertTestToken(t *testing.T, store *database.Store, fileName string, conte
 		t.Fatalf("read inserted token id: %v", err)
 	}
 	return tokenID
+}
+
+func setTestTokenEnabledState(t *testing.T, store *database.Store, tokenID int64, enabled bool) {
+	t.Helper()
+
+	enabledValue := boolToInt(enabled)
+	if _, err := store.DB().Exec(`
+		UPDATE tokens
+		SET is_enabled = ?,
+		    is_available = ?,
+		    updated_at_ts = 1000
+		WHERE id = ?
+	`, enabledValue, enabledValue, tokenID); err != nil {
+		t.Fatalf("set test token enabled state: %v", err)
+	}
+}
+
+func insertInventoryRuntimeState(t *testing.T, store *database.Store, status string, total int, available int, unclaimed int, maxClaims int, updatedAtTS int64) {
+	t.Helper()
+
+	if _, err := store.DB().Exec(`
+		INSERT INTO inventory_runtime (
+			id,
+			status,
+			total_tokens,
+			available_tokens,
+			unclaimed_tokens,
+			max_claims,
+			updated_at_ts
+		) VALUES (1, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			total_tokens = excluded.total_tokens,
+			available_tokens = excluded.available_tokens,
+			unclaimed_tokens = excluded.unclaimed_tokens,
+			max_claims = excluded.max_claims,
+			updated_at_ts = excluded.updated_at_ts
+	`, status, total, available, unclaimed, maxClaims, updatedAtTS); err != nil {
+		t.Fatalf("insert inventory runtime state: %v", err)
+	}
 }
 
 func boolToInt(value bool) int {
