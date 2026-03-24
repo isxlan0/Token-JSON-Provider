@@ -161,6 +161,15 @@
   grid-template-columns: 1fr;
 }
 
+.queue-monitor-grid {
+  grid-template-columns: minmax(0, 1fr) 360px;
+  align-items: start;
+}
+
+.queue-monitor-main {
+  min-width: 0;
+}
+
 .admin-card,
 .admin-detail,
 .admin-policy-panel {
@@ -362,6 +371,90 @@
   margin-bottom: 0.35rem;
 }
 
+.admin-activity-panel {
+  padding: 1.25rem;
+  display: grid;
+  gap: 0.85rem;
+  align-content: start;
+  position: sticky;
+  top: 1.25rem;
+}
+
+.admin-activity-list {
+  display: grid;
+  gap: 0.75rem;
+  max-height: calc(100vh - 240px);
+  overflow: auto;
+  padding-right: 0.2rem;
+}
+
+.admin-activity-item {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  background: var(--bg-main);
+  padding: 0.85rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.admin-activity-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.admin-activity-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-full);
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.admin-activity-pill.info {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.admin-activity-pill.success {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.admin-activity-pill.warn {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.admin-activity-pill.error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.admin-activity-message {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.admin-activity-detail,
+.admin-activity-meta,
+.admin-activity-time,
+.admin-activity-empty {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.admin-activity-empty {
+  border: 1px dashed var(--border-base);
+  border-radius: var(--radius-md);
+  background: var(--bg-main);
+  padding: 1rem;
+}
+
 .admin-pager {
   display: flex;
   align-items: center;
@@ -385,8 +478,20 @@
     grid-template-columns: 1fr;
   }
 
+  .queue-monitor-grid {
+    grid-template-columns: 1fr;
+  }
+
   .admin-detail {
     position: static;
+  }
+
+  .admin-activity-panel {
+    position: static;
+  }
+
+  .admin-activity-list {
+    max-height: none;
   }
 }
 

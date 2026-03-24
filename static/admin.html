@@ -96,8 +96,8 @@
     }
   </style>
   <link rel="stylesheet" href="/assets/styles.css?v=20260323a">
-  <link rel="stylesheet" href="/assets/admin.css?v=20260323a">
-  <script src="/assets/admin.js?v=20260323a" defer></script>
+  <link rel="stylesheet" href="/assets/admin.css?v=20260324e">
+  <script src="/assets/admin.js?v=20260324e" defer></script>
 </head>
 
 <body class="light-theme admin-body">
@@ -273,6 +273,8 @@
               placeholder="搜索队列 ID / 用户 ID / 用户名 / 请求 ID">
             <select id="admin-queue-status" class="form-input admin-select">
               <option value="queued" selected>仅当前排队</option>
+              <option value="queued_waiting">仅等待中</option>
+              <option value="queued_blocked">仅阻塞中</option>
               <option value="all">全部状态</option>
               <option value="cancelled">仅已取消</option>
               <option value="expired">仅已过期</option>
@@ -287,10 +289,29 @@
               <button id="admin-queue-show-abnormal" class="btn btn-outline btn-inline" type="button">仅查看异常项</button>
               <button id="admin-queue-show-timeout" class="btn btn-outline btn-inline" type="button">仅查看超时项</button>
             </div>
+            <button id="admin-queue-cancel-all" class="btn btn-outline" type="button">取消全部排队</button>
             <button id="admin-queue-refresh" class="btn btn-outline" type="button">刷新队列</button>
           </div>
-          <div id="admin-queue-list" class="admin-list queue-list"></div>
-          <div id="admin-queue-pager" class="admin-pager"></div>
+          <div class="admin-grid queue-monitor-grid">
+            <div class="queue-monitor-main">
+              <div id="admin-queue-list" class="admin-list queue-list"></div>
+              <div id="admin-queue-pager" class="admin-pager"></div>
+            </div>
+            <aside class="card admin-activity-panel">
+              <div class="admin-detail-header">
+                <div>
+                  <div class="admin-detail-title">实时活动</div>
+                  <div id="admin-queue-activity-summary" class="admin-detail-meta">正在等待服务器活动流连接。</div>
+                </div>
+                <div class="admin-inline-actions">
+                  <span id="admin-queue-activity-status" class="admin-badge inactive">连接中</span>
+                  <button id="admin-queue-activity-refresh" class="btn btn-outline btn-inline" type="button">刷新活动</button>
+                </div>
+              </div>
+              <div id="admin-queue-activity-meta" class="admin-note">最近快照：-</div>
+              <div id="admin-queue-activity-list" class="admin-activity-list"></div>
+            </aside>
+          </div>
         </section>
 
         <section id="admin-view-policy" class="admin-view">

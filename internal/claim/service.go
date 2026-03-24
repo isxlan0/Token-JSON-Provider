@@ -25,9 +25,20 @@ import (
 	"token-atlas/internal/runtimecache"
 )
 
-const queuePumpInterval = 2 * time.Second
+const (
+	queuePumpInterval                = 500 * time.Millisecond
+	queueAdvanceRowTimeout           = 1500 * time.Millisecond
+	queueAdvanceRetryDelay           = 1 * time.Second
+	queueAdvanceMaxProbeSubmits      = 4
+	queueAdvanceMaxGrantsPerTick     = 4
+	queueAdvanceMaxResolvedHeadTurns = 8
+	queueNotifyBatchWindow           = 100 * time.Millisecond
+	queueNotifyBatchMaxUsers         = 64
+)
 
 var errRetryAllocation = errors.New("retry allocation")
+
+var dbWriteLocks sync.Map
 
 type sqlQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -41,8 +52,12 @@ type Service struct {
 	auth   *auth.Service
 	logger *slog.Logger
 	cache  *runtimecache.AppCache
-	probe  claimProbe
 	wakeCh chan struct{}
+
+	// probe is kept as a test override; production paths use dedicated claim/upload probes.
+	probe       claimProbe
+	claimProbe  claimProbe
+	uploadProbe claimProbe
 
 	startOnce sync.Once
 	advanceMu sync.Mutex
@@ -65,15 +80,20 @@ type Service struct {
 	startupReadyCh       chan struct{}
 	startupReadyOnce     sync.Once
 
-	queueEvents     *queueStatusEventBroker
-	claimEvents     *claimRealtimeEventBroker
-	uploadEvents    *uploadResultsEventBroker
-	hideClaimsCh    chan hideClaimsTask
-	uploadTaskCh    chan uploadTask
-	uploadMu        sync.Mutex
-	uploadSnapshots map[int64]uploadSnapshot
-	uploadPending   map[string]*uploadPendingRecord
-	uploadQueued    int
+	queueEvents           *queueStatusEventBroker
+	adminQueueEvents      *queueStatusEventBroker
+	claimEvents           *claimRealtimeEventBroker
+	uploadEvents          *uploadResultsEventBroker
+	adminQueueActivityMu  sync.Mutex
+	adminQueueActivity    []adminQueueActivityEntry
+	adminQueueActivitySeq int64
+	hideClaimsCh          chan hideClaimsTask
+	uploadTaskCh          chan uploadTask
+	uploadMu              sync.Mutex
+	uploadSnapshots       map[int64]uploadSnapshot
+	uploadPending         map[string]*uploadPendingRecord
+	uploadQueued          int
+	queueNotifyCh         chan int64
 
 	tokenImportCh       chan tokenImportRequest
 	tokenImportDoneCh   chan tokenImportResult
@@ -147,9 +167,13 @@ type claimResult struct {
 	Requested      int                 `json:"requested"`
 	Granted        int                 `json:"granted"`
 	Queued         bool                `json:"queued"`
+	QueueStatus    string              `json:"queue_status,omitempty"`
 	QueueID        int64               `json:"queue_id,omitempty"`
 	QueuePosition  int                 `json:"queue_position,omitempty"`
 	QueueRemaining int                 `json:"queue_remaining,omitempty"`
+	BlockReason    string              `json:"block_reason,omitempty"`
+	LastProgressAt string              `json:"last_progress_at,omitempty"`
+	NextRetryAt    string              `json:"next_retry_at,omitempty"`
 	Quota          quotaUsage          `json:"quota"`
 }
 
@@ -174,11 +198,18 @@ type claimHistoryItem struct {
 
 type queueStatusPayload struct {
 	Queued                bool   `json:"queued"`
+	Status                string `json:"status,omitempty"`
 	QueueID               int64  `json:"queue_id,omitempty"`
 	Position              int    `json:"position,omitempty"`
 	Ahead                 int    `json:"ahead,omitempty"`
 	Requested             int    `json:"requested,omitempty"`
 	Remaining             int    `json:"remaining,omitempty"`
+	BlockReason           string `json:"block_reason,omitempty"`
+	LastProgressAt        string `json:"last_progress_at,omitempty"`
+	NextRetryAt           string `json:"next_retry_at,omitempty"`
+	FrontBlocked          bool   `json:"front_blocked,omitempty"`
+	FrontBlockReason      string `json:"front_block_reason,omitempty"`
+	FrontNextRetryAt      string `json:"front_next_retry_at,omitempty"`
 	EnqueuedAt            string `json:"enqueued_at,omitempty"`
 	RequestID             string `json:"request_id,omitempty"`
 	TotalQueued           int    `json:"total_queued"`
@@ -219,6 +250,12 @@ type userQueueEntry struct {
 	EnqueuedAtTS      int64
 	RequestID         string
 	Status            string
+	OriginSessionID   sql.NullString
+	OriginTabID       sql.NullString
+	BlockReason       sql.NullString
+	NextRetryAtTS     sql.NullInt64
+	LastProgressAtTS  sql.NullInt64
+	TerminalAtTS      sql.NullInt64
 	CancelReason      sql.NullString
 	CancelledAtTS     sql.NullInt64
 	CancelledByUserID sql.NullInt64
@@ -284,16 +321,19 @@ func NewService(cfg config.Config, store *database.Store, authService *auth.Serv
 		auth:                 authService,
 		logger:               logger,
 		cache:                cache,
-		probe:                proberuntime.New(cfg.Probe.DelaySec, cfg.Probe.TimeoutSec),
+		claimProbe:           proberuntime.New(cfg.Probe.DelaySec, cfg.Probe.TimeoutSec),
+		uploadProbe:          proberuntime.New(cfg.Probe.DelaySec, cfg.Probe.TimeoutSec),
 		wakeCh:               make(chan struct{}, 1),
 		systemIndexUpdatedAt: isoformatNow(),
 		queueEvents:          newQueueStatusEventBroker(),
+		adminQueueEvents:     newQueueStatusEventBroker(),
 		claimEvents:          newClaimRealtimeEventBroker(),
 		uploadEvents:         newUploadResultsEventBroker(),
 		hideClaimsCh:         make(chan hideClaimsTask, 256),
 		uploadTaskCh:         make(chan uploadTask, 128),
 		uploadSnapshots:      make(map[int64]uploadSnapshot),
 		uploadPending:        make(map[string]*uploadPendingRecord),
+		queueNotifyCh:        make(chan int64, 1024),
 		startupInProgress:    true,
 		startupReadyCh:       make(chan struct{}),
 		tokenImportCh:        make(chan tokenImportRequest, 512),
@@ -309,10 +349,12 @@ func NewService(cfg config.Config, store *database.Store, authService *auth.Serv
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		s.setLifecycleContext(ctx)
-		s.probe.Start()
+		s.activeClaimProbe().Start()
+		s.activeUploadProbe().Start()
 		go func() {
 			<-ctx.Done()
-			s.probe.Stop()
+			s.activeClaimProbe().Stop()
+			s.activeUploadProbe().Stop()
 		}()
 
 		ticker := time.NewTicker(queuePumpInterval)
@@ -337,6 +379,7 @@ func (s *Service) Start(ctx context.Context) {
 		s.goWorker(func() { s.hideClaimsWorkerLoop(ctx) })
 		s.goWorker(func() { s.tokenImportLoop(ctx) })
 		s.goWorker(func() { s.tokenWatchLoop(ctx) })
+		s.goWorker(func() { s.queueNotificationWorkerLoop(ctx) })
 		s.goWorker(func() { s.warmReadCaches(ctx) })
 	})
 }
@@ -377,9 +420,179 @@ func (s *Service) wakeQueuePump() {
 	}
 }
 
+func (s *Service) activeClaimProbe() claimProbe {
+	if s != nil && s.probe != nil {
+		return s.probe
+	}
+	if s != nil && s.claimProbe != nil {
+		return s.claimProbe
+	}
+	return noopClaimProbe{}
+}
+
+func (s *Service) activeUploadProbe() claimProbe {
+	if s != nil && s.probe != nil {
+		return s.probe
+	}
+	if s != nil && s.uploadProbe != nil {
+		return s.uploadProbe
+	}
+	return noopClaimProbe{}
+}
+
+type noopClaimProbe struct{}
+
+func (noopClaimProbe) Start() {}
+
+func (noopClaimProbe) Stop() {}
+
+func (noopClaimProbe) Submit(map[string]any, float64) proberuntime.Result {
+	return proberuntime.Result{Status: "non_401_error", Detail: "probe_unavailable"}
+}
+
 func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64, count int) (*claimResult, error) {
+	return s.claimTokens(ctx, userID, apiKeyID, count, "", "")
+}
+
+func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, apiKeyID *int64, count int, originSessionID string, originTabID string) (*claimResult, error) {
 	requested := maxInt(1, count)
 	now := time.Now().Unix()
+	originSessionID = strings.TrimSpace(originSessionID)
+	originTabID = strings.TrimSpace(originTabID)
+
+	type claimRequestBootstrap struct {
+		Item      *userQueueEntry
+		Used      int
+		Limit     int
+		Remaining int
+	}
+
+	initial, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (claimRequestBootstrap, error) {
+		policy, err := s.ensureInventoryPolicyTx(ctx, tx, false)
+		if err != nil {
+			return claimRequestBootstrap{}, err
+		}
+		if requested > policy.HourlyLimit {
+			requested = policy.HourlyLimit
+		}
+		if requested <= 0 {
+			return claimRequestBootstrap{}, echo.NewHTTPError(http.StatusTooManyRequests, "您当前小时内的兑换额度已用完")
+		}
+
+		used, err := s.countUserClaimsSince(ctx, tx, userID, now-3600)
+		if err != nil {
+			return claimRequestBootstrap{}, err
+		}
+
+		queueState, assessErr := s.assessQueueAdvanceQueryer(ctx, tx, userQueueEntry{
+			UserID:       userID,
+			APIKeyID:     sqlNullInt64(apiKeyID),
+			Requested:    requested,
+			Remaining:    requested,
+			Status:       queueStatusQueuedWaiting,
+			EnqueuedAtTS: now,
+		}, policy)
+		if assessErr != nil {
+			return claimRequestBootstrap{}, assessErr
+		}
+
+		queueItem, _, err := s.enqueueClaimTx(
+			ctx,
+			tx,
+			userID,
+			apiKeyID,
+			requested,
+			originSessionID,
+			originTabID,
+			queueState.Status,
+			queueState.BlockReason,
+			queueState.NextRetryAtTS,
+		)
+		if err != nil {
+			return claimRequestBootstrap{}, err
+		}
+
+		return claimRequestBootstrap{
+			Item:      queueItem,
+			Used:      used,
+			Limit:     policy.HourlyLimit,
+			Remaining: maxInt(0, policy.HourlyLimit-used),
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := &claimResult{
+		RequestID:      initial.Item.RequestID,
+		Items:          []claimResponseItem{},
+		Requested:      initial.Item.Requested,
+		Granted:        maxInt(0, initial.Item.Requested-initial.Item.Remaining),
+		Queued:         true,
+		QueueStatus:    initial.Item.Status,
+		QueueID:        initial.Item.ID,
+		QueuePosition:  initial.Item.QueueRank,
+		QueueRemaining: initial.Item.Remaining,
+		BlockReason:    strings.TrimSpace(initial.Item.BlockReason.String),
+		LastProgressAt: isoformatFromNullableTS(initial.Item.LastProgressAtTS),
+		NextRetryAt:    isoformatFromNullableTS(initial.Item.NextRetryAtTS),
+		Quota: quotaUsage{
+			Used:      initial.Used,
+			Limit:     initial.Limit,
+			Remaining: initial.Remaining,
+		},
+	}
+
+	s.afterQueueMutation(ctx, userID)
+	s.wakeQueuePump()
+	s.publishAdminQueueEnqueued(*initial.Item)
+	return result, nil
+}
+
+func (s *Service) GetClaimRequest(ctx context.Context, userID int64, requestID string) (*claimResult, error) {
+	entry, err := s.loadClaimRequestEntry(ctx, userID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, nil
+	}
+
+	items, err := s.listClaimItemsByRequestID(ctx, userID, entry.RequestID)
+	if err != nil {
+		return nil, err
+	}
+	quota, err := s.GetQuotaUsage(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	queued := isQueueActiveStatus(entry.Status) && entry.Remaining > 0
+	result := &claimResult{
+		RequestID:      entry.RequestID,
+		Items:          items,
+		Requested:      maxInt(0, entry.Requested),
+		Granted:        maxInt(0, entry.Requested-entry.Remaining),
+		Queued:         queued,
+		QueueStatus:    strings.ToLower(strings.TrimSpace(entry.Status)),
+		QueueID:        entry.ID,
+		QueueRemaining: maxInt(0, entry.Remaining),
+		BlockReason:    strings.TrimSpace(entry.BlockReason.String),
+		LastProgressAt: isoformatFromNullableTS(entry.LastProgressAtTS),
+		NextRetryAt:    isoformatFromNullableTS(entry.NextRetryAtTS),
+		Quota:          quota,
+	}
+	if queued {
+		result.QueuePosition = entry.QueueRank
+	}
+	return result, nil
+}
+
+func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64, count int, originSessionID string, originTabID string) (*claimResult, error) {
+	requested := maxInt(1, count)
+	now := time.Now().Unix()
+	originSessionID = strings.TrimSpace(originSessionID)
+	originTabID = strings.TrimSpace(originTabID)
 
 	type claimBootstrap struct {
 		Target      int
@@ -388,6 +601,7 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 		Remaining   int
 		APIKeyLimit int
 		Queued      *claimResult
+		QueuedItem  *userQueueEntry
 	}
 
 	initial, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (claimBootstrap, error) {
@@ -436,7 +650,18 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 			return claimBootstrap{}, err
 		}
 		if hasPending {
-			queueItem, _, err := s.enqueueClaimTx(ctx, tx, userID, apiKeyID, target)
+			queueState, assessErr := s.assessQueueAdvanceQueryer(ctx, tx, userQueueEntry{
+				UserID:       userID,
+				APIKeyID:     sqlNullInt64(apiKeyID),
+				Requested:    target,
+				Remaining:    target,
+				Status:       queueStatusQueuedWaiting,
+				EnqueuedAtTS: now,
+			}, policy)
+			if assessErr != nil {
+				return claimBootstrap{}, assessErr
+			}
+			queueItem, _, err := s.enqueueClaimTx(ctx, tx, userID, apiKeyID, target, originSessionID, originTabID, queueState.Status, queueState.BlockReason, queueState.NextRetryAtTS)
 			if err != nil {
 				return claimBootstrap{}, err
 			}
@@ -446,15 +671,20 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 				Limit:       policy.HourlyLimit,
 				Remaining:   remaining,
 				APIKeyLimit: apiKeyLimit,
+				QueuedItem:  queueItem,
 				Queued: &claimResult{
 					RequestID:      queueItem.RequestID,
 					Items:          []claimResponseItem{},
 					Requested:      target,
 					Granted:        0,
 					Queued:         true,
+					QueueStatus:    queueItem.Status,
 					QueueID:        queueItem.ID,
 					QueuePosition:  queueItem.QueueRank,
 					QueueRemaining: queueItem.Remaining,
+					BlockReason:    strings.TrimSpace(queueItem.BlockReason.String),
+					LastProgressAt: isoformatFromNullableTS(queueItem.LastProgressAtTS),
+					NextRetryAt:    isoformatFromNullableTS(queueItem.NextRetryAtTS),
 					Quota: quotaUsage{
 						Used:      used,
 						Limit:     policy.HourlyLimit,
@@ -479,6 +709,9 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 	if initial.Queued != nil {
 		s.afterQueueMutation(ctx, userID)
 		s.wakeQueuePump()
+		if initial.QueuedItem != nil {
+			s.publishAdminQueueEnqueued(*initial.QueuedItem)
+		}
 		return initial.Queued, nil
 	}
 
@@ -508,7 +741,22 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 	}
 
 	if len(items) == 0 {
-		queued, err := s.enqueueClaim(ctx, userID, apiKeyID, initial.Target, initial.Used, initial.Limit, initial.Remaining)
+		policy, policyErr := s.getInventoryPolicy(ctx)
+		if policyErr != nil {
+			return nil, policyErr
+		}
+		queueState, assessErr := s.assessQueueAdvanceQueryer(ctx, s.store.DB(), userQueueEntry{
+			UserID:       userID,
+			APIKeyID:     sqlNullInt64(apiKeyID),
+			Requested:    initial.Target,
+			Remaining:    initial.Target,
+			Status:       queueStatusQueuedWaiting,
+			EnqueuedAtTS: now,
+		}, policy)
+		if assessErr != nil {
+			return nil, assessErr
+		}
+		queued, err := s.enqueueClaim(ctx, userID, apiKeyID, initial.Target, initial.Used, initial.Limit, initial.Remaining, originSessionID, originTabID, queueState.Status, queueState.BlockReason, queueState.NextRetryAtTS)
 		if err != nil {
 			return nil, err
 		}
@@ -530,12 +778,15 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 			Remaining: maxInt(0, initial.Limit-usedAfter),
 		},
 	}
+	if err := s.recordTerminalClaimRequest(ctx, userID, apiKeyID, originSessionID, originTabID, result); err != nil {
+		return nil, err
+	}
 	s.invalidateUserQuotaCache(userID)
 	s.invalidateUserClaimsCache(userID)
 	s.invalidateInventoryCache()
 	s.invalidateDashboardClaimCaches()
 	s.invalidateAdminCache()
-	s.notifyQueueUsers(ctx, userID)
+	s.scheduleQueueNotifications(userID)
 	return result, nil
 }
 
@@ -548,18 +799,17 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 		return err
 	}
 
-	queueRows, err := s.listQueuedEntries(ctx)
-	if err != nil {
-		return err
-	}
-	if len(queueRows) == 0 {
-		return nil
-	}
-
-	affectedUsers := make(map[int64]struct{}, len(queueRows))
-	claimedUsers := make(map[int64]struct{}, len(queueRows))
-	for _, row := range queueRows {
-		result, err := s.advanceQueueRow(ctx, row, policy)
+	affectedUsers := make(map[int64]struct{}, queueAdvanceMaxResolvedHeadTurns+1)
+	claimedUsers := make(map[int64]struct{}, queueAdvanceMaxResolvedHeadTurns+1)
+	for resolvedHeads := 0; resolvedHeads < queueAdvanceMaxResolvedHeadTurns; resolvedHeads++ {
+		row, err := s.loadQueueHead(ctx)
+		if err != nil {
+			return err
+		}
+		if row == nil {
+			break
+		}
+		result, err := s.advanceQueueRow(ctx, *row, policy)
 		if err != nil {
 			s.logger.Warn(
 				"advance claim queue row failed",
@@ -572,7 +822,7 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 				"error",
 				err,
 			)
-			failureResult, failureErr := s.recordQueueFailure(ctx, row, err.Error())
+			failureResult, failureErr := s.recordQueueFailure(ctx, *row, err.Error())
 			if failureErr != nil {
 				s.logger.Error(
 					"record claim queue failure",
@@ -583,13 +833,14 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 					"error",
 					failureErr,
 				)
-				continue
+				break
 			}
 			if failureResult.Changed {
 				affectedUsers[row.UserID] = struct{}{}
+				s.publishAdminQueueFailure(*row, err.Error(), failureResult.FailureCount, failureResult.Cancelled)
 			}
 			if failureResult.Cancelled {
-				if publishErr := s.publishQueueTerminalState(ctx, row, claimStatusCancelled, queueCancelReasonFailureThreshold); publishErr != nil {
+				if publishErr := s.publishQueueTerminalState(ctx, *row, queueStatusFailed, queueCancelReasonFailureThreshold); publishErr != nil {
 					s.logger.Warn(
 						"publish queue failure terminal state",
 						"queue_id",
@@ -602,14 +853,34 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 						publishErr,
 					)
 				}
+				nextHead, headErr := s.loadQueueHead(ctx)
+				if headErr != nil {
+					return headErr
+				}
+				if nextHead != nil {
+					affectedUsers[nextHead.UserID] = struct{}{}
+				}
+				continue
 			}
-			continue
+			break
 		}
 		if result.Changed {
 			affectedUsers[row.UserID] = struct{}{}
 			if result.Claimed {
 				claimedUsers[row.UserID] = struct{}{}
 			}
+			if result.Terminal {
+				nextHead, headErr := s.loadQueueHead(ctx)
+				if headErr != nil {
+					return headErr
+				}
+				if nextHead != nil {
+					affectedUsers[nextHead.UserID] = struct{}{}
+				}
+			}
+		}
+		if !result.Terminal {
+			break
 		}
 	}
 
@@ -1026,6 +1297,19 @@ func (s *Service) loadQueueStatusSnapshotWithMetrics(
 		return queueStatusPayload{}, err
 	}
 
+	var queueHead *userQueueEntry
+	if entry != nil && entry.QueueRank > 1 {
+		headStage := startObservedReadStage(ctx)
+		queueHead, err = s.loadQueueHead(headStage.Context())
+		if metrics != nil {
+			metrics.EntryDuration += headStage.Duration()
+			metrics.EntrySQLCount += headStage.SQLCount()
+		}
+		if err != nil {
+			return queueStatusPayload{}, err
+		}
+	}
+
 	inventoryStage := startObservedReadStage(ctx)
 	runtimeState, runtimeExists, err := s.getInventoryRuntimeState(inventoryStage.Context(), s.store.DB())
 	if metrics != nil {
@@ -1052,10 +1336,33 @@ func (s *Service) loadQueueStatusSnapshotWithMetrics(
 		availableTokens = snapshot["available"]
 	}
 
-	return buildQueueStatusPayload(entry, totalQueued, availableTokens), nil
+	return buildQueueStatusPayload(entry, totalQueued, availableTokens, queueHead), nil
 }
 
-func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTokens int) queueStatusPayload {
+func deriveFrontQueueBlock(queueHead *userQueueEntry, follower *userQueueEntry) (bool, string, string) {
+	if follower == nil || follower.QueueRank <= 1 || queueHead == nil || queueHead.ID <= 0 || queueHead.ID == follower.ID {
+		return false, "", ""
+	}
+
+	blockReason := strings.TrimSpace(queueHead.BlockReason.String)
+	if strings.EqualFold(strings.TrimSpace(queueHead.Status), queueStatusQueuedBlocked) {
+		if blockReason == "" {
+			blockReason = queueBlockReasonAllocationStalled
+		}
+		return true, blockReason, isoformatFromNullableTS(queueHead.NextRetryAtTS)
+	}
+
+	if queueHead.NextRetryAtTS.Valid && queueHead.NextRetryAtTS.Int64 > time.Now().Unix() {
+		if blockReason == "" {
+			blockReason = queueBlockReasonAllocationStalled
+		}
+		return true, blockReason, isoformatFromNullableTS(queueHead.NextRetryAtTS)
+	}
+
+	return false, "", ""
+}
+
+func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTokens int, queueHead *userQueueEntry) queueStatusPayload {
 	generatedAt := isoformatNow()
 	if entry == nil {
 		return withQueueStatusMetadata(queueStatusPayload{
@@ -1066,19 +1373,29 @@ func buildQueueStatusPayload(entry *userQueueEntry, totalQueued int, availableTo
 		}, dataSourceLive, generatedAt, "", "", false)
 	}
 
-	return withQueueStatusMetadata(queueStatusPayload{
+	payload := queueStatusPayload{
 		Queued:          true,
+		Status:          entry.Status,
 		QueueID:         entry.ID,
 		Position:        entry.QueueRank,
 		Ahead:           maxInt(0, entry.QueueRank-1),
 		Requested:       entry.Requested,
 		Remaining:       entry.Remaining,
+		BlockReason:     strings.TrimSpace(entry.BlockReason.String),
+		LastProgressAt:  isoformatFromNullableTS(entry.LastProgressAtTS),
+		NextRetryAt:     isoformatFromNullableTS(entry.NextRetryAtTS),
 		EnqueuedAt:      isoformatFromTS(entry.EnqueuedAtTS),
 		RequestID:       entry.RequestID,
 		TotalQueued:     totalQueued,
 		AvailableTokens: availableTokens,
 		ClaimableNow:    nil,
-	}, dataSourceLive, generatedAt, "", "", false)
+	}
+	if frontBlocked, frontReason, frontNextRetryAt := deriveFrontQueueBlock(queueHead, entry); frontBlocked {
+		payload.FrontBlocked = true
+		payload.FrontBlockReason = frontReason
+		payload.FrontNextRetryAt = frontNextRetryAt
+	}
+	return withQueueStatusMetadata(payload, dataSourceLive, generatedAt, "", "", false)
 }
 
 func (s *Service) attachCachedClaimableNow(userID int64, payload queueStatusPayload) queueStatusPayload {
@@ -1097,7 +1414,7 @@ func (s *Service) attachCachedClaimableNow(userID int64, payload queueStatusPayl
 		return payload
 	}
 	payload.ClaimableNow = nil
-	payload.ClaimableNowState = dataSourceUnavailable
+	payload.ClaimableNowState = dataSourceDeferred
 	payload.ClaimableNowUpdatedAt = ""
 	if strings.TrimSpace(payload.DegradedReason) == "" {
 		payload.DegradedReason = degradedReasonClaimableDeferred
@@ -1277,7 +1594,7 @@ func (s *Service) HideClaims(ctx context.Context, userID int64, claimIDs []int64
 		WHERE user_id = ? AND id IN (%s)
 	`, strings.Join(placeholders, ","))
 
-	if _, err := s.store.DB().ExecContext(ctx, query, args...); err != nil {
+	if _, err := execWriteContext(ctx, s.store.DB(), query, args...); err != nil {
 		return fmt.Errorf("hide claims: %w", err)
 	}
 
@@ -1408,13 +1725,13 @@ func (s *Service) getDashboardStats(ctx context.Context, userID int64) (map[stri
 	return result.Value, err
 }
 
-func (s *Service) enqueueClaim(ctx context.Context, userID int64, apiKeyID *int64, target int, used int, limit int, remaining int) (*claimResult, error) {
+func (s *Service) enqueueClaim(ctx context.Context, userID int64, apiKeyID *int64, target int, used int, limit int, remaining int, originSessionID string, originTabID string, queueStatus string, blockReason string, nextRetryAtTS int64) (*claimResult, error) {
 	type queueInsertResult struct {
 		Item *userQueueEntry
 	}
 
 	inserted, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (queueInsertResult, error) {
-		item, _, err := s.enqueueClaimTx(ctx, tx, userID, apiKeyID, target)
+		item, _, err := s.enqueueClaimTx(ctx, tx, userID, apiKeyID, target, originSessionID, originTabID, queueStatus, blockReason, nextRetryAtTS)
 		if err != nil {
 			return queueInsertResult{}, err
 		}
@@ -1424,15 +1741,20 @@ func (s *Service) enqueueClaim(ctx context.Context, userID int64, apiKeyID *int6
 		return nil, err
 	}
 
+	s.publishAdminQueueEnqueued(*inserted.Item)
 	return &claimResult{
 		RequestID:      inserted.Item.RequestID,
 		Items:          []claimResponseItem{},
 		Requested:      target,
 		Granted:        0,
 		Queued:         true,
+		QueueStatus:    inserted.Item.Status,
 		QueueID:        inserted.Item.ID,
 		QueuePosition:  inserted.Item.QueueRank,
 		QueueRemaining: inserted.Item.Remaining,
+		BlockReason:    strings.TrimSpace(inserted.Item.BlockReason.String),
+		LastProgressAt: isoformatFromNullableTS(inserted.Item.LastProgressAtTS),
+		NextRetryAt:    isoformatFromNullableTS(inserted.Item.NextRetryAtTS),
 		Quota: quotaUsage{
 			Used:      used,
 			Limit:     limit,
@@ -1441,7 +1763,7 @@ func (s *Service) enqueueClaim(ctx context.Context, userID int64, apiKeyID *int6
 	}, nil
 }
 
-func (s *Service) enqueueClaimTx(ctx context.Context, tx *sql.Tx, userID int64, apiKeyID *int64, requested int) (*userQueueEntry, bool, error) {
+func (s *Service) enqueueClaimTx(ctx context.Context, tx *sql.Tx, userID int64, apiKeyID *int64, requested int, originSessionID string, originTabID string, queueStatus string, blockReason string, nextRetryAtTS int64) (*userQueueEntry, bool, error) {
 	existing, err := s.getUserQueueEntryTx(ctx, tx, userID)
 	if err != nil {
 		return nil, false, err
@@ -1465,12 +1787,32 @@ func (s *Service) enqueueClaimTx(ctx context.Context, tx *sql.Tx, userID int64, 
 	if apiKeyID != nil {
 		apiKeyArg = *apiKeyID
 	}
+	var originSessionArg any
+	if trimmed := strings.TrimSpace(originSessionID); trimmed != "" {
+		originSessionArg = trimmed
+	}
+	var originTabArg any
+	if trimmed := strings.TrimSpace(originTabID); trimmed != "" {
+		originTabArg = trimmed
+	}
+	normalizedQueueStatus := strings.ToLower(strings.TrimSpace(queueStatus))
+	if !isQueueActiveStatus(normalizedQueueStatus) {
+		normalizedQueueStatus = queueStatusQueuedWaiting
+	}
+	var blockReasonArg any
+	if trimmed := strings.TrimSpace(blockReason); trimmed != "" {
+		blockReasonArg = trimmed
+	}
+	var nextRetryArg any
+	if nextRetryAtTS > 0 {
+		nextRetryArg = nextRetryAtTS
+	}
 
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO claim_queue (
-			user_id, api_key_id, requested, remaining, queue_rank, enqueued_at_ts, request_id, status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')
-	`, userID, apiKeyArg, requested, requested, totalQueued+1, now, requestID)
+			user_id, api_key_id, requested, remaining, queue_rank, enqueued_at_ts, request_id, status, origin_session_id, origin_tab_id, block_reason, next_retry_at_ts
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, userID, apiKeyArg, requested, requested, totalQueued+1, now, requestID, normalizedQueueStatus, originSessionArg, originTabArg, blockReasonArg, nextRetryArg)
 	if err != nil {
 		return nil, false, fmt.Errorf("insert claim queue row: %w", err)
 	}
@@ -1498,7 +1840,125 @@ func (s *Service) enqueueClaimTx(ctx context.Context, tx *sql.Tx, userID int64, 
 		QueueRank:    totalQueued + 1,
 		EnqueuedAtTS: now,
 		RequestID:    requestID,
+		Status:       normalizedQueueStatus,
+		OriginSessionID: sql.NullString{
+			String: strings.TrimSpace(originSessionID),
+			Valid:  strings.TrimSpace(originSessionID) != "",
+		},
+		OriginTabID: sql.NullString{
+			String: strings.TrimSpace(originTabID),
+			Valid:  strings.TrimSpace(originTabID) != "",
+		},
+		BlockReason: sql.NullString{
+			String: strings.TrimSpace(blockReason),
+			Valid:  strings.TrimSpace(blockReason) != "",
+		},
+		NextRetryAtTS: sql.NullInt64{
+			Int64: nextRetryAtTS,
+			Valid: nextRetryAtTS > 0,
+		},
 	}, false, nil
+}
+
+func (s *Service) recordTerminalClaimRequest(ctx context.Context, userID int64, apiKeyID *int64, originSessionID string, originTabID string, result *claimResult) error {
+	if userID <= 0 || result == nil || strings.TrimSpace(result.RequestID) == "" {
+		return nil
+	}
+
+	requested := maxInt(0, result.Requested)
+	granted := maxInt(0, result.Granted)
+	remaining := maxInt(0, requested-granted)
+	status := queueStatusFailed
+	switch {
+	case granted >= requested && requested > 0:
+		status = queueStatusSucceeded
+	case granted > 0:
+		status = queueStatusPartial
+	}
+
+	nowTS := time.Now().Unix()
+	var apiKeyArg any
+	if apiKeyID != nil {
+		apiKeyArg = *apiKeyID
+	}
+	var originSessionArg any
+	if trimmed := strings.TrimSpace(originSessionID); trimmed != "" {
+		originSessionArg = trimmed
+	}
+	var originTabArg any
+	if trimmed := strings.TrimSpace(originTabID); trimmed != "" {
+		originTabArg = trimmed
+	}
+
+	_, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (int64, error) {
+		row := tx.QueryRowContext(ctx, `
+			SELECT id
+			FROM claim_queue
+			WHERE user_id = ? AND request_id = ?
+			ORDER BY id DESC
+			LIMIT 1
+		`, userID, result.RequestID)
+
+		var existingID int64
+		switch scanErr := row.Scan(&existingID); scanErr {
+		case nil:
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE claim_queue
+				SET api_key_id = ?,
+				    requested = ?,
+				    remaining = ?,
+				    queue_rank = 0,
+				    status = ?,
+				    origin_session_id = ?,
+				    origin_tab_id = ?,
+				    block_reason = NULL,
+				    next_retry_at_ts = NULL,
+				    last_progress_at_ts = ?,
+				    terminal_at_ts = ?,
+				    cancel_reason = NULL,
+				    cancelled_at_ts = NULL,
+				    cancelled_by_user_id = NULL,
+				    last_error_reason = NULL,
+				    last_error_at_ts = NULL,
+				    failure_count = 0
+				WHERE id = ?
+			`, apiKeyArg, requested, remaining, status, originSessionArg, originTabArg, nowTS, nowTS, existingID); err != nil {
+				return 0, fmt.Errorf("update terminal claim request %s: %w", result.RequestID, err)
+			}
+			return existingID, nil
+		case sql.ErrNoRows:
+		default:
+			return 0, fmt.Errorf("load claim request row %s: %w", result.RequestID, scanErr)
+		}
+
+		record, err := tx.ExecContext(ctx, `
+			INSERT INTO claim_queue (
+				user_id,
+				api_key_id,
+				requested,
+				remaining,
+				queue_rank,
+				enqueued_at_ts,
+				request_id,
+				status,
+				origin_session_id,
+				origin_tab_id,
+				block_reason,
+				next_retry_at_ts,
+				last_progress_at_ts,
+				terminal_at_ts
+			) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+		`, userID, apiKeyArg, requested, remaining, nowTS, result.RequestID, status, originSessionArg, originTabArg, nowTS, nowTS)
+		if err != nil {
+			return 0, fmt.Errorf("insert terminal claim request %s: %w", result.RequestID, err)
+		}
+		insertedID, err := record.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("read terminal claim request id %s: %w", result.RequestID, err)
+		}
+		return insertedID, nil
+	})
+	return err
 }
 
 func (s *Service) consumeQueueGrant(ctx context.Context, queueID int64, granted int) (bool, error) {
@@ -1510,7 +1970,7 @@ func (s *Service) consumeQueueGrant(ctx context.Context, queueID int64, granted 
 		row := tx.QueryRowContext(ctx, `
 			SELECT remaining
 			FROM claim_queue
-			WHERE id = ? AND status = 'queued'
+			WHERE id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked')
 		`, queueID)
 
 		var remaining int
@@ -1522,18 +1982,17 @@ func (s *Service) consumeQueueGrant(ctx context.Context, queueID int64, granted 
 		}
 
 		remainingAfter := maxInt(0, remaining-granted)
+		nowTS := time.Now().Unix()
 		if remainingAfter <= 0 {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM claim_queue WHERE id = ?`, queueID); err != nil {
-				return false, fmt.Errorf("delete queue row %d: %w", queueID, err)
-			}
-			if err := s.normalizeActiveQueueStateTx(ctx, tx); err != nil {
-				return false, err
-			}
-		} else {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE claim_queue
-				SET remaining = ?,
-				    status = 'queued',
+				SET remaining = 0,
+				    queue_rank = 0,
+				    status = ?,
+				    block_reason = NULL,
+				    next_retry_at_ts = NULL,
+				    last_progress_at_ts = ?,
+				    terminal_at_ts = ?,
 				    cancel_reason = NULL,
 				    cancelled_at_ts = NULL,
 				    cancelled_by_user_id = NULL,
@@ -1541,12 +2000,31 @@ func (s *Service) consumeQueueGrant(ctx context.Context, queueID int64, granted 
 				    last_error_at_ts = NULL,
 				    failure_count = 0
 				WHERE id = ?
-			`, remainingAfter, queueID); err != nil {
+			`, queueStatusSucceeded, nowTS, nowTS, queueID); err != nil {
+				return false, fmt.Errorf("complete queue row %d: %w", queueID, err)
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE claim_queue
+				SET remaining = ?,
+				    status = ?,
+				    block_reason = NULL,
+				    next_retry_at_ts = NULL,
+				    last_progress_at_ts = ?,
+				    terminal_at_ts = NULL,
+				    cancel_reason = NULL,
+				    cancelled_at_ts = NULL,
+				    cancelled_by_user_id = NULL,
+				    last_error_reason = NULL,
+				    last_error_at_ts = NULL,
+				    failure_count = 0
+				WHERE id = ?
+			`, remainingAfter, queueStatusQueuedWaiting, nowTS, queueID); err != nil {
 				return false, fmt.Errorf("update queue remaining: %w", err)
 			}
-			if err := s.normalizeActiveQueueStateTx(ctx, tx); err != nil {
-				return false, err
-			}
+		}
+		if err := s.normalizeActiveQueueStateTx(ctx, tx); err != nil {
+			return false, err
 		}
 
 		return remainingAfter <= 0, nil
@@ -1554,38 +2032,85 @@ func (s *Service) consumeQueueGrant(ctx context.Context, queueID int64, granted 
 }
 
 func (s *Service) allocateClaimableToken(ctx context.Context, userID int64, apiKeyID *int64, requestID string, hourlyLimit int, apiKeyLimit int) (*claimAllocation, error) {
-	waitTimeoutSec := s.cfg.Probe.TimeoutSec + s.cfg.Probe.DelaySec + 5.0
 	for attempt := 0; attempt < 16; attempt++ {
-		candidate, err := s.reserveClaimableTokenForUser(ctx, userID)
-		if err != nil {
-			return nil, err
-		}
-		if candidate == nil {
-			return nil, nil
-		}
-
-		probeResult := s.probe.Submit(candidate.Content, waitTimeoutSec)
-		if probeResult.IsBanned() {
-			if err := s.markTokenBanned(ctx, candidate.TokenID, "upstream_401"); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if probeResult.Status != "ok" {
-			if err := s.recordProbeStatus(ctx, candidate.TokenID, probeResult.Status, false); err != nil {
-				return nil, err
-			}
-		}
-
-		item, err := s.finalizeClaimReservedToken(ctx, candidate.TokenID, userID, apiKeyID, requestID, hourlyLimit, apiKeyLimit)
+		item, retry, err := s.allocateClaimableTokenOnce(ctx, userID, apiKeyID, requestID, hourlyLimit, apiKeyLimit, 0)
 		if err != nil {
 			return nil, err
 		}
 		if item != nil {
 			return item, nil
 		}
+		if !retry {
+			return nil, nil
+		}
 	}
 	return nil, nil
+}
+
+func (s *Service) allocateClaimableTokenForQueue(ctx context.Context, userID int64, apiKeyID *int64, requestID string, hourlyLimit int, apiKeyLimit int, budget time.Duration) (*claimAllocation, error) {
+	item, _, err := s.allocateClaimableTokenOnce(ctx, userID, apiKeyID, requestID, hourlyLimit, apiKeyLimit, budget)
+	return item, err
+}
+
+func (s *Service) allocateClaimableTokenOnce(ctx context.Context, userID int64, apiKeyID *int64, requestID string, hourlyLimit int, apiKeyLimit int, budget time.Duration) (*claimAllocation, bool, error) {
+	candidate, err := s.reserveClaimableTokenForUser(ctx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	if candidate == nil {
+		return nil, false, nil
+	}
+
+	probeResult := s.submitProbeWithBudget(s.activeClaimProbe(), candidate.Content, s.cfg.Probe.TimeoutSec+s.cfg.Probe.DelaySec+5.0, budget)
+	if probeResult.IsBanned() {
+		if err := s.markTokenBanned(ctx, candidate.TokenID, "upstream_401"); err != nil {
+			return nil, false, err
+		}
+		return nil, true, nil
+	}
+	if probeResult.Status != "ok" {
+		statusText := probeResult.Status
+		clearLock := false
+		if probeResult.Detail == "queue_tick_timeout" {
+			statusText = probeResult.Detail
+			clearLock = true
+		}
+		if err := s.recordProbeStatus(ctx, candidate.TokenID, statusText, clearLock); err != nil {
+			return nil, false, err
+		}
+		if probeResult.Detail == "queue_tick_timeout" {
+			return nil, false, nil
+		}
+	}
+
+	item, err := s.finalizeClaimReservedToken(ctx, candidate.TokenID, userID, apiKeyID, requestID, hourlyLimit, apiKeyLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	return item, item == nil, nil
+}
+
+func (s *Service) submitProbeWithBudget(probe claimProbe, tokenContent map[string]any, waitTimeoutSec float64, budget time.Duration) proberuntime.Result {
+	if probe == nil {
+		return proberuntime.Result{Status: "non_401_error", Detail: "probe_unavailable"}
+	}
+	if budget <= 0 {
+		return probe.Submit(tokenContent, waitTimeoutSec)
+	}
+
+	resultCh := make(chan proberuntime.Result, 1)
+	go func() {
+		resultCh <- probe.Submit(tokenContent, waitTimeoutSec)
+	}()
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case result := <-resultCh:
+		return result
+	case <-timer.C:
+		return proberuntime.Result{Status: "non_401_error", Detail: "queue_tick_timeout"}
+	}
 }
 
 func (s *Service) ensureInventoryPolicy(ctx context.Context, refreshExistingScope bool) (inventoryPolicy, error) {
@@ -2023,7 +2548,7 @@ func (s *Service) hasPendingQueueTx(ctx context.Context, tx *sql.Tx) (bool, erro
 	row := tx.QueryRowContext(ctx, `
 		SELECT 1
 		FROM claim_queue
-		WHERE status = 'queued' AND remaining > 0
+		WHERE status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
 		LIMIT 1
 	`)
 
@@ -2045,10 +2570,16 @@ func (s *Service) listQueuedEntries(ctx context.Context) ([]userQueueEntry, erro
 		       api_key_id,
 		       requested,
 		       remaining,
-		       queue_rank,
+		       0,
 		       enqueued_at_ts,
 		       request_id,
 		       status,
+		       origin_session_id,
+		       origin_tab_id,
+		       block_reason,
+		       next_retry_at_ts,
+		       last_progress_at_ts,
+		       terminal_at_ts,
 		       cancel_reason,
 		       cancelled_at_ts,
 		       cancelled_by_user_id,
@@ -2056,8 +2587,8 @@ func (s *Service) listQueuedEntries(ctx context.Context) ([]userQueueEntry, erro
 		       last_error_at_ts,
 		       failure_count
 		FROM claim_queue
-		WHERE status = 'queued' AND remaining > 0
-		ORDER BY queue_rank ASC, id ASC
+		WHERE status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+		ORDER BY enqueued_at_ts ASC, id ASC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list queued entries: %w", err)
@@ -2077,6 +2608,12 @@ func (s *Service) listQueuedEntries(ctx context.Context) ([]userQueueEntry, erro
 			&item.EnqueuedAtTS,
 			&item.RequestID,
 			&item.Status,
+			&item.OriginSessionID,
+			&item.OriginTabID,
+			&item.BlockReason,
+			&item.NextRetryAtTS,
+			&item.LastProgressAtTS,
+			&item.TerminalAtTS,
 			&item.CancelReason,
 			&item.CancelledAtTS,
 			&item.CancelledByUserID,
@@ -2091,8 +2628,69 @@ func (s *Service) listQueuedEntries(ctx context.Context) ([]userQueueEntry, erro
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate queued entries: %w", err)
 	}
+	assignSequentialQueueRanks(items)
 
 	return items, nil
+}
+
+func (s *Service) loadQueueHead(ctx context.Context) (*userQueueEntry, error) {
+	row := queryRowContextCounted(ctx, s.store.DB(), `
+		SELECT id,
+		       user_id,
+		       api_key_id,
+		       requested,
+		       remaining,
+		       1,
+		       enqueued_at_ts,
+		       request_id,
+		       status,
+		       origin_session_id,
+		       origin_tab_id,
+		       block_reason,
+		       next_retry_at_ts,
+		       last_progress_at_ts,
+		       terminal_at_ts,
+		       cancel_reason,
+		       cancelled_at_ts,
+		       cancelled_by_user_id,
+		       last_error_reason,
+		       last_error_at_ts,
+		       failure_count
+		FROM claim_queue
+		WHERE status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+		ORDER BY enqueued_at_ts ASC, id ASC
+		LIMIT 1
+	`)
+	var item userQueueEntry
+	if err := row.Scan(
+		&item.ID,
+		&item.UserID,
+		&item.APIKeyID,
+		&item.Requested,
+		&item.Remaining,
+		&item.QueueRank,
+		&item.EnqueuedAtTS,
+		&item.RequestID,
+		&item.Status,
+		&item.OriginSessionID,
+		&item.OriginTabID,
+		&item.BlockReason,
+		&item.NextRetryAtTS,
+		&item.LastProgressAtTS,
+		&item.TerminalAtTS,
+		&item.CancelReason,
+		&item.CancelledAtTS,
+		&item.CancelledByUserID,
+		&item.LastErrorReason,
+		&item.LastErrorAtTS,
+		&item.FailureCount,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load queue head: %w", err)
+	}
+	return &item, nil
 }
 
 func (s *Service) getUserQueueEntry(ctx context.Context, userID int64) (*userQueueEntry, error) {
@@ -2103,17 +2701,32 @@ func (s *Service) getUserQueueEntryTx(ctx context.Context, tx *sql.Tx, userID in
 	return s.getUserQueueEntryFrom(ctx, tx, userID)
 }
 
-func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer, userID int64) (*userQueueEntry, error) {
+func (s *Service) loadClaimRequestEntry(ctx context.Context, userID int64, requestID string) (*userQueueEntry, error) {
+	return s.loadClaimRequestEntryFrom(ctx, s.store.DB(), userID, requestID)
+}
+
+func (s *Service) loadClaimRequestEntryFrom(ctx context.Context, queryer sqlQueryer, userID int64, requestID string) (*userQueueEntry, error) {
+	trimmedRequestID := strings.TrimSpace(requestID)
+	if userID <= 0 || trimmedRequestID == "" {
+		return nil, nil
+	}
+
 	row := queryRowContextCounted(ctx, queryer, `
 		SELECT id,
 		       user_id,
 		       api_key_id,
 		       requested,
 		       remaining,
-		       queue_rank,
+		       0,
 		       enqueued_at_ts,
 		       request_id,
 		       status,
+		       origin_session_id,
+		       origin_tab_id,
+		       block_reason,
+		       next_retry_at_ts,
+		       last_progress_at_ts,
+		       terminal_at_ts,
 		       cancel_reason,
 		       cancelled_at_ts,
 		       cancelled_by_user_id,
@@ -2121,8 +2734,76 @@ func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer,
 		       last_error_at_ts,
 		       failure_count
 		FROM claim_queue
-		WHERE user_id = ? AND status = 'queued' AND remaining > 0
-		ORDER BY queue_rank ASC, id ASC
+		WHERE user_id = ? AND request_id = ?
+		ORDER BY id DESC
+		LIMIT 1
+	`, userID, trimmedRequestID)
+
+	var item userQueueEntry
+	if err := row.Scan(
+		&item.ID,
+		&item.UserID,
+		&item.APIKeyID,
+		&item.Requested,
+		&item.Remaining,
+		&item.QueueRank,
+		&item.EnqueuedAtTS,
+		&item.RequestID,
+		&item.Status,
+		&item.OriginSessionID,
+		&item.OriginTabID,
+		&item.BlockReason,
+		&item.NextRetryAtTS,
+		&item.LastProgressAtTS,
+		&item.TerminalAtTS,
+		&item.CancelReason,
+		&item.CancelledAtTS,
+		&item.CancelledByUserID,
+		&item.LastErrorReason,
+		&item.LastErrorAtTS,
+		&item.FailureCount,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load claim request %q for user %d: %w", trimmedRequestID, userID, err)
+	}
+	if isQueueActiveStatus(item.Status) && item.Remaining > 0 {
+		position, err := s.lookupQueuePosition(ctx, queryer, item)
+		if err != nil {
+			return nil, err
+		}
+		item.QueueRank = position
+	}
+	return &item, nil
+}
+
+func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer, userID int64) (*userQueueEntry, error) {
+	row := queryRowContextCounted(ctx, queryer, `
+		SELECT id,
+		       user_id,
+		       api_key_id,
+		       requested,
+		       remaining,
+		       0,
+		       enqueued_at_ts,
+		       request_id,
+		       status,
+		       origin_session_id,
+		       origin_tab_id,
+		       block_reason,
+		       next_retry_at_ts,
+		       last_progress_at_ts,
+		       terminal_at_ts,
+		       cancel_reason,
+		       cancelled_at_ts,
+		       cancelled_by_user_id,
+		       last_error_reason,
+		       last_error_at_ts,
+		       failure_count
+		FROM claim_queue
+		WHERE user_id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+		ORDER BY enqueued_at_ts ASC, id ASC
 		LIMIT 1
 	`, userID)
 
@@ -2137,6 +2818,12 @@ func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer,
 		&item.EnqueuedAtTS,
 		&item.RequestID,
 		&item.Status,
+		&item.OriginSessionID,
+		&item.OriginTabID,
+		&item.BlockReason,
+		&item.NextRetryAtTS,
+		&item.LastProgressAtTS,
+		&item.TerminalAtTS,
 		&item.CancelReason,
 		&item.CancelledAtTS,
 		&item.CancelledByUserID,
@@ -2149,6 +2836,11 @@ func (s *Service) getUserQueueEntryFrom(ctx context.Context, queryer sqlQueryer,
 		}
 		return nil, fmt.Errorf("load queue entry for user %d: %w", userID, err)
 	}
+	position, err := s.lookupQueuePosition(ctx, queryer, item)
+	if err != nil {
+		return nil, err
+	}
+	item.QueueRank = position
 
 	return &item, nil
 }
@@ -2171,15 +2863,23 @@ func (s *Service) getTotalQueued(ctx context.Context, queryer sqlQueryer) (int, 
 }
 
 func (s *Service) remainingHourlyQuota(ctx context.Context, userID int64, limit int) (int, error) {
-	used, err := s.countUserClaimsSince(ctx, s.store.DB(), userID, time.Now().Unix()-3600)
+	return s.remainingHourlyQuotaQueryer(ctx, s.store.DB(), userID, limit)
+}
+
+func (s *Service) remainingMinuteQuota(ctx context.Context, apiKeyID int64, limit int) (int, error) {
+	return s.remainingMinuteQuotaQueryer(ctx, s.store.DB(), apiKeyID, limit)
+}
+
+func (s *Service) remainingHourlyQuotaQueryer(ctx context.Context, queryer sqlQueryer, userID int64, limit int) (int, error) {
+	used, err := s.countUserClaimsSince(ctx, queryer, userID, time.Now().Unix()-3600)
 	if err != nil {
 		return 0, err
 	}
 	return maxInt(0, limit-used), nil
 }
 
-func (s *Service) remainingMinuteQuota(ctx context.Context, apiKeyID int64, limit int) (int, error) {
-	used, err := s.countAPIKeyClaimsSince(ctx, s.store.DB(), apiKeyID, time.Now().Unix()-60)
+func (s *Service) remainingMinuteQuotaQueryer(ctx context.Context, queryer sqlQueryer, apiKeyID int64, limit int) (int, error) {
+	used, err := s.countAPIKeyClaimsSince(ctx, queryer, apiKeyID, time.Now().Unix()-60)
 	if err != nil {
 		return 0, err
 	}
@@ -2221,28 +2921,101 @@ func (s *Service) countClaimableTokensForUser(ctx context.Context, queryer sqlQu
 	`, time.Now().Unix(), userID)
 }
 
+func (s *Service) countPotentialClaimableTokensForUser(ctx context.Context, queryer sqlQueryer, userID int64) (int, error) {
+	return queryCount(ctx, queryer, `
+		SELECT COUNT(*)
+		FROM tokens
+		WHERE is_active = 1
+		  AND is_enabled = 1
+		  AND is_banned = 0
+		  AND is_available = 1
+		  AND claim_count < max_claims
+		  AND NOT EXISTS (
+			  SELECT 1
+			  FROM user_token_claims
+			  WHERE user_token_claims.user_id = ?
+				AND user_token_claims.token_id = tokens.id
+		  )
+	`, userID)
+}
+
+func (s *Service) countPotentialClaimableTokens(ctx context.Context, queryer sqlQueryer) (int, error) {
+	return queryCount(ctx, queryer, `
+		SELECT COUNT(*)
+		FROM tokens
+		WHERE is_active = 1
+		  AND is_enabled = 1
+		  AND is_banned = 0
+		  AND is_available = 1
+		  AND claim_count < max_claims
+	`)
+}
+
+func sqlNullInt64(value *int64) sql.NullInt64 {
+	if value == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *value, Valid: true}
+}
+
+func isoformatFromNullableTS(value sql.NullInt64) string {
+	if !value.Valid || value.Int64 <= 0 {
+		return ""
+	}
+	return isoformatFromTS(value.Int64)
+}
+
+func dbWriteLock(db *sql.DB) *sync.Mutex {
+	if db == nil {
+		return &sync.Mutex{}
+	}
+	if existing, ok := dbWriteLocks.Load(db); ok {
+		return existing.(*sync.Mutex)
+	}
+	created := &sync.Mutex{}
+	actual, _ := dbWriteLocks.LoadOrStore(db, created)
+	return actual.(*sync.Mutex)
+}
+
+func withSerializedDBWrite[T any](db *sql.DB, fn func() (T, error)) (T, error) {
+	lock := dbWriteLock(db)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
+}
+
+func execWriteContext(ctx context.Context, db *sql.DB, query string, args ...any) (sql.Result, error) {
+	return runWithDatabaseBusyRetry(ctx, func() (sql.Result, error) {
+		return withSerializedDBWrite(db, func() (sql.Result, error) {
+			return db.ExecContext(ctx, query, args...)
+		})
+	})
+}
+
 func withTx[T any](ctx context.Context, db *sql.DB, fn func(*sql.Tx) (T, error)) (T, error) {
 	return runWithDatabaseBusyRetry(ctx, func() (T, error) {
-		var zero T
+		return withSerializedDBWrite(db, func() (T, error) {
+			var zero T
 
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return zero, fmt.Errorf("begin transaction: %w", err)
-		}
-		defer func() {
-			_ = tx.Rollback()
-		}()
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return zero, fmt.Errorf("begin transaction: %w", err)
+			}
+			defer func() {
+				_ = tx.Rollback()
+			}()
 
-		value, err := fn(tx)
-		if err != nil {
-			return zero, err
-		}
+			value, err := fn(tx)
+			if err != nil {
+				return zero, err
+			}
 
-		if err := tx.Commit(); err != nil {
-			return zero, fmt.Errorf("commit transaction: %w", err)
-		}
+			if err := tx.Commit(); err != nil {
+				return zero, fmt.Errorf("commit transaction: %w", err)
+			}
 
-		return value, nil
+			return value, nil
+		})
 	})
 }
 

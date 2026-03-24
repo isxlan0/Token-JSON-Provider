@@ -61,7 +61,6 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 		s.invalidateInventoryCache()
 		s.invalidateDashboardUploadCaches()
 		s.invalidateAdminCache()
-		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
 
@@ -98,25 +97,26 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 
 	changed, err := withTx(ctx, s.store.DB(), func(tx *sql.Tx) (bool, error) {
 		row := tx.QueryRowContext(ctx, `
-			SELECT id, claim_count, max_claims, is_enabled, is_banned, file_hash, file_path, encoding, content_json, is_active
+			SELECT id, claim_count, max_claims, is_enabled, is_banned, file_hash, file_path, encoding, content_json, is_active, is_available
 			FROM tokens
 			WHERE file_name = ?
 		`, filepath.Base(path))
 
 		var (
-			tokenID          int64
-			claimCount       int
-			maxClaims        int
-			isEnabled        int
-			isBanned         int
-			existingHash     string
-			existingPath     string
-			existingEncoding string
-			existingContent  string
-			isActive         int
+			tokenID           int64
+			claimCount        int
+			maxClaims         int
+			isEnabled         int
+			isBanned          int
+			existingHash      string
+			existingPath      string
+			existingEncoding  string
+			existingContent   string
+			isActive          int
+			existingAvailable int
 		)
 		existing := true
-		if err := row.Scan(&tokenID, &claimCount, &maxClaims, &isEnabled, &isBanned, &existingHash, &existingPath, &existingEncoding, &existingContent, &isActive); err != nil {
+		if err := row.Scan(&tokenID, &claimCount, &maxClaims, &isEnabled, &isBanned, &existingHash, &existingPath, &existingEncoding, &existingContent, &isActive, &existingAvailable); err != nil {
 			if err != sql.ErrNoRows {
 				return false, fmt.Errorf("select token by file name: %w", err)
 			}
@@ -165,7 +165,12 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 				existingPath != relativePath ||
 				existingEncoding != encoding ||
 				existingContent != contentJSON ||
-				isActive != nextIsActive
+				isActive != nextIsActive ||
+				existingAvailable != isAvailable
+
+			if !changed {
+				return false, nil
+			}
 
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE tokens
@@ -226,7 +231,6 @@ func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, e
 		s.invalidateInventoryCache()
 		s.invalidateDashboardUploadCaches()
 		s.invalidateAdminCache()
-		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
 	return changed, nil
@@ -258,7 +262,7 @@ func (s *Service) findSyncTokenConflictTx(ctx context.Context, tx *sql.Tx, accou
 func (s *Service) deactivateTokenFile(ctx context.Context, fileName string) (bool, error) {
 	affected, err := runWithDatabaseBusyRetry(ctx, func() (int64, error) {
 		now := time.Now().Unix()
-		result, err := s.store.DB().ExecContext(ctx, `
+		result, err := execWriteContext(ctx, s.store.DB(), `
 			UPDATE tokens
 			SET is_active = 0,
 			    is_available = 0,
@@ -282,7 +286,6 @@ func (s *Service) deactivateTokenFile(ctx context.Context, fileName string) (boo
 		s.invalidateInventoryCache()
 		s.invalidateDashboardUploadCaches()
 		s.invalidateAdminCache()
-		s.notifyQueueUsers(ctx)
 	}
 	return affected > 0, nil
 }
@@ -314,7 +317,7 @@ func (s *Service) deactivateMissingTokenFiles(ctx context.Context, existingNames
 	}
 
 	affected, err := runWithDatabaseBusyRetry(ctx, func() (int64, error) {
-		result, err := s.store.DB().ExecContext(ctx, query, args...)
+		result, err := execWriteContext(ctx, s.store.DB(), query, args...)
 		if err != nil {
 			return 0, fmt.Errorf("deactivate missing token files: %w", err)
 		}
@@ -420,8 +423,8 @@ func (s *Service) listQueuedUserIDs(ctx context.Context) ([]int64, error) {
 	rows, err := s.store.DB().QueryContext(ctx, `
 		SELECT DISTINCT user_id
 		FROM claim_queue
-		WHERE status = 'queued' AND remaining > 0
-		ORDER BY queue_rank ASC, id ASC
+		WHERE status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+		ORDER BY enqueued_at_ts ASC, id ASC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list queued user ids: %w", err)

@@ -2,6 +2,7 @@ package claim
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"sort"
@@ -12,13 +13,15 @@ import (
 )
 
 const (
-	claimStatusProcessing = "processing"
-	claimStatusQueued     = "queued"
-	claimStatusSucceeded  = "succeeded"
-	claimStatusPartial    = "partial"
-	claimStatusFailed     = "failed"
-	claimStatusCancelled  = "cancelled"
-	claimStatusExpired    = "expired"
+	claimStatusProcessing    = "processing"
+	claimStatusQueued        = "queued"
+	claimStatusQueuedWaiting = "queued_waiting"
+	claimStatusQueuedBlocked = "queued_blocked"
+	claimStatusSucceeded     = "succeeded"
+	claimStatusPartial       = "partial"
+	claimStatusFailed        = "failed"
+	claimStatusCancelled     = "cancelled"
+	claimStatusExpired       = "expired"
 
 	claimSourceSelf         = "self"
 	claimSourceOtherSession = "other_session"
@@ -37,6 +40,9 @@ type claimRequestAccepted struct {
 	QueueID        int64  `json:"queue_id,omitempty"`
 	QueuePosition  int    `json:"queue_position,omitempty"`
 	QueueRemaining int    `json:"queue_remaining,omitempty"`
+	BlockReason    string `json:"block_reason,omitempty"`
+	LastProgressAt string `json:"last_progress_at,omitempty"`
+	NextRetryAt    string `json:"next_retry_at,omitempty"`
 	Requested      int    `json:"requested"`
 	AcceptedAt     string `json:"accepted_at"`
 	Source         string `json:"source"`
@@ -52,6 +58,9 @@ type claimRealtimeRequest struct {
 	QueueID         int64               `json:"queue_id,omitempty"`
 	QueuePosition   int                 `json:"queue_position,omitempty"`
 	QueueTotal      int                 `json:"queue_total,omitempty"`
+	BlockReason     string              `json:"block_reason,omitempty"`
+	LastProgressAt  string              `json:"last_progress_at,omitempty"`
+	NextRetryAt     string              `json:"next_retry_at,omitempty"`
 	Items           []claimResponseItem `json:"items,omitempty"`
 	ReasonCode      string              `json:"reason_code,omitempty"`
 	ReasonMessage   string              `json:"reason_message,omitempty"`
@@ -75,6 +84,15 @@ type claimRealtimeSnapshot struct {
 func isClaimTerminalStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case claimStatusSucceeded, claimStatusPartial, claimStatusFailed, claimStatusCancelled, claimStatusExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func isClaimQueuedStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case claimStatusQueued, claimStatusQueuedWaiting, claimStatusQueuedBlocked:
 		return true
 	default:
 		return false
@@ -145,6 +163,9 @@ func sameClaimRealtimeRequestContent(left claimRealtimeRequest, right claimRealt
 		left.QueueID == right.QueueID &&
 		left.QueuePosition == right.QueuePosition &&
 		left.QueueTotal == right.QueueTotal &&
+		left.BlockReason == right.BlockReason &&
+		left.LastProgressAt == right.LastProgressAt &&
+		left.NextRetryAt == right.NextRetryAt &&
 		left.ReasonCode == right.ReasonCode &&
 		left.ReasonMessage == right.ReasonMessage &&
 		left.SourceKind == right.SourceKind &&
@@ -153,6 +174,52 @@ func sameClaimRealtimeRequestContent(left claimRealtimeRequest, right claimRealt
 		left.EnqueuedAt == right.EnqueuedAt &&
 		left.Terminal == right.Terminal &&
 		reflect.DeepEqual(left.Items, right.Items)
+}
+
+func claimRealtimeStatusPrecedence(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case claimStatusSucceeded, claimStatusPartial, claimStatusFailed, claimStatusCancelled, claimStatusExpired:
+		return 40
+	case claimStatusQueuedBlocked:
+		return 30
+	case claimStatusQueuedWaiting:
+		return 20
+	case claimStatusQueued:
+		return 10
+	default:
+		return 0
+	}
+}
+
+func shouldKeepExistingClaimRealtime(existing claimRealtimeRequest, incoming claimRealtimeRequest) (bool, string) {
+	if existing.Terminal && !incoming.Terminal {
+		return true, "terminal_preserved"
+	}
+	if existing.UpdatedAtTS > 0 && incoming.UpdatedAtTS > 0 && incoming.UpdatedAtTS < existing.UpdatedAtTS {
+		return true, "older_updated_at"
+	}
+	if incoming.Granted < existing.Granted {
+		return true, "granted_regressed"
+	}
+	if incoming.Remaining > existing.Remaining {
+		return true, "remaining_regressed"
+	}
+	if existing.QueuePosition > 0 && incoming.QueuePosition > existing.QueuePosition {
+		return true, "position_regressed"
+	}
+	if incoming.UpdatedAtTS == existing.UpdatedAtTS {
+		if claimRealtimeStatusPrecedence(incoming.Status) < claimRealtimeStatusPrecedence(existing.Status) {
+			return true, "status_regressed"
+		}
+		if incoming.QueueTotal < existing.QueueTotal &&
+			incoming.QueuePosition == existing.QueuePosition &&
+			incoming.Granted == existing.Granted &&
+			incoming.Remaining == existing.Remaining &&
+			incoming.Status == existing.Status {
+			return true, "queue_total_regressed"
+		}
+	}
+	return false, ""
 }
 
 func (s *Service) claimRealtimeTTL() int {
@@ -286,11 +353,17 @@ func (s *Service) upsertClaimRealtimeRequest(ctx context.Context, userID int64, 
 		request.Status = claimStatusProcessing
 	}
 	request.Status = strings.ToLower(strings.TrimSpace(request.Status))
-	request.Queued = request.Status == claimStatusQueued
+	request.Queued = isClaimQueuedStatus(request.Status)
 	request.Terminal = isClaimTerminalStatus(request.Status)
 	request.SourceKind = firstNonEmpty(strings.TrimSpace(request.SourceKind), claimSourceKindUser)
 	if request.Items != nil {
 		request.Items = cloneClaimResponseItems(request.Items)
+	}
+	if request.UpdatedAtTS <= 0 {
+		request.UpdatedAtTS = time.Now().Unix()
+	}
+	if strings.TrimSpace(request.UpdatedAt) == "" {
+		request.UpdatedAt = isoformatFromTS(request.UpdatedAtTS)
 	}
 	snapshot, err := s.getStoredClaimRealtimeSnapshot(ctx, userID)
 	if err != nil {
@@ -304,23 +377,22 @@ func (s *Service) upsertClaimRealtimeRequest(ctx context.Context, userID int64, 
 		if sameClaimRealtimeRequestContent(snapshot.Requests[index], request) {
 			return nil
 		}
-		if request.UpdatedAtTS <= 0 {
-			request.UpdatedAtTS = time.Now().Unix()
-		}
-		if strings.TrimSpace(request.UpdatedAt) == "" {
-			request.UpdatedAt = isoformatFromTS(request.UpdatedAtTS)
+		if keepExisting, reason := shouldKeepExistingClaimRealtime(snapshot.Requests[index], request); keepExisting {
+			s.logger.Info(
+				"drop stale claim realtime update",
+				"user_id", userID,
+				"request_id", request.RequestID,
+				"reason", reason,
+				"existing_updated_at_ts", snapshot.Requests[index].UpdatedAtTS,
+				"incoming_updated_at_ts", request.UpdatedAtTS,
+			)
+			return nil
 		}
 		snapshot.Requests[index] = request
 		replaced = true
 		break
 	}
 	if !replaced {
-		if request.UpdatedAtTS <= 0 {
-			request.UpdatedAtTS = time.Now().Unix()
-		}
-		if strings.TrimSpace(request.UpdatedAt) == "" {
-			request.UpdatedAt = isoformatFromTS(request.UpdatedAtTS)
-		}
 		snapshot.Requests = append(snapshot.Requests, request)
 	}
 	s.setClaimRealtimeSnapshot(userID, snapshot)
@@ -332,8 +404,8 @@ func (s *Service) buildClaimRealtimeAck(result *claimResult) *claimRequestAccept
 		return nil
 	}
 	status := claimStatusProcessing
-	if result.Queued {
-		status = claimStatusQueued
+	if result.Queued && isClaimQueuedStatus(result.QueueStatus) {
+		status = strings.ToLower(strings.TrimSpace(result.QueueStatus))
 	}
 	return &claimRequestAccepted{
 		RequestID:      result.RequestID,
@@ -342,6 +414,9 @@ func (s *Service) buildClaimRealtimeAck(result *claimResult) *claimRequestAccept
 		QueueID:        result.QueueID,
 		QueuePosition:  result.QueuePosition,
 		QueueRemaining: result.QueueRemaining,
+		BlockReason:    strings.TrimSpace(result.BlockReason),
+		LastProgressAt: strings.TrimSpace(result.LastProgressAt),
+		NextRetryAt:    strings.TrimSpace(result.NextRetryAt),
 		Requested:      result.Requested,
 		AcceptedAt:     isoformatNow(),
 		Source:         claimSourceSelf,
@@ -385,7 +460,7 @@ func (s *Service) CreateClaimRequest(ctx context.Context, requestContext *auth.R
 	if requestContext == nil {
 		return nil, fmt.Errorf("request context is required")
 	}
-	result, err := s.ClaimTokens(ctx, requestContext.UserID, apiKeyID, count)
+	result, err := s.claimTokens(ctx, requestContext.UserID, apiKeyID, count, requestContext.SessionID, clientTabID)
 	if err != nil {
 		return nil, err
 	}
@@ -429,20 +504,23 @@ func (s *Service) publishQueuedClaimRequest(ctx context.Context, userID int64, s
 	if result == nil {
 		return nil
 	}
-	queueTotal := result.QueuePosition
-	if queueStatus, err := s.GetQueueStatus(ctx, userID); err == nil && queueStatus.Queued && queueStatus.RequestID == result.RequestID {
-		queueTotal = queueStatus.TotalQueued
+	status := strings.ToLower(strings.TrimSpace(result.QueueStatus))
+	if !isClaimQueuedStatus(status) {
+		status = claimStatusQueuedWaiting
 	}
 	request := claimRealtimeRequest{
 		RequestID:       result.RequestID,
-		Status:          claimStatusQueued,
+		Status:          status,
 		Requested:       result.Requested,
 		Granted:         maxInt(0, result.Requested-result.QueueRemaining),
 		Remaining:       result.QueueRemaining,
 		Queued:          true,
 		QueueID:         result.QueueID,
 		QueuePosition:   result.QueuePosition,
-		QueueTotal:      queueTotal,
+		QueueTotal:      result.QueuePosition,
+		BlockReason:     strings.TrimSpace(result.BlockReason),
+		LastProgressAt:  strings.TrimSpace(result.LastProgressAt),
+		NextRetryAt:     strings.TrimSpace(result.NextRetryAt),
 		SourceKind:      claimSourceKindUser,
 		OriginSessionID: strings.TrimSpace(sessionID),
 		OriginTabID:     strings.TrimSpace(tabID),
@@ -474,6 +552,9 @@ func terminalReasonMessage(status string, reasonCode string) string {
 	trimmed := strings.TrimSpace(reasonCode)
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case claimStatusCancelled:
+		if trimmed == queueCancelReasonStartupReset {
+			return "服务重启，未完成的排队请求已结束。"
+		}
 		if trimmed != "" {
 			return fmt.Sprintf("领取请求已取消：%s", trimmed)
 		}
@@ -493,6 +574,102 @@ func terminalReasonMessage(status string, reasonCode string) string {
 	default:
 		return ""
 	}
+}
+
+func queueEntrySourceKind(entry userQueueEntry) string {
+	switch strings.ToLower(strings.TrimSpace(entry.Status)) {
+	case queueStatusCancelled, queueStatusExpired, queueStatusFailed:
+		return claimSourceKindSystem
+	default:
+		return claimSourceKindUser
+	}
+}
+
+func claimRealtimeStatusFromQueueEntry(entry userQueueEntry) string {
+	granted := maxInt(0, entry.Requested-entry.Remaining)
+	switch strings.ToLower(strings.TrimSpace(entry.Status)) {
+	case queueStatusQueued:
+		return claimStatusQueuedWaiting
+	case queueStatusQueuedWaiting:
+		return claimStatusQueuedWaiting
+	case queueStatusQueuedBlocked:
+		return claimStatusQueuedBlocked
+	case queueStatusSucceeded:
+		return claimStatusSucceeded
+	case queueStatusPartial:
+		return claimStatusPartial
+	case queueStatusFailed:
+		if granted > 0 {
+			return claimStatusPartial
+		}
+		return claimStatusFailed
+	case queueStatusCancelled:
+		if granted > 0 {
+			return claimStatusPartial
+		}
+		return claimStatusCancelled
+	case queueStatusExpired:
+		if granted > 0 {
+			return claimStatusPartial
+		}
+		return claimStatusExpired
+	default:
+		if granted > 0 && entry.Remaining <= 0 {
+			return claimStatusSucceeded
+		}
+		return claimStatusFailed
+	}
+}
+
+func claimRealtimeUpdatedAtTSFromQueueEntry(entry userQueueEntry) int64 {
+	updatedAtTS := entry.EnqueuedAtTS
+	if entry.LastProgressAtTS.Valid && entry.LastProgressAtTS.Int64 > updatedAtTS {
+		updatedAtTS = entry.LastProgressAtTS.Int64
+	}
+	if entry.CancelledAtTS.Valid && entry.CancelledAtTS.Int64 > updatedAtTS {
+		updatedAtTS = entry.CancelledAtTS.Int64
+	}
+	if entry.TerminalAtTS.Valid && entry.TerminalAtTS.Int64 > updatedAtTS {
+		updatedAtTS = entry.TerminalAtTS.Int64
+	}
+	return updatedAtTS
+}
+
+func claimRealtimeRequestFromQueueEntry(entry userQueueEntry, queueTotal int, items []claimResponseItem) claimRealtimeRequest {
+	status := claimRealtimeStatusFromQueueEntry(entry)
+	request := claimRealtimeRequest{
+		RequestID:       entry.RequestID,
+		Status:          status,
+		Requested:       entry.Requested,
+		Granted:         maxInt(0, entry.Requested-entry.Remaining),
+		Remaining:       maxInt(0, entry.Remaining),
+		Queued:          isClaimQueuedStatus(status),
+		QueueID:         entry.ID,
+		BlockReason:     strings.TrimSpace(entry.BlockReason.String),
+		LastProgressAt:  isoformatFromNullableTS(entry.LastProgressAtTS),
+		NextRetryAt:     isoformatFromNullableTS(entry.NextRetryAtTS),
+		Items:           cloneClaimResponseItems(items),
+		ReasonCode:      strings.TrimSpace(entry.CancelReason.String),
+		ReasonMessage:   "",
+		SourceKind:      queueEntrySourceKind(entry),
+		OriginSessionID: strings.TrimSpace(entry.OriginSessionID.String),
+		OriginTabID:     strings.TrimSpace(entry.OriginTabID.String),
+		EnqueuedAt:      isoformatFromTS(entry.EnqueuedAtTS),
+		UpdatedAtTS:     claimRealtimeUpdatedAtTSFromQueueEntry(entry),
+		Terminal:        !isClaimQueuedStatus(status),
+	}
+	if request.Queued {
+		request.QueuePosition = entry.QueueRank
+		request.QueueTotal = queueTotal
+	}
+	if request.UpdatedAtTS <= 0 {
+		request.UpdatedAtTS = time.Now().Unix()
+	}
+	request.UpdatedAt = isoformatFromTS(request.UpdatedAtTS)
+	if request.Terminal {
+		request.ReasonMessage = terminalReasonMessage(request.Status, request.ReasonCode)
+	}
+	return request
 }
 
 func (s *Service) publishTerminalClaimResult(ctx context.Context, userID int64, sessionID string, tabID string, result *claimResult) error {
@@ -527,50 +704,51 @@ func (s *Service) publishQueueCompletion(ctx context.Context, entry userQueueEnt
 	if entry.UserID <= 0 || strings.TrimSpace(entry.RequestID) == "" {
 		return nil
 	}
-	existing, err := s.findClaimRealtimeRequest(ctx, entry.UserID, entry.RequestID)
+	items, err := s.listClaimItemsByRequestID(ctx, entry.UserID, entry.RequestID)
 	if err != nil {
 		return err
+	}
+	nowTS := time.Now().Unix()
+	entry.Status = queueStatusSucceeded
+	entry.Remaining = 0
+	entry.QueueRank = 0
+	entry.BlockReason = sql.NullString{}
+	entry.NextRetryAtTS = sql.NullInt64{}
+	entry.LastProgressAtTS = sql.NullInt64{Int64: nowTS, Valid: true}
+	entry.TerminalAtTS = sql.NullInt64{Int64: nowTS, Valid: true}
+	entry.CancelReason = sql.NullString{}
+	entry.CancelledAtTS = sql.NullInt64{}
+	request := claimRealtimeRequestFromQueueEntry(entry, 0, items)
+	if err := s.upsertClaimRealtimeRequest(ctx, entry.UserID, request); err != nil {
+		return err
+	}
+	s.logClaimRealtimeRequest("queued claim request completed", entry.UserID, request)
+	return nil
+}
+
+func (s *Service) publishQueueProgress(ctx context.Context, entry userQueueEntry, remainingAfter int, queueTotal int) error {
+	if entry.UserID <= 0 || strings.TrimSpace(entry.RequestID) == "" || remainingAfter <= 0 {
+		return nil
 	}
 	items, err := s.listClaimItemsByRequestID(ctx, entry.UserID, entry.RequestID)
 	if err != nil {
 		return err
 	}
-	requested := entry.Requested
-	sourceKind := claimSourceKindUser
-	originSessionID := ""
-	originTabID := ""
-	if existing != nil {
-		if existing.Requested > 0 {
-			requested = existing.Requested
-		}
-		sourceKind = firstNonEmpty(existing.SourceKind, claimSourceKindUser)
-		originSessionID = existing.OriginSessionID
-		originTabID = existing.OriginTabID
-	}
-	status := claimStatusSucceeded
-	if len(items) < requested {
-		status = claimStatusPartial
-	}
-	request := claimRealtimeRequest{
-		RequestID:       entry.RequestID,
-		Status:          status,
-		Requested:       requested,
-		Granted:         len(items),
-		Remaining:       maxInt(0, requested-len(items)),
-		Queued:          false,
-		Items:           cloneClaimResponseItems(items),
-		ReasonMessage:   terminalReasonMessage(status, ""),
-		SourceKind:      sourceKind,
-		OriginSessionID: originSessionID,
-		OriginTabID:     originTabID,
-		UpdatedAtTS:     time.Now().Unix(),
-		UpdatedAt:       isoformatNow(),
-		Terminal:        true,
-	}
+	nowTS := time.Now().Unix()
+	entry.Status = queueStatusQueuedWaiting
+	entry.Remaining = remainingAfter
+	entry.QueueRank = maxInt(1, entry.QueueRank)
+	entry.BlockReason = sql.NullString{}
+	entry.NextRetryAtTS = sql.NullInt64{}
+	entry.LastProgressAtTS = sql.NullInt64{Int64: nowTS, Valid: true}
+	entry.TerminalAtTS = sql.NullInt64{}
+	entry.CancelReason = sql.NullString{}
+	entry.CancelledAtTS = sql.NullInt64{}
+	request := claimRealtimeRequestFromQueueEntry(entry, maxInt(queueTotal, entry.QueueRank), items)
 	if err := s.upsertClaimRealtimeRequest(ctx, entry.UserID, request); err != nil {
 		return err
 	}
-	s.logClaimRealtimeRequest("queued claim request completed", entry.UserID, request)
+	s.logClaimRealtimeRequest("queued claim request progress", entry.UserID, request)
 	return nil
 }
 
@@ -623,51 +801,24 @@ func (s *Service) publishQueueTerminalState(ctx context.Context, entry userQueue
 	if entry.UserID <= 0 || strings.TrimSpace(entry.RequestID) == "" {
 		return nil
 	}
-	existing, err := s.findClaimRealtimeRequest(ctx, entry.UserID, entry.RequestID)
-	if err != nil {
-		return err
-	}
 	items, err := s.listClaimItemsByRequestID(ctx, entry.UserID, entry.RequestID)
 	if err != nil {
 		return err
 	}
-	granted := len(items)
-	requested := entry.Requested
-	if existing != nil && existing.Requested > 0 {
-		requested = existing.Requested
-	}
-	remaining := maxInt(0, requested-granted)
-	finalStatus := strings.ToLower(strings.TrimSpace(status))
-	if (finalStatus == claimStatusCancelled || finalStatus == claimStatusExpired) && granted > 0 {
-		finalStatus = claimStatusPartial
-	}
-
-	request := claimRealtimeRequest{
-		RequestID:       entry.RequestID,
-		Status:          finalStatus,
-		Requested:       requested,
-		Granted:         granted,
-		Remaining:       remaining,
-		Queued:          false,
-		Items:           cloneClaimResponseItems(items),
-		ReasonCode:      strings.TrimSpace(reasonCode),
-		ReasonMessage:   terminalReasonMessage(finalStatus, reasonCode),
-		SourceKind:      claimSourceKindSystem,
-		UpdatedAtTS:     time.Now().Unix(),
-		UpdatedAt:       isoformatNow(),
-		Terminal:        true,
-		OriginSessionID: "",
-		OriginTabID:     "",
-	}
-	if existing != nil {
-		request.SourceKind = firstNonEmpty(existing.SourceKind, claimSourceKindSystem)
-		request.OriginSessionID = existing.OriginSessionID
-		request.OriginTabID = existing.OriginTabID
-	}
+	nowTS := time.Now().Unix()
+	entry.Status = strings.ToLower(strings.TrimSpace(status))
+	entry.QueueRank = 0
+	entry.BlockReason = sql.NullString{}
+	entry.NextRetryAtTS = sql.NullInt64{}
+	entry.CancelReason = sql.NullString{String: strings.TrimSpace(reasonCode), Valid: strings.TrimSpace(reasonCode) != ""}
+	entry.CancelledAtTS = sql.NullInt64{Int64: nowTS, Valid: true}
+	entry.TerminalAtTS = sql.NullInt64{Int64: nowTS, Valid: true}
+	request := claimRealtimeRequestFromQueueEntry(entry, 0, items)
 	if err := s.upsertClaimRealtimeRequest(ctx, entry.UserID, request); err != nil {
 		return err
 	}
 	s.logClaimRealtimeRequest("queued claim request closed", entry.UserID, request)
+	s.publishAdminQueueTerminal(entry, status, reasonCode)
 	return nil
 }
 
@@ -681,7 +832,7 @@ func (s *Service) syncClaimRealtimeQueueStatus(ctx context.Context, userID int64
 	}
 	request := claimRealtimeRequest{
 		RequestID:       status.RequestID,
-		Status:          claimStatusQueued,
+		Status:          firstNonEmpty(strings.ToLower(strings.TrimSpace(status.Status)), claimStatusQueuedWaiting),
 		Requested:       status.Requested,
 		Granted:         maxInt(0, status.Requested-status.Remaining),
 		Remaining:       status.Remaining,
@@ -689,6 +840,9 @@ func (s *Service) syncClaimRealtimeQueueStatus(ctx context.Context, userID int64
 		QueueID:         status.QueueID,
 		QueuePosition:   status.Position,
 		QueueTotal:      status.TotalQueued,
+		BlockReason:     strings.TrimSpace(status.BlockReason),
+		LastProgressAt:  strings.TrimSpace(status.LastProgressAt),
+		NextRetryAt:     strings.TrimSpace(status.NextRetryAt),
 		EnqueuedAt:      status.EnqueuedAt,
 		SourceKind:      claimSourceKindUser,
 		UpdatedAtTS:     time.Now().Unix(),
@@ -708,7 +862,10 @@ func (s *Service) syncClaimRealtimeQueueStatus(ctx context.Context, userID int64
 		existing.QueueID != request.QueueID ||
 		existing.QueuePosition != request.QueuePosition ||
 		existing.QueueTotal != request.QueueTotal ||
-		existing.Remaining != request.Remaining
+		existing.Remaining != request.Remaining ||
+		existing.BlockReason != request.BlockReason ||
+		existing.LastProgressAt != request.LastProgressAt ||
+		existing.NextRetryAt != request.NextRetryAt
 	if err := s.upsertClaimRealtimeRequest(ctx, userID, request); err != nil {
 		return err
 	}
@@ -725,41 +882,16 @@ func (s *Service) rebuildClaimRealtimeSnapshot(ctx context.Context, userID int64
 	}
 
 	requestsByID := make(map[string]claimRealtimeRequest)
-
-	if queueStatus, err := s.loadQueueStatusSnapshot(ctx, userID); err == nil && queueStatus.Queued && strings.TrimSpace(queueStatus.RequestID) != "" {
-		requestsByID[queueStatus.RequestID] = claimRealtimeRequest{
-			RequestID:     queueStatus.RequestID,
-			Status:        claimStatusQueued,
-			Requested:     queueStatus.Requested,
-			Granted:       maxInt(0, queueStatus.Requested-queueStatus.Remaining),
-			Remaining:     queueStatus.Remaining,
-			Queued:        true,
-			QueueID:       queueStatus.QueueID,
-			QueuePosition: queueStatus.Position,
-			QueueTotal:    queueStatus.TotalQueued,
-			EnqueuedAt:    queueStatus.EnqueuedAt,
-			SourceKind:    claimSourceKindUser,
-			UpdatedAtTS:   time.Now().Unix(),
-			UpdatedAt:     isoformatNow(),
-			Terminal:      false,
-		}
-	} else if err != nil {
-		return claimRealtimeSnapshot{}, err
-	}
-
 	claims, err := s.ListClaims(ctx, userID)
 	if err != nil {
 		return claimRealtimeSnapshot{}, err
 	}
+	itemsByRequestID := make(map[string][]claimResponseItem)
 	for _, item := range claims {
 		if strings.TrimSpace(item.RequestID) == "" {
 			continue
 		}
-		request := requestsByID[item.RequestID]
-		request.RequestID = item.RequestID
-		request.Granted++
-		request.SourceKind = firstNonEmpty(request.SourceKind, claimSourceKindUser)
-		request.Items = append(request.Items, claimResponseItem{
+		itemsByRequestID[item.RequestID] = append(itemsByRequestID[item.RequestID], claimResponseItem{
 			ClaimID:     item.ClaimID,
 			TokenID:     item.TokenID,
 			FileName:    item.FileName,
@@ -768,55 +900,57 @@ func (s *Service) rebuildClaimRealtimeSnapshot(ctx context.Context, userID int64
 			Content:     item.Content,
 			DownloadURL: item.DownloadURL,
 		})
-		request.UpdatedAt = item.ClaimedAt
-		request.UpdatedAtTS = maxClaimRealtimeInt64(request.UpdatedAtTS, parseISOUnix(item.ClaimedAt))
-		if request.Status != claimStatusQueued {
-			request.Status = claimStatusSucceeded
-			request.Queued = false
-			request.Terminal = true
-		}
-		requestsByID[item.RequestID] = request
 	}
 
-	terminalRows, err := s.listRecentQueueTerminalEntries(ctx, userID, claimRealtimeMaxRequests)
+	queueTotal, err := s.getTotalQueued(ctx, s.store.DB())
 	if err != nil {
 		return claimRealtimeSnapshot{}, err
 	}
-	for _, row := range terminalRows {
-		request := requestsByID[row.RequestID]
-		if request.RequestID == "" {
-			request.RequestID = row.RequestID
-			request.Requested = row.Requested
-			request.Remaining = row.Remaining
-			request.Granted = maxInt(0, row.Requested-row.Remaining)
-			request.SourceKind = claimSourceKindSystem
-			request.UpdatedAtTS = row.CancelledAtTS.Int64
-			request.UpdatedAt = isoformatFromTS(row.CancelledAtTS.Int64)
-			request.Terminal = true
-			if row.Status == queueStatusExpired {
-				request.Status = claimStatusExpired
-			} else {
-				request.Status = claimStatusCancelled
+
+	requestRows, err := s.listRecentClaimRequestEntries(ctx, userID, claimRealtimeMaxRequests)
+	if err != nil {
+		return claimRealtimeSnapshot{}, err
+	}
+	for _, row := range requestRows {
+		if strings.TrimSpace(row.RequestID) == "" {
+			continue
+		}
+		requestsByID[row.RequestID] = claimRealtimeRequestFromQueueEntry(row, queueTotal, itemsByRequestID[row.RequestID])
+	}
+
+	// Compatibility fallback for legacy rows created before claim_queue became the request ledger.
+	for requestID, items := range itemsByRequestID {
+		if strings.TrimSpace(requestID) == "" {
+			continue
+		}
+		if _, exists := requestsByID[requestID]; exists {
+			continue
+		}
+		request := claimRealtimeRequest{
+			RequestID:     requestID,
+			Status:        claimStatusSucceeded,
+			Requested:     len(items),
+			Granted:       len(items),
+			Remaining:     0,
+			Queued:        false,
+			Items:         cloneClaimResponseItems(items),
+			SourceKind:    claimSourceKindUser,
+			UpdatedAtTS:   0,
+			UpdatedAt:     "",
+			Terminal:      true,
+			ReasonMessage: terminalReasonMessage(claimStatusSucceeded, ""),
+		}
+		for _, claimItem := range claims {
+			if claimItem.RequestID != requestID {
+				continue
 			}
-			request.ReasonCode = strings.TrimSpace(row.CancelReason.String)
-			request.ReasonMessage = terminalReasonMessage(request.Status, request.ReasonCode)
-			requestsByID[row.RequestID] = request
-			continue
+			request.UpdatedAtTS = maxClaimRealtimeInt64(request.UpdatedAtTS, parseISOUnix(claimItem.ClaimedAt))
 		}
-		if request.Terminal {
-			continue
+		if request.UpdatedAtTS <= 0 {
+			request.UpdatedAtTS = time.Now().Unix()
 		}
-		request.Terminal = true
-		if row.Status == queueStatusExpired {
-			request.Status = claimStatusExpired
-		} else {
-			request.Status = claimStatusCancelled
-		}
-		request.ReasonCode = strings.TrimSpace(row.CancelReason.String)
-		request.ReasonMessage = terminalReasonMessage(request.Status, request.ReasonCode)
-		request.UpdatedAtTS = maxClaimRealtimeInt64(request.UpdatedAtTS, row.CancelledAtTS.Int64)
 		request.UpdatedAt = isoformatFromTS(request.UpdatedAtTS)
-		requestsByID[row.RequestID] = request
+		requestsByID[requestID] = request
 	}
 
 	snapshot.Requests = make([]claimRealtimeRequest, 0, len(requestsByID))
@@ -862,17 +996,23 @@ func maxClaimRealtimeInt64(left int64, right int64) int64 {
 	return right
 }
 
-func (s *Service) listRecentQueueTerminalEntries(ctx context.Context, userID int64, limit int) ([]userQueueEntry, error) {
+func (s *Service) listRecentClaimRequestEntries(ctx context.Context, userID int64, limit int) ([]userQueueEntry, error) {
 	rows, err := s.store.DB().QueryContext(ctx, `
 		SELECT id,
 		       user_id,
 		       api_key_id,
 		       requested,
 		       remaining,
-		       queue_rank,
+		       0,
 		       enqueued_at_ts,
 		       request_id,
 		       status,
+		       origin_session_id,
+		       origin_tab_id,
+		       block_reason,
+		       next_retry_at_ts,
+		       last_progress_at_ts,
+		       terminal_at_ts,
 		       cancel_reason,
 		       cancelled_at_ts,
 		       cancelled_by_user_id,
@@ -881,12 +1021,26 @@ func (s *Service) listRecentQueueTerminalEntries(ctx context.Context, userID int
 		       failure_count
 		FROM claim_queue
 		WHERE user_id = ?
-		  AND status IN (?, ?)
-		ORDER BY COALESCE(cancelled_at_ts, enqueued_at_ts) DESC, id DESC
+		  AND (
+		       (status IN (?, ?, ?) AND remaining > 0)
+		       OR status IN (?, ?, ?, ?, ?)
+		  )
+		ORDER BY
+		       CASE WHEN status IN (?, ?, ?) AND remaining > 0 THEN 0 ELSE 1 END ASC,
+		       CASE WHEN status IN (?, ?, ?) AND remaining > 0 THEN enqueued_at_ts ELSE 0 END ASC,
+		       CASE WHEN status IN (?, ?, ?) AND remaining > 0 THEN id ELSE 0 END ASC,
+		       COALESCE(terminal_at_ts, cancelled_at_ts, last_progress_at_ts, enqueued_at_ts) DESC,
+		       id DESC
 		LIMIT ?
-	`, userID, queueStatusCancelled, queueStatusExpired, maxInt(1, limit))
+	`, userID,
+		queueStatusQueued, queueStatusQueuedWaiting, queueStatusQueuedBlocked,
+		queueStatusSucceeded, queueStatusPartial, queueStatusFailed, queueStatusCancelled, queueStatusExpired,
+		queueStatusQueued, queueStatusQueuedWaiting, queueStatusQueuedBlocked,
+		queueStatusQueued, queueStatusQueuedWaiting, queueStatusQueuedBlocked,
+		queueStatusQueued, queueStatusQueuedWaiting, queueStatusQueuedBlocked,
+		maxInt(1, limit+1))
 	if err != nil {
-		return nil, fmt.Errorf("list recent queue terminal entries: %w", err)
+		return nil, fmt.Errorf("list recent claim request entries: %w", err)
 	}
 	defer rows.Close()
 
@@ -903,6 +1057,12 @@ func (s *Service) listRecentQueueTerminalEntries(ctx context.Context, userID int
 			&item.EnqueuedAtTS,
 			&item.RequestID,
 			&item.Status,
+			&item.OriginSessionID,
+			&item.OriginTabID,
+			&item.BlockReason,
+			&item.NextRetryAtTS,
+			&item.LastProgressAtTS,
+			&item.TerminalAtTS,
 			&item.CancelReason,
 			&item.CancelledAtTS,
 			&item.CancelledByUserID,
@@ -910,12 +1070,19 @@ func (s *Service) listRecentQueueTerminalEntries(ctx context.Context, userID int
 			&item.LastErrorAtTS,
 			&item.FailureCount,
 		); err != nil {
-			return nil, fmt.Errorf("scan recent queue terminal entry: %w", err)
+			return nil, fmt.Errorf("scan recent claim request entry: %w", err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate recent queue terminal entries: %w", err)
+		return nil, fmt.Errorf("iterate recent claim request entries: %w", err)
+	}
+	for index := range items {
+		position, err := s.lookupQueuePosition(ctx, s.store.DB(), items[index])
+		if err != nil {
+			return nil, err
+		}
+		items[index].QueueRank = position
 	}
 	return items, nil
 }

@@ -11,6 +11,16 @@ const state = {
   bans: [],
   tokens: [],
   queue: [],
+  queueActivity: [],
+  queueActivityTotal: 0,
+  queueActivityGeneratedAt: "",
+  queueActivityPromise: null,
+  queueActivityStream: null,
+  queueActivityStreamConnected: false,
+  queueActivityStreamError: "",
+  queueActivityStreamRetryCount: 0,
+  queueActivityStreamRetryTimer: null,
+  queueActivityRefreshTimer: null,
   policy: null,
   activeTab: "users",
   queueOnly: "all",
@@ -21,6 +31,9 @@ const state = {
 };
 
 const ADMIN_MONITOR_REFRESH_MS = 10_000;
+const ADMIN_QUEUE_ACTIVITY_LIMIT = 40;
+const ADMIN_QUEUE_STREAM_RETRY_BASE_MS = 1_000;
+const ADMIN_QUEUE_STREAM_RETRY_MAX_MS = 10_000;
 
 const elements = {
   loadingScreen: document.getElementById("admin-loading-screen"),
@@ -77,9 +90,15 @@ const elements = {
   queueShowAll: document.getElementById("admin-queue-show-all"),
   queueShowAbnormal: document.getElementById("admin-queue-show-abnormal"),
   queueShowTimeout: document.getElementById("admin-queue-show-timeout"),
+  queueCancelAll: document.getElementById("admin-queue-cancel-all"),
   queueRefresh: document.getElementById("admin-queue-refresh"),
   queueList: document.getElementById("admin-queue-list"),
   queuePager: document.getElementById("admin-queue-pager"),
+  queueActivityStatus: document.getElementById("admin-queue-activity-status"),
+  queueActivitySummary: document.getElementById("admin-queue-activity-summary"),
+  queueActivityMeta: document.getElementById("admin-queue-activity-meta"),
+  queueActivityList: document.getElementById("admin-queue-activity-list"),
+  queueActivityRefresh: document.getElementById("admin-queue-activity-refresh"),
   policyPanel: document.getElementById("admin-policy-panel"),
   notice: document.getElementById("admin-notice"),
 };
@@ -91,10 +110,13 @@ function showScreen(name) {
   elements.appScreen.classList.toggle("hidden", name !== "app");
   if (name === "app") {
     startAdminMonitor();
+    startAdminQueueRealtime();
+    loadQueueActivity({ silent: true }).catch(() => {});
     refreshTokenMonitoring({ silent: true }).catch(() => {});
     return;
   }
   stopAdminMonitor();
+  stopAdminQueueRealtime();
 }
 
 function setLoginMessage(message = "", tone = "error") {
@@ -187,6 +209,15 @@ function formatDateTime(value) {
   return date.toLocaleString();
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function formatDurationSeconds(value) {
   const total = Math.max(0, Number(value || 0));
   if (!total) {
@@ -276,11 +307,15 @@ async function refreshTokenMonitoring({ resetOffset = false, silent = false } = 
       const tasks = [loadPolicy()];
       const shouldRefreshTokens = state.activeTab === "tokens" || state.tokens.length > 0;
       const shouldRefreshQueue = state.activeTab === "queue" || state.queue.length > 0;
+      const shouldRefreshQueueActivity = state.activeTab === "queue" && !state.queueActivityStreamConnected;
       if (shouldRefreshTokens) {
         tasks.push(loadTokens(resetOffset && state.activeTab === "tokens"));
       }
       if (shouldRefreshQueue) {
         tasks.push(loadQueue(resetOffset && state.activeTab === "queue"));
+      }
+      if (shouldRefreshQueueActivity) {
+        tasks.push(loadQueueActivity({ silent: true }));
       }
       await Promise.all(tasks);
     } catch (error) {
@@ -321,6 +356,10 @@ function switchTab(name) {
   });
   if (name === "tokens" || name === "queue" || name === "policy") {
     refreshTokenMonitoring({ silent: true }).catch(() => {});
+  }
+  if (name === "queue") {
+    startAdminQueueRealtime();
+    loadQueueActivity({ silent: true }).catch(() => {});
   }
 }
 
@@ -593,12 +632,21 @@ function renderQueueOnlyButtons() {
 
 function queueStatusLabel(item) {
   switch (item?.status) {
+    case "queued_waiting":
+      return "等待中";
+    case "queued_blocked":
+      return "阻塞中";
     case "cancelled":
       return "已取消";
     case "expired":
       return "已过期";
+    case "succeeded":
     case "fulfilled":
       return "已完成";
+    case "partial":
+      return "部分完成";
+    case "failed":
+      return "失败";
     case "queued":
       return "排队中";
     default:
@@ -607,19 +655,42 @@ function queueStatusLabel(item) {
 }
 
 function queueBadgeClass(item) {
-  if (item?.status === "expired" || item?.status === "fulfilled") {
-    return "cleaned";
-  }
-  if (item?.status === "cancelled") {
-    return "disabled";
-  }
-  if (item?.status !== "queued") {
-    return "disabled";
-  }
-  if (item?.is_abnormal || item?.is_timeout) {
+  if (item?.status === "queued_blocked") {
     return "active";
   }
-  return "enabled";
+  if (item?.status === "queued" || item?.status === "queued_waiting") {
+    return item?.is_abnormal || item?.is_timeout ? "active" : "enabled";
+  }
+  if (item?.status === "expired" || item?.status === "fulfilled" || item?.status === "succeeded" || item?.status === "partial") {
+    return "cleaned";
+  }
+  if (item?.status === "cancelled" || item?.status === "failed") {
+    return "disabled";
+  }
+  return "disabled";
+}
+
+function describeQueueBlockReason(reason) {
+  switch (String(reason || "").trim()) {
+    case "hourly_quota_exhausted":
+      return "用户小时额度已耗尽";
+    case "api_key_rate_limited":
+      return "API Key 分钟限流";
+    case "inventory_unavailable":
+      return "当前没有可领库存";
+    case "probe_locks_pending":
+      return "候选账号仍在探活锁定中";
+    case "no_eligible_tokens":
+      return "当前没有符合该用户条件的账号";
+    case "allocation_stalled":
+      return "本轮未成功分配到账号";
+    default:
+      return reason || "-";
+  }
+}
+
+function isActiveQueueStatus(status) {
+  return ["queued", "queued_waiting", "queued_blocked"].includes(String(status || "").trim().toLowerCase());
 }
 
 function summarizeQueueRefresh(result) {
@@ -656,7 +727,7 @@ async function cancelQueueEntryItem(item, button) {
       body: JSON.stringify({ reason }),
     });
     showNotice(`已取消队列 #${item.queue_id}`);
-    await Promise.all([loadQueue(), loadPolicy()]);
+    await Promise.all([loadQueue(), loadPolicy(), loadQueueActivity({ silent: true })]);
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
@@ -681,12 +752,299 @@ async function cancelUserQueueItems(item, button) {
       body: JSON.stringify({ reason }),
     });
     showNotice(`已取消用户 ${item.user_id} 的 ${result.cancelled || 0} 条排队`);
-    await Promise.all([loadQueue(), loadPolicy()]);
+    await Promise.all([loadQueue(), loadPolicy(), loadQueueActivity({ silent: true })]);
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
     restoreButton?.();
   }
+}
+
+async function cancelAllQueueItems(button) {
+  const reason = await promptQueueCancelReason("全部当前排队");
+  if (!reason) {
+    return;
+  }
+  if (!window.confirm("确认取消全部当前排队吗？")) {
+    return;
+  }
+  const restoreButton = setButtonPending(button, "取消中...");
+  showNotice("正在取消全部当前排队...");
+  try {
+    const result = await fetchJson("/admin/queue/cancel-all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+    showNotice(`已取消 ${result.cancelled || 0} 条排队`);
+    await Promise.all([loadQueue(), loadPolicy(), loadQueueActivity({ silent: true })]);
+  } catch (error) {
+    showNotice(error.message, "error");
+  } finally {
+    restoreButton?.();
+  }
+}
+
+function applyQueueActivityPayload(payload) {
+  state.queueActivity = Array.isArray(payload?.items) ? payload.items : [];
+  state.queueActivityTotal = Number(payload?.total || state.queueActivity.length || 0);
+  state.queueActivityGeneratedAt = payload?.generated_at || "";
+  renderQueueActivity();
+}
+
+function queueActivityStageLabel(stage) {
+  switch (String(stage || "").trim()) {
+    case "queue_enqueued":
+      return "已入队";
+    case "processing_started":
+      return "处理中";
+    case "retry_pending":
+      return "等重试";
+    case "queue_blocked":
+      return "阻塞";
+    case "probe_started":
+      return "验活";
+    case "queue_progress":
+      return "进度";
+    case "queue_completed":
+      return "完成";
+    case "queue_failure":
+      return "失败";
+    case "queue_terminal":
+      return "结束";
+    default:
+      return "事件";
+  }
+}
+
+function queueActivityToneClass(kind) {
+  switch (String(kind || "").trim()) {
+    case "success":
+      return "success";
+    case "warn":
+      return "warn";
+    case "error":
+      return "error";
+    default:
+      return "info";
+  }
+}
+
+function renderQueueActivity() {
+  if (!elements.queueActivityList) {
+    return;
+  }
+
+  let statusLabel = "连接中";
+  let statusClass = "inactive";
+  let summary = "正在等待服务器活动流连接。";
+  if (typeof EventSource === "undefined") {
+    statusLabel = "轮询";
+    statusClass = "disabled";
+    summary = "当前浏览器不支持实时连接，页面将退化为轮询刷新。";
+  } else if (state.queueActivityStreamConnected) {
+    statusLabel = "实时中";
+    statusClass = "enabled";
+    summary = "服务器活动流已连接，队列状态会自动推送。";
+  } else if (state.queueActivityStreamError) {
+    statusLabel = "重连中";
+    statusClass = "active";
+    summary = state.queueActivityStreamError;
+  }
+
+  if (elements.queueActivityStatus) {
+    elements.queueActivityStatus.textContent = statusLabel;
+    elements.queueActivityStatus.className = `admin-badge ${statusClass}`;
+  }
+  if (elements.queueActivitySummary) {
+    elements.queueActivitySummary.textContent = summary;
+  }
+  if (elements.queueActivityMeta) {
+    const snapshotText = state.queueActivityGeneratedAt ? formatDateTime(state.queueActivityGeneratedAt) : "-";
+    elements.queueActivityMeta.textContent = `最近快照：${snapshotText} · 已显示 ${state.queueActivity.length} / ${Math.max(state.queueActivityTotal, state.queueActivity.length)} 条`;
+  }
+
+  if (!state.queueActivity.length) {
+    elements.queueActivityList.innerHTML = '<div class="admin-activity-empty">暂无队列活动，服务器一有新的排队动作就会出现在这里。</div>';
+    return;
+  }
+
+  elements.queueActivityList.innerHTML = state.queueActivity
+    .map((item) => {
+      const stageLabel = queueActivityStageLabel(item?.stage);
+      const toneClass = queueActivityToneClass(item?.kind);
+      const meta = [];
+      if (item?.queue_id) {
+        meta.push(`队列 #${item.queue_id}`);
+      }
+      if (item?.user_id) {
+        meta.push(`用户 ${item.user_id}`);
+      }
+      if (item?.remaining) {
+        meta.push(`剩余 ${item.remaining}`);
+      }
+      if (item?.granted) {
+        meta.push(`本轮 ${item.granted}`);
+      }
+      if (item?.status) {
+        meta.push(`状态 ${item.status}`);
+      }
+      if (item?.block_reason) {
+        meta.push(`原因 ${item.block_reason}`);
+      }
+      if (item?.next_retry_at) {
+        meta.push(`重试 ${formatDateTime(item.next_retry_at)}`);
+      }
+      if (item?.request_id) {
+        meta.push(`请求 ${item.request_id}`);
+      }
+      return `
+        <div class="admin-activity-item">
+          <div class="admin-activity-top">
+            <span class="admin-activity-pill ${toneClass}">${escapeHtml(stageLabel)}</span>
+            <span class="admin-activity-time mono">${escapeHtml(formatDateTime(item?.created_at))}</span>
+          </div>
+          <div class="admin-activity-message">${escapeHtml(item?.message || stageLabel)}</div>
+          ${item?.detail ? `<div class="admin-activity-detail">${escapeHtml(item.detail)}</div>` : ""}
+          <div class="admin-activity-meta mono">${escapeHtml(meta.join(" · ") || "系统事件")}</div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+async function loadQueueActivity({ silent = false } = {}) {
+  if (state.queueActivityPromise) {
+    return state.queueActivityPromise;
+  }
+  state.queueActivityPromise = (async () => {
+    const payload = await fetchJson(`/admin/queue/activity?limit=${ADMIN_QUEUE_ACTIVITY_LIMIT}`);
+    applyQueueActivityPayload(payload || {});
+  })();
+
+  try {
+    await state.queueActivityPromise;
+  } catch (error) {
+    if (!handleAdminAuthError(error)) {
+      state.queueActivityStreamError = error.message || "拉取队列活动失败。";
+      renderQueueActivity();
+      if (!silent) {
+        showNotice(error.message, "error");
+      }
+      throw error;
+    }
+  } finally {
+    state.queueActivityPromise = null;
+  }
+}
+
+function clearAdminQueueStreamRetry() {
+  if (state.queueActivityStreamRetryTimer) {
+    window.clearTimeout(state.queueActivityStreamRetryTimer);
+    state.queueActivityStreamRetryTimer = null;
+  }
+}
+
+function closeAdminQueueStream() {
+  if (state.queueActivityStream) {
+    state.queueActivityStream.close();
+    state.queueActivityStream = null;
+  }
+}
+
+function scheduleAdminQueueRealtimeRefresh() {
+  if (state.queueActivityRefreshTimer) {
+    return;
+  }
+  state.queueActivityRefreshTimer = window.setTimeout(() => {
+    state.queueActivityRefreshTimer = null;
+    refreshTokenMonitoring({ silent: true }).catch(() => {});
+  }, 250);
+}
+
+function stopAdminQueueRealtime() {
+  clearAdminQueueStreamRetry();
+  closeAdminQueueStream();
+  if (state.queueActivityRefreshTimer) {
+    window.clearTimeout(state.queueActivityRefreshTimer);
+    state.queueActivityRefreshTimer = null;
+  }
+  state.queueActivityStreamConnected = false;
+  state.queueActivityStreamRetryCount = 0;
+  state.queueActivityStreamError = "";
+  renderQueueActivity();
+}
+
+function scheduleAdminQueueStreamReconnect() {
+  clearAdminQueueStreamRetry();
+  if (elements.appScreen.classList.contains("hidden")) {
+    return;
+  }
+  const delay = Math.min(
+    ADMIN_QUEUE_STREAM_RETRY_MAX_MS,
+    ADMIN_QUEUE_STREAM_RETRY_BASE_MS * (2 ** Math.max(0, state.queueActivityStreamRetryCount))
+  );
+  state.queueActivityStreamRetryTimer = window.setTimeout(() => {
+    state.queueActivityStreamRetryTimer = null;
+    startAdminQueueRealtime();
+  }, delay);
+}
+
+function startAdminQueueRealtime() {
+  if (elements.appScreen.classList.contains("hidden")) {
+    return;
+  }
+  if (typeof EventSource === "undefined") {
+    state.queueActivityStreamConnected = false;
+    state.queueActivityStreamError = "";
+    renderQueueActivity();
+    return;
+  }
+  if (state.queueActivityStream) {
+    return;
+  }
+
+  const stream = new EventSource(`/admin/queue/stream?limit=${ADMIN_QUEUE_ACTIVITY_LIMIT}`);
+  state.queueActivityStream = stream;
+  renderQueueActivity();
+
+  stream.addEventListener("stream_status", () => {
+    if (state.queueActivityStream !== stream) {
+      return;
+    }
+    state.queueActivityStreamConnected = true;
+    state.queueActivityStreamError = "";
+    state.queueActivityStreamRetryCount = 0;
+    renderQueueActivity();
+  });
+
+  stream.addEventListener("admin_queue_activity", (event) => {
+    if (state.queueActivityStream !== stream) {
+      return;
+    }
+    try {
+      const payload = JSON.parse(event.data || "{}");
+      state.queueActivityStreamConnected = true;
+      state.queueActivityStreamError = "";
+      state.queueActivityStreamRetryCount = 0;
+      applyQueueActivityPayload(payload || {});
+      scheduleAdminQueueRealtimeRefresh();
+    } catch (error) {
+      console.error("解析后台队列活动失败", error);
+    }
+  });
+
+  stream.onerror = () => {
+    if (state.queueActivityStream !== stream) {
+      return;
+    }
+    closeAdminQueueStream();
+    state.queueActivityStreamConnected = false;
+    state.queueActivityStreamRetryCount += 1;
+    state.queueActivityStreamError = "后台实时连接中断，正在重连...";
+    renderQueueActivity();
+    scheduleAdminQueueStreamReconnect();
+  };
 }
 
 function renderQueue() {
@@ -703,6 +1061,9 @@ function renderQueue() {
       const userLabel = item.username ? `@${item.username}` : `用户 ${item.user_id}`;
       const queuePosition = item.queue_position ?? "-";
       const apiKeyText = item.api_key_id ?? "-";
+      const blockReasonText = item.block_reason ? describeQueueBlockReason(item.block_reason) : "-";
+      const lastProgressText = item.last_progress_at ? formatDateTime(item.last_progress_at) : "-";
+      const nextRetryText = item.next_retry_at ? formatDateTime(item.next_retry_at) : "-";
       const errorMeta = item.last_error_reason
         ? `<div class="admin-note queue-card-reason">最近错误：${item.last_error_reason}${item.last_error_at ? ` · ${formatDateTime(item.last_error_at)}` : ""} · 连续失败 ${item.failure_count || 0} 次</div>`
         : "";
@@ -711,7 +1072,7 @@ function renderQueue() {
         : "";
       const timeoutBadge = item.is_timeout ? '<span class="admin-badge active">超时</span>' : "";
       const abnormalBadge = item.is_abnormal ? '<span class="admin-badge active">异常</span>' : "";
-      const actionHtml = item.status === "queued"
+      const actionHtml = isActiveQueueStatus(item.status)
         ? `
           <button class="btn btn-outline btn-inline" data-queue-cancel="${item.queue_id}">取消本条</button>
           <button class="btn btn-outline btn-inline" data-queue-cancel-user="${item.user_id}">取消该用户全部排队</button>
@@ -735,12 +1096,28 @@ function renderQueue() {
             <div class="queue-card-value">${item.requested} / ${item.remaining}</div>
           </div>
           <div class="queue-card-block">
+            <div class="queue-card-label">当前状态</div>
+            <div class="queue-card-value">${statusLabel}</div>
+          </div>
+          <div class="queue-card-block">
             <div class="queue-card-label">排队位置</div>
             <div class="queue-card-value">${queuePosition}</div>
           </div>
           <div class="queue-card-block">
             <div class="queue-card-label">等待时长</div>
             <div class="queue-card-value">${waitText}</div>
+          </div>
+          <div class="queue-card-block">
+            <div class="queue-card-label">阻塞原因</div>
+            <div class="queue-card-value">${blockReasonText}</div>
+          </div>
+          <div class="queue-card-block">
+            <div class="queue-card-label">最近推进</div>
+            <div class="queue-card-value">${lastProgressText}</div>
+          </div>
+          <div class="queue-card-block">
+            <div class="queue-card-label">下次重试</div>
+            <div class="queue-card-value">${nextRetryText}</div>
           </div>
           <div class="queue-card-block">
             <div class="queue-card-label">请求 ID</div>
@@ -921,7 +1298,7 @@ async function runQueueRefresh() {
   try {
     const result = await fetchJson("/admin/queue/refresh", { method: "POST" });
     showNotice(summarizeQueueRefresh(result));
-    await Promise.all([loadQueue(), loadPolicy()]);
+    await Promise.all([loadQueue(), loadPolicy(), loadQueueActivity({ silent: true })]);
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
@@ -1044,8 +1421,14 @@ function bindEvents() {
   elements.tokenRefresh?.addEventListener("click", () => {
     refreshTokenMonitoring({ resetOffset: true }).catch(() => {});
   });
+  elements.queueCancelAll?.addEventListener("click", () => {
+    cancelAllQueueItems(elements.queueCancelAll).catch(() => {});
+  });
   elements.queueRefresh?.addEventListener("click", () => {
     runQueueRefresh().catch(() => {});
+  });
+  elements.queueActivityRefresh?.addEventListener("click", () => {
+    loadQueueActivity().catch(() => {});
   });
   elements.tokenCleanupFiles?.addEventListener("click", () => cleanupExhaustedTokens("files_only"));
   elements.tokenCleanupDb?.addEventListener("click", () => cleanupExhaustedTokens("files_and_db"));
@@ -1075,6 +1458,10 @@ function bindEvents() {
   elements.queueLimit?.addEventListener("change", () => loadQueue(true));
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && !elements.appScreen.classList.contains("hidden")) {
+      startAdminQueueRealtime();
+      if (!state.queueActivityStreamConnected) {
+        loadQueueActivity({ silent: true }).catch(() => {});
+      }
       refreshTokenMonitoring({ silent: true }).catch(() => {});
     }
   });
@@ -1134,6 +1521,7 @@ async function bootstrapAdminShell() {
 async function init() {
   bindEvents();
   renderQueueOnlyButtons();
+  renderQueueActivity();
   const url = new URL(window.location.href);
   state.authErrorParam = url.searchParams.get("auth_error") || "";
   await bootstrapAdminShell();

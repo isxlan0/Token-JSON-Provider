@@ -312,7 +312,7 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 			RecordEvent: true,
 		}))
 
-		probeResult := s.probe.Submit(tokenContent, s.cfg.Probe.TimeoutSec+s.cfg.Probe.DelaySec+5.0)
+		probeResult := s.activeUploadProbe().Submit(tokenContent, s.cfg.Probe.TimeoutSec+s.cfg.Probe.DelaySec+5.0)
 		switch {
 		case probeResult.IsBanned():
 			resultItem = buildUploadStatePatch(uploadStateSpec{
@@ -456,7 +456,7 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 						s.invalidateDashboardUploadCaches()
 						s.invalidateAdminCache()
 						s.invalidateInventoryCache()
-						s.notifyQueueUsers(ctx, task.UserID)
+						s.scheduleQueueNotifications(task.UserID)
 						s.invalidateUserUploadResultsCache(task.UserID)
 					}
 					if cleanupErr := s.cleanupUploadedTokenTempFile(tempPath); cleanupErr != nil {
@@ -488,7 +488,7 @@ func (s *Service) processUploadTask(ctx context.Context, task uploadTask) {
 				s.invalidateDashboardUploadCaches()
 				s.invalidateAdminCache()
 				s.invalidateInventoryCache()
-				s.notifyQueueUsers(ctx, task.UserID)
+				s.scheduleQueueNotifications(task.UserID)
 				s.wakeQueuePump()
 				s.invalidateUserUploadResultsCache(task.UserID)
 			}

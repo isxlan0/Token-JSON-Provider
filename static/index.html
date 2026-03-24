@@ -98,7 +98,7 @@
   <link rel="modulepreload" href="/assets/app/leader-sync.js?v=20260322f">
   <link rel="modulepreload" href="/assets/app/summary-sync.js?v=20260323i">
   <link rel="stylesheet" href="/assets/styles.css?v=20260322q">
-  <script type="module" src="/assets/app.js?v=20260323e"></script>
+  <script type="module" src="/assets/app.js?v=20260324d"></script>
 </head>
 
 <body class="light-theme">
@@ -463,7 +463,7 @@
 
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge post">POST</span> /me/claim</div>
-              <p>使用会话 Cookie 领取账号，例如 <code>{"count": 2}</code>。</p>
+              <p>使用会话 Cookie 创建领取请求并立即返回 <code>request_id</code>，例如 <code>{"count": 2}</code>。</p>
               <pre class="token-json">curl -X POST ${TOKEN_PROVIDER_BASE_URL}/me/claim \
 \
   -H "Content-Type: application/json" \
@@ -483,12 +483,19 @@
 
             <div class="endpoint-block">
               <div class="endpoint-title"><span class="method-badge post">POST</span> /api/claim</div>
-              <p>使用 <code>X-API-Key</code> 领取账号，例如 <code>{"count": 2}</code>。</p>
+              <p>使用 <code>X-API-Key</code> 创建领取请求并立即返回 <code>request_id</code>，例如 <code>{"count": 2}</code>。</p>
               <pre class="token-json">curl -X POST ${TOKEN_PROVIDER_BASE_URL}/api/claim \
 \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-api-key" \
   -d "{\"count\": 2}"</pre>
+            </div>
+
+            <div class="endpoint-block">
+              <div class="endpoint-title"><span class="method-badge">GET</span> /api/claims/{request_id}</div>
+              <p>查询领取请求状态；完成后会返回 <code>items</code> 和每个结果的 <code>download_url</code>。</p>
+              <pre class="token-json">curl ${TOKEN_PROVIDER_BASE_URL}/api/claims/YOUR_REQUEST_ID \
+  -H "X-API-Key: your-api-key"</pre>
             </div>
 
             <div class="endpoint-block">

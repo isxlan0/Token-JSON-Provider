@@ -107,7 +107,7 @@ func (s *Service) recordProbeStatus(ctx context.Context, tokenID int64, statusTe
 	if clearLock {
 		clearValue = 1
 	}
-	if _, err := s.store.DB().ExecContext(ctx, `
+	if _, err := execWriteContext(ctx, s.store.DB(), `
 		UPDATE tokens
 		SET last_probe_at_ts = ?,
 		    last_probe_status = ?,
@@ -163,7 +163,7 @@ func (s *Service) markTokenBanned(ctx context.Context, tokenID int64, reason str
 	s.invalidateInventoryCache()
 	s.invalidateDashboardInventoryCache()
 	s.invalidateAdminCache()
-	s.notifyQueueUsers(ctx)
+	s.wakeQueuePump()
 	return nil
 }
 

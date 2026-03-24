@@ -165,6 +165,12 @@ func TestInitMigratesLegacySchemaAndBackfillsDerivedData(t *testing.T) {
 	queueColumns := tableColumnSet(t, store.DB(), "claim_queue")
 	for _, columnName := range []string{
 		"queue_rank",
+		"origin_session_id",
+		"origin_tab_id",
+		"block_reason",
+		"next_retry_at_ts",
+		"last_progress_at_ts",
+		"terminal_at_ts",
 		"cancel_reason",
 		"cancelled_at_ts",
 		"cancelled_by_user_id",

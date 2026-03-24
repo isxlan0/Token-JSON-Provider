@@ -2,11 +2,13 @@ package claim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +184,97 @@ func TestMapDatabaseBusyErrorReturnsRetryAfterHeader(t *testing.T) {
 	}
 	if httpErr.Message != "数据库正忙，请稍后重试。" {
 		t.Fatalf("unexpected db busy message: %#v", httpErr.Message)
+	}
+}
+
+func TestAPIClaimRoutesUseQueuedRequestLifecycle(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "4401", "api-queue-user")
+	apiKeyID := insertTestAPIKey(t, store, userID, "api-queue-key")
+	insertTestToken(t, store, "api-queued.json", `{"access_token":"api-queued","refresh_token":"api-queued-r","account_id":"acct-api-queued"}`, 0, 1)
+
+	e := echo.New()
+	postRequest := httptest.NewRequest(http.MethodPost, "/api/claim", strings.NewReader(`{"count":1}`))
+	postRequest.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	postRecorder := httptest.NewRecorder()
+	postContext := e.NewContext(postRequest, postRecorder)
+	postContext.Set("auth.api_key_record", &auth.APIKeyRecord{UserID: userID, APIKeyID: apiKeyID})
+
+	if err := service.claimByAPIKey(postContext); err != nil {
+		t.Fatalf("post /api/claim: %v", err)
+	}
+	if postRecorder.Code != http.StatusOK {
+		t.Fatalf("unexpected post status: %d body=%s", postRecorder.Code, postRecorder.Body.String())
+	}
+
+	var accepted claimResult
+	if err := json.Unmarshal(postRecorder.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode queued api claim result: %v", err)
+	}
+	if accepted.RequestID == "" {
+		t.Fatalf("expected request id in queued api response: %+v", accepted)
+	}
+	if !accepted.Queued || accepted.QueueStatus != queueStatusQueuedWaiting {
+		t.Fatalf("expected queued_waiting api ack, got %+v", accepted)
+	}
+	if accepted.Granted != 0 || len(accepted.Items) != 0 {
+		t.Fatalf("api claim ack should not synchronously grant items: %+v", accepted)
+	}
+
+	getQueuedRequest := httptest.NewRequest(http.MethodGet, "/api/claims/"+accepted.RequestID, nil).WithContext(ctx)
+	getQueuedRecorder := httptest.NewRecorder()
+	getQueuedContext := e.NewContext(getQueuedRequest, getQueuedRecorder)
+	getQueuedContext.SetParamNames("request_id")
+	getQueuedContext.SetParamValues(accepted.RequestID)
+	getQueuedContext.Set("auth.api_key_record", &auth.APIKeyRecord{UserID: userID, APIKeyID: apiKeyID})
+
+	if err := service.getClaimRequestByAPIKey(getQueuedContext); err != nil {
+		t.Fatalf("get queued api claim request: %v", err)
+	}
+
+	var queued claimResult
+	if err := json.Unmarshal(getQueuedRecorder.Body.Bytes(), &queued); err != nil {
+		t.Fatalf("decode queued api claim request: %v", err)
+	}
+	if !queued.Queued || queued.QueuePosition != 1 || queued.QueueRemaining != 1 {
+		t.Fatalf("expected active queued request snapshot, got %+v", queued)
+	}
+
+	if err := service.AdvanceQueue(ctx); err != nil {
+		t.Fatalf("advance queue: %v", err)
+	}
+
+	getDoneRequest := httptest.NewRequest(http.MethodGet, "/api/claims/"+accepted.RequestID, nil).WithContext(ctx)
+	getDoneRecorder := httptest.NewRecorder()
+	getDoneContext := e.NewContext(getDoneRequest, getDoneRecorder)
+	getDoneContext.SetParamNames("request_id")
+	getDoneContext.SetParamValues(accepted.RequestID)
+	getDoneContext.Set("auth.api_key_record", &auth.APIKeyRecord{UserID: userID, APIKeyID: apiKeyID})
+
+	if err := service.getClaimRequestByAPIKey(getDoneContext); err != nil {
+		t.Fatalf("get completed api claim request: %v", err)
+	}
+	if getDoneRecorder.Code != http.StatusOK {
+		t.Fatalf("unexpected get status: %d body=%s", getDoneRecorder.Code, getDoneRecorder.Body.String())
+	}
+
+	var completed claimResult
+	if err := json.Unmarshal(getDoneRecorder.Body.Bytes(), &completed); err != nil {
+		t.Fatalf("decode completed api claim request: %v", err)
+	}
+	if completed.Queued {
+		t.Fatalf("completed api request should not remain queued: %+v", completed)
+	}
+	if completed.QueueStatus != queueStatusSucceeded {
+		t.Fatalf("expected succeeded api request status, got %+v", completed)
+	}
+	if completed.Granted != 1 || len(completed.Items) != 1 {
+		t.Fatalf("expected one completed api claim item, got %+v", completed)
+	}
+	if !strings.Contains(completed.Items[0].DownloadURL, "/api/download/") {
+		t.Fatalf("expected download url in completed api request payload, got %+v", completed.Items[0])
 	}
 }
 

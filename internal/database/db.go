@@ -117,6 +117,12 @@ var schemaStatements = []string{
 		enqueued_at_ts INTEGER NOT NULL,
 		request_id TEXT NOT NULL,
 		status TEXT NOT NULL,
+		origin_session_id TEXT,
+		origin_tab_id TEXT,
+		block_reason TEXT,
+		next_retry_at_ts INTEGER,
+		last_progress_at_ts INTEGER,
+		terminal_at_ts INTEGER,
 		cancel_reason TEXT,
 		cancelled_at_ts INTEGER,
 		cancelled_by_user_id INTEGER,
@@ -449,7 +455,7 @@ func ensureQueueColumns(ctx context.Context, tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT id
 			FROM claim_queue
-			WHERE status = 'queued' AND remaining > 0
+			WHERE status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
 			ORDER BY enqueued_at_ts ASC, id ASC
 		`)
 		if err != nil {
@@ -481,6 +487,12 @@ func ensureQueueColumns(ctx context.Context, tx *sql.Tx) error {
 		name       string
 		definition string
 	}{
+		{name: "origin_session_id", definition: "TEXT"},
+		{name: "origin_tab_id", definition: "TEXT"},
+		{name: "block_reason", definition: "TEXT"},
+		{name: "next_retry_at_ts", definition: "INTEGER"},
+		{name: "last_progress_at_ts", definition: "INTEGER"},
+		{name: "terminal_at_ts", definition: "INTEGER"},
 		{name: "cancel_reason", definition: "TEXT"},
 		{name: "cancelled_at_ts", definition: "INTEGER"},
 		{name: "cancelled_by_user_id", definition: "INTEGER"},
@@ -630,7 +642,7 @@ func refreshQueueRuntime(ctx context.Context, tx *sql.Tx) error {
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM claim_queue
-		WHERE status = 'queued' AND remaining > 0
+		WHERE status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
 	`).Scan(&totalQueued); err != nil {
 		return fmt.Errorf("count queued rows: %w", err)
 	}

@@ -589,7 +589,6 @@ func (s *Service) SetTokenEnabled(ctx context.Context, tokenID int64, enabled bo
 		s.invalidateInventoryCache()
 		s.invalidateDashboardInventoryCache()
 		s.invalidateAdminCache()
-		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
 	return item, nil
@@ -688,7 +687,6 @@ func (s *Service) CleanupExhaustedTokens(ctx context.Context, mode string) (map[
 		s.invalidateInventoryCache()
 		s.invalidateDashboardInventoryCache()
 		s.invalidateAdminCache()
-		s.notifyQueueUsers(ctx)
 		s.wakeQueuePump()
 	}
 	return result, nil

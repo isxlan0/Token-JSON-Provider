@@ -22,6 +22,7 @@ const (
 	dataSourceLive        = "live"
 	dataSourceCache       = "cache"
 	dataSourceStale       = "stale"
+	dataSourceDeferred    = "deferred"
 	dataSourceUnavailable = "unavailable"
 
 	degradedReasonReadTimeout       = "read_timeout"
@@ -439,7 +440,11 @@ func withQueueStatusMetadata(payload queueStatusPayload, dataSource string, gene
 	payload.DegradedReason = degradedReason
 	payload.Degraded = degraded
 	if payload.ClaimableNow == nil && strings.TrimSpace(payload.ClaimableNowState) == "" {
-		payload.ClaimableNowState = dataSourceUnavailable
+		if strings.EqualFold(strings.TrimSpace(dataSource), dataSourceUnavailable) {
+			payload.ClaimableNowState = dataSourceUnavailable
+		} else {
+			payload.ClaimableNowState = dataSourceDeferred
+		}
 	}
 	return payload
 }

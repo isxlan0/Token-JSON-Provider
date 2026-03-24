@@ -43,6 +43,7 @@ func (s *Service) RegisterRoutes(e *echo.Echo) {
 	me.POST("/claim", s.claimBySession)
 
 	e.POST("/api/claim", s.claimByAPIKey, s.auth.RequireAPIKeyMiddleware)
+	e.GET("/api/claims/:request_id", s.getClaimRequestByAPIKey, s.auth.RequireAPIKeyMiddleware)
 	e.GET("/api/download/:token_id", s.downloadClaimedToken)
 
 	dashboard := e.Group("/dashboard", s.auth.RequireUserMiddleware)
@@ -66,7 +67,10 @@ func (s *Service) RegisterRoutes(e *echo.Echo) {
 	admin.POST("/tokens/:token_id/deactivate", s.adminDeactivateToken)
 	admin.POST("/tokens/cleanup-exhausted", s.adminCleanupExhaustedTokens)
 	admin.GET("/queue", s.adminListQueue)
+	admin.GET("/queue/activity", s.adminGetQueueActivity)
+	admin.GET("/queue/stream", s.adminGetQueueStream)
 	admin.POST("/queue/refresh", s.adminRefreshQueue)
+	admin.POST("/queue/cancel-all", s.adminCancelAllQueue)
 	admin.POST("/queue/:queue_id/cancel", s.adminCancelQueueEntry)
 	admin.POST("/queue/users/:user_id/cancel", s.adminCancelUserQueue)
 	admin.GET("/policy", s.adminGetPolicy)
@@ -362,7 +366,7 @@ func (s *Service) claimResultFromPayload(c echo.Context, userID int64, apiKeyID 
 		return nil, echo.NewHTTPError(http.StatusBadRequest, "count must be greater than or equal to 1")
 	}
 
-	result, err := s.ClaimTokens(c.Request().Context(), userID, apiKeyID, payload.Count)
+	result, err := s.createQueuedClaimRequest(c.Request().Context(), userID, apiKeyID, payload.Count, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -371,6 +375,31 @@ func (s *Service) claimResultFromPayload(c echo.Context, userID int64, apiKeyID 
 		result.Items[index].DownloadURL = s.buildDownloadURL(c, result.Items[index].TokenID)
 	}
 	return result, nil
+}
+
+func (s *Service) getClaimRequestByAPIKey(c echo.Context) error {
+	record, ok := auth.APIKeyRecordFromEcho(c)
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnauthorized, "Invalid API key.")
+	}
+
+	requestID := strings.TrimSpace(c.Param("request_id"))
+	if requestID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "request_id is required")
+	}
+
+	result, err := s.GetClaimRequest(c.Request().Context(), record.UserID, requestID)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return echo.NewHTTPError(http.StatusNotFound, "claim request not found")
+	}
+
+	for index := range result.Items {
+		result.Items[index].DownloadURL = s.buildDownloadURL(c, result.Items[index].TokenID)
+	}
+	return c.JSON(http.StatusOK, result)
 }
 
 func (s *Service) getDashboardSummary(c echo.Context) error {

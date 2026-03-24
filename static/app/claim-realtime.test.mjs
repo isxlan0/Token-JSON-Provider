@@ -12,8 +12,8 @@ test("direct success only emits one terminal toast", () => {
   const initial = createInitialClaimRealtimeState();
   const accepted = applyClaimAcceptedState(initial, {
     request_id: "req-direct",
-    status: "processing",
-    queued: false,
+    status: "queued_waiting",
+    queued: true,
     requested: 1,
   }, { tabId: "tab-a" });
 
@@ -65,7 +65,7 @@ test("direct success only emits one terminal toast", () => {
 test("queued request keeps queue status then completes", () => {
   const initial = applyClaimAcceptedState(createInitialClaimRealtimeState(), {
     request_id: "req-queue",
-    status: "queued",
+    status: "queued_waiting",
     queued: true,
     queue_id: 9,
     queue_position: 2,
@@ -76,7 +76,7 @@ test("queued request keeps queue status then completes", () => {
   let result = applyClaimSnapshotState(initial.state, {
     requests: [{
       request_id: "req-queue",
-      status: "queued",
+      status: "queued_waiting",
       queued: true,
       queue_id: 9,
       queue_position: 1,
@@ -95,16 +95,24 @@ test("queued request keeps queue status then completes", () => {
     emitToasts: true,
   });
 
-  assert.equal(result.activeRequest?.status, "queued");
+  assert.equal(result.activeRequest?.status, "queued_waiting");
   assert.deepEqual(buildQueueStatusFromRequest(result.queueRequest), {
     queued: true,
+    status: "queued_waiting",
     queue_id: 9,
     position: 1,
     total_queued: 4,
     requested: 3,
     remaining: 2,
     request_id: "req-queue",
+    block_reason: "",
+    last_progress_at: "",
+    next_retry_at: "",
+    front_blocked: false,
+    front_block_reason: "",
+    front_next_retry_at: "",
   });
+  assert.equal(result.effects.filter((effect) => effect.type === "toast").length, 0);
 
   result = applyClaimSnapshotState(result.state, {
     requests: [{
@@ -130,6 +138,36 @@ test("queued request keeps queue status then completes", () => {
     result.effects.filter((effect) => effect.type === "toast").map((effect) => effect.title),
     ["申请成功"]
   );
+});
+
+test("accepted queued request does not fake queue total from queue position", () => {
+  const result = applyClaimAcceptedState(createInitialClaimRealtimeState(), {
+    request_id: "req-accepted",
+    status: "queued_waiting",
+    queued: true,
+    queue_id: 19,
+    queue_position: 3,
+    requested: 1,
+  }, { tabId: "tab-a" });
+
+  assert.equal(result.queueRequest?.queue_position, 3);
+  assert.equal(result.queueRequest?.queue_total, 0);
+  assert.deepEqual(buildQueueStatusFromRequest(result.queueRequest), {
+    queued: true,
+    status: "queued_waiting",
+    queue_id: 19,
+    position: 3,
+    total_queued: 0,
+    requested: 1,
+    remaining: 1,
+    request_id: "req-accepted",
+    block_reason: "",
+    last_progress_at: "",
+    next_retry_at: "",
+    front_blocked: false,
+    front_block_reason: "",
+    front_next_retry_at: "",
+  });
 });
 
 test("other session delivery emits explicit other session toast", () => {
@@ -159,8 +197,8 @@ test("other session delivery emits explicit other session toast", () => {
 test("duplicate tab does not emit self toast for non-origin tab", () => {
   const accepted = applyClaimAcceptedState(createInitialClaimRealtimeState(), {
     request_id: "req-tab",
-    status: "processing",
-    queued: false,
+    status: "queued_waiting",
+    queued: true,
     requested: 1,
   }, { tabId: "tab-origin" });
 
@@ -227,11 +265,67 @@ test("stream reconnect reuses terminal dedupe state", () => {
   assert.equal(afterReconnect.effects.filter((effect) => effect.type === "toast").length, 0);
 });
 
+test("startup reset terminal stays silent", () => {
+  const result = applyClaimSnapshotState(createInitialClaimRealtimeState(), {
+    requests: [{
+      request_id: "req-startup-reset",
+      status: "cancelled",
+      requested: 1,
+      granted: 0,
+      remaining: 1,
+      reason_code: "system_startup_reset",
+      reason_message: "服务重启，未完成的排队请求已结束。",
+      source: "self",
+      origin_tab_id: "tab-reset",
+      terminal: true,
+      updated_at_ts: 90,
+    }],
+  }, {
+    tabId: "tab-reset",
+    activeRequestId: "req-startup-reset",
+    emitToasts: true,
+  });
+
+  assert.equal(result.effects.filter((effect) => effect.type === "toast").length, 0);
+  assert.equal(result.effects.filter((effect) => effect.type === "terminal").length, 1);
+});
+
+test("restored toast keys suppress duplicate terminal toast after refresh", () => {
+  const restored = createInitialClaimRealtimeState({
+    toastKeys: {
+      "req-refresh:cancelled": true,
+    },
+  });
+
+  const result = applyClaimSnapshotState(restored, {
+    requests: [{
+      request_id: "req-refresh",
+      status: "cancelled",
+      requested: 1,
+      granted: 0,
+      remaining: 1,
+      reason_code: "admin:bug，继续排除中",
+      reason_message: "领取请求已取消：admin:bug，继续排除中",
+      source: "self",
+      origin_tab_id: "tab-refresh",
+      terminal: true,
+      updated_at_ts: 91,
+    }],
+  }, {
+    tabId: "tab-refresh",
+    activeRequestId: "req-refresh",
+    emitToasts: true,
+  });
+
+  assert.equal(result.effects.filter((effect) => effect.type === "toast").length, 0);
+  assert.equal(result.effects.filter((effect) => effect.type === "terminal").length, 1);
+});
+
 test("same tab reload restores queued request and still emits one terminal toast", () => {
   const queued = applyClaimSnapshotState(createInitialClaimRealtimeState(), {
     requests: [{
       request_id: "req-reload",
-      status: "queued",
+      status: "queued_waiting",
       queued: true,
       queue_id: 12,
       queue_position: 2,
@@ -251,7 +345,7 @@ test("same tab reload restores queued request and still emits one terminal toast
   });
 
   assert.equal(queued.state.activeRequestId, "req-reload");
-  assert.equal(queued.activeRequest?.status, "queued");
+  assert.equal(queued.activeRequest?.status, "queued_waiting");
 
   const completed = applyClaimSnapshotState(queued.state, {
     requests: [{
@@ -275,4 +369,51 @@ test("same tab reload restores queued request and still emits one terminal toast
     completed.effects.filter((effect) => effect.type === "toast").map((effect) => effect.title),
     ["申请成功"]
   );
+});
+
+test("blocked queued request stays nonterminal and carries block metadata", () => {
+  const result = applyClaimSnapshotState(createInitialClaimRealtimeState(), {
+    requests: [{
+      request_id: "req-blocked",
+      status: "queued_blocked",
+      queued: true,
+      queue_id: 15,
+      queue_position: 3,
+      queue_total: 6,
+      requested: 2,
+      granted: 0,
+      remaining: 2,
+      block_reason: "no_eligible_tokens",
+      next_retry_at: "2026-03-24T16:59:08Z",
+      source: "self",
+      origin_tab_id: "tab-blocked",
+      terminal: false,
+      updated_at_ts: 80,
+    }],
+  }, {
+    tabId: "tab-blocked",
+    activeRequestId: "",
+    emitToasts: true,
+  });
+
+  assert.equal(result.activeRequest?.status, "queued_blocked");
+  assert.equal(result.activeRequest?.terminal, false);
+  assert.equal(result.queueRequest?.block_reason, "no_eligible_tokens");
+  assert.equal(result.effects.filter((effect) => effect.type === "toast").length, 0);
+  assert.deepEqual(buildQueueStatusFromRequest(result.queueRequest), {
+    queued: true,
+    status: "queued_blocked",
+    queue_id: 15,
+    position: 3,
+    total_queued: 6,
+    requested: 2,
+    remaining: 2,
+    request_id: "req-blocked",
+    block_reason: "no_eligible_tokens",
+    last_progress_at: "",
+    next_retry_at: "2026-03-24T16:59:08Z",
+    front_blocked: false,
+    front_block_reason: "",
+    front_next_retry_at: "",
+  });
 });

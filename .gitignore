@@ -25,3 +25,4 @@ token_atlas.db*
 cmd/server/*.go.[0-9]*
 .gotmp/*
 .pycache-check/*
+.tmp/

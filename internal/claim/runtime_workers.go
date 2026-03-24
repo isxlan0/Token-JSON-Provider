@@ -266,7 +266,7 @@ func (s *Service) applyHideClaims(ctx context.Context, userID int64, claimIDs []
 		SET is_hidden = 1
 		WHERE user_id = ? AND id IN (%s)
 	`, strings.Join(placeholders, ","))
-	if _, err := s.store.DB().ExecContext(ctx, query, args...); err != nil {
+	if _, err := execWriteContext(ctx, s.store.DB(), query, args...); err != nil {
 		return fmt.Errorf("hide claims: %w", err)
 	}
 

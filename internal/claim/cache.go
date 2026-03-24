@@ -448,24 +448,11 @@ func (s *Service) notifyQueueUsers(ctx context.Context, extraUserIDs ...int64) {
 		seen[userID] = struct{}{}
 	}
 
-	queuedUserIDs, err := s.listQueuedUserIDs(ctx)
-	if err == nil {
-		for _, userID := range queuedUserIDs {
-			if userID <= 0 {
-				continue
-			}
-			seen[userID] = struct{}{}
-		}
-	}
-
 	for userID := range seen {
 		payload, err := s.loadQueueStatusSnapshot(ctx, userID)
 		if err != nil {
 			s.invalidateUserQueueCache(userID)
-			s.queueEvents.notify(userID)
-			if s.claimEvents != nil {
-				s.claimEvents.notify(userID)
-			}
+			s.logger.Warn("refresh queue snapshot", "user_id", userID, "error", err)
 			continue
 		}
 		s.setQueueStatusSnapshot(userID, payload)
@@ -473,6 +460,98 @@ func (s *Service) notifyQueueUsers(ctx context.Context, extraUserIDs ...int64) {
 			s.logger.Warn("sync claim realtime queue status", "user_id", userID, "error", err)
 		}
 	}
+}
+
+func (s *Service) scheduleQueueNotifications(userIDs ...int64) {
+	if s == nil {
+		return
+	}
+	ids := mapKeysInt64(uniquePositiveInt64(userIDs...))
+	if len(ids) == 0 {
+		return
+	}
+	if _, ok := s.serviceContext(); !ok {
+		s.notifyQueueUsers(context.Background(), ids...)
+		return
+	}
+	for _, userID := range ids {
+		select {
+		case s.queueNotifyCh <- userID:
+		default:
+			go s.notifyQueueUsers(context.Background(), userID)
+		}
+	}
+}
+
+func (s *Service) queueNotificationWorkerLoop(ctx context.Context) {
+	var (
+		timer  *time.Timer
+		timerC <-chan time.Time
+		batch  = make(map[int64]struct{})
+	)
+	stopTimer := func() {
+		if timer == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerC = nil
+	}
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		userIDs := mapKeysInt64(batch)
+		clear(batch)
+		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.notifyQueueUsers(notifyCtx, userIDs...)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			stopTimer()
+			flush()
+			return
+		case userID := <-s.queueNotifyCh:
+			if userID <= 0 {
+				continue
+			}
+			batch[userID] = struct{}{}
+			if len(batch) >= queueNotifyBatchMaxUsers {
+				stopTimer()
+				flush()
+				continue
+			}
+			if timer == nil {
+				timer = time.NewTimer(queueNotifyBatchWindow)
+			} else {
+				stopTimer()
+				timer.Reset(queueNotifyBatchWindow)
+			}
+			timerC = timer.C
+		case <-timerC:
+			stopTimer()
+			flush()
+		}
+	}
+}
+
+func uniquePositiveInt64(values ...int64) map[int64]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if value > 0 {
+			seen[value] = struct{}{}
+		}
+	}
+	return seen
 }
 
 func (s *Service) queueSnapshotTTL() int {

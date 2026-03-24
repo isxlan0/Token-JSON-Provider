@@ -89,6 +89,117 @@ func TestQueuedClaimCanBeFulfilledByQueuePump(t *testing.T) {
 	}
 }
 
+func TestClaimTokensQueuesBlockedWhenUserHasNoEligibleTokens(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10022", "blocked-user")
+	tokenID := insertTestToken(t, store, "blocked-eligible.json", `{"access_token":"blocked","refresh_token":"blocked-r","account_id":"acct-blocked"}`, 0, 2)
+	claimID := insertTestClaimRecord(t, store, tokenID, userID, nil, time.Now().Add(-5*time.Minute).Unix(), "seed-claimed")
+	insertTestUserTokenClaim(t, store, userID, tokenID, claimID, time.Now().Add(-5*time.Minute).Unix())
+
+	result, err := service.ClaimTokens(ctx, userID, nil, 1)
+	if err != nil {
+		t.Fatalf("claim tokens with no eligible user tokens: %v", err)
+	}
+	if !result.Queued {
+		t.Fatalf("expected blocked request to stay queued, got %+v", result)
+	}
+	if result.QueueStatus != queueStatusQueuedBlocked {
+		t.Fatalf("expected queued_blocked result, got %+v", result)
+	}
+	if result.BlockReason != queueBlockReasonNoEligibleTokens {
+		t.Fatalf("expected no eligible tokens reason, got %+v", result)
+	}
+
+	queueStatus, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get blocked queue status: %v", err)
+	}
+	if !queueStatus.Queued || queueStatus.Status != queueStatusQueuedBlocked {
+		t.Fatalf("expected blocked queue status payload, got %+v", queueStatus)
+	}
+	if queueStatus.BlockReason != queueBlockReasonNoEligibleTokens {
+		t.Fatalf("expected blocked queue status reason, got %+v", queueStatus)
+	}
+}
+
+func TestGetQueueStatusMarksFrontBlockedWhenHeadIsBlocked(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	headUserID := insertTestUser(t, store, "10024", "head-blocked-user")
+	followerUserID := insertTestUser(t, store, "10025", "follower-user")
+	headQueueID := insertTestQueuedEntry(t, store, headUserID, nil, 1, 1, 1, "front-blocked-head", time.Now().Add(-2*time.Minute).Unix())
+	insertTestQueuedEntry(t, store, followerUserID, nil, 2, 2, 2, "front-blocked-follower", time.Now().Add(-time.Minute).Unix())
+	nextRetryTS := time.Now().Add(3 * time.Minute).Unix()
+
+	if _, err := store.DB().Exec(`
+		UPDATE claim_queue
+		SET status = ?,
+		    block_reason = ?,
+		    next_retry_at_ts = ?
+		WHERE id = ?
+	`, queueStatusQueuedBlocked, queueBlockReasonProbeLocksPending, nextRetryTS, headQueueID); err != nil {
+		t.Fatalf("seed blocked head row: %v", err)
+	}
+
+	queueStatus, err := service.GetQueueStatus(ctx, followerUserID)
+	if err != nil {
+		t.Fatalf("get follower queue status: %v", err)
+	}
+	if !queueStatus.Queued || queueStatus.Position != 2 {
+		t.Fatalf("expected follower queue position to remain 2, got %+v", queueStatus)
+	}
+	if !queueStatus.FrontBlocked {
+		t.Fatalf("expected follower queue status to report blocked head, got %+v", queueStatus)
+	}
+	if queueStatus.FrontBlockReason != queueBlockReasonProbeLocksPending {
+		t.Fatalf("unexpected front blocked reason: %+v", queueStatus)
+	}
+	if queueStatus.FrontNextRetryAt != isoformatFromTS(nextRetryTS) {
+		t.Fatalf("unexpected front blocked retry timestamp: %+v", queueStatus)
+	}
+}
+
+func TestGetQueueStatusMarksFrontBlockedWhenHeadIsWaitingRetry(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	headUserID := insertTestUser(t, store, "10026", "head-waiting-user")
+	followerUserID := insertTestUser(t, store, "10027", "follower-waiting-user")
+	headQueueID := insertTestQueuedEntry(t, store, headUserID, nil, 1, 1, 1, "front-waiting-head", time.Now().Add(-2*time.Minute).Unix())
+	insertTestQueuedEntry(t, store, followerUserID, nil, 1, 1, 2, "front-waiting-follower", time.Now().Add(-time.Minute).Unix())
+	nextRetryTS := time.Now().Add(2 * time.Minute).Unix()
+
+	if _, err := store.DB().Exec(`
+		UPDATE claim_queue
+		SET status = ?,
+		    block_reason = NULL,
+		    next_retry_at_ts = ?
+		WHERE id = ?
+	`, queueStatusQueuedWaiting, nextRetryTS, headQueueID); err != nil {
+		t.Fatalf("seed waiting head row: %v", err)
+	}
+
+	queueStatus, err := service.GetQueueStatus(ctx, followerUserID)
+	if err != nil {
+		t.Fatalf("get follower queue status with waiting head: %v", err)
+	}
+	if !queueStatus.Queued || queueStatus.Position != 2 {
+		t.Fatalf("expected follower queue position to remain 2, got %+v", queueStatus)
+	}
+	if !queueStatus.FrontBlocked {
+		t.Fatalf("expected follower queue status to report waiting head retry, got %+v", queueStatus)
+	}
+	if queueStatus.FrontBlockReason != queueBlockReasonAllocationStalled {
+		t.Fatalf("unexpected front blocked reason for waiting head: %+v", queueStatus)
+	}
+	if queueStatus.FrontNextRetryAt != isoformatFromTS(nextRetryTS) {
+		t.Fatalf("unexpected waiting head retry timestamp: %+v", queueStatus)
+	}
+}
+
 func TestGetQueueStatusCachesMissAndReusesSnapshot(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
@@ -169,8 +280,8 @@ func TestGetQueueStatusDefersClaimableNowOnMainPath(t *testing.T) {
 	if payload.ClaimableNow != nil {
 		t.Fatalf("expected queue status main path to defer claimable_now, got %+v", payload)
 	}
-	if payload.ClaimableNowState != dataSourceUnavailable {
-		t.Fatalf("expected deferred claimable_now state to be unavailable, got %+v", payload)
+	if payload.ClaimableNowState != dataSourceDeferred {
+		t.Fatalf("expected deferred claimable_now state to be deferred, got %+v", payload)
 	}
 	if payload.DegradedReason != degradedReasonClaimableDeferred {
 		t.Fatalf("expected deferred degraded reason, got %+v", payload)
@@ -1020,6 +1131,72 @@ func insertTestToken(t *testing.T, store *database.Store, fileName string, conte
 		t.Fatalf("read inserted token id: %v", err)
 	}
 	return tokenID
+}
+
+func insertTestAPIKey(t *testing.T, store *database.Store, userID int64, name string) int64 {
+	t.Helper()
+
+	nowTS := time.Now().Unix()
+	result, err := store.DB().Exec(`
+		INSERT INTO api_keys (
+			user_id,
+			name,
+			key_hash,
+			key_prefix,
+			key_value,
+			status,
+			created_at_ts
+		) VALUES (?, ?, ?, ?, ?, 'active', ?)
+	`, userID, name, "hash-"+name, "prefix-"+name, "value-"+name, nowTS)
+	if err != nil {
+		t.Fatalf("insert test api key: %v", err)
+	}
+	apiKeyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read inserted api key id: %v", err)
+	}
+	return apiKeyID
+}
+
+func insertTestClaimRecord(t *testing.T, store *database.Store, tokenID int64, userID int64, apiKeyID *int64, claimedAtTS int64, requestID string) int64 {
+	t.Helper()
+
+	var apiKeyArg any
+	if apiKeyID != nil {
+		apiKeyArg = *apiKeyID
+	}
+	result, err := store.DB().Exec(`
+		INSERT INTO token_claims (
+			token_id,
+			user_id,
+			api_key_id,
+			claimed_at_ts,
+			request_id
+		) VALUES (?, ?, ?, ?, ?)
+	`, tokenID, userID, apiKeyArg, claimedAtTS, requestID)
+	if err != nil {
+		t.Fatalf("insert test claim record: %v", err)
+	}
+	claimID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read inserted claim id: %v", err)
+	}
+	return claimID
+}
+
+func insertTestUserTokenClaim(t *testing.T, store *database.Store, userID int64, tokenID int64, firstClaimID int64, createdAtTS int64) {
+	t.Helper()
+
+	if _, err := store.DB().Exec(`
+		INSERT INTO user_token_claims (
+			user_id,
+			token_id,
+			first_claim_id,
+			created_at_ts
+		) VALUES (?, ?, ?, ?)
+	`, userID, tokenID, firstClaimID, createdAtTS); err != nil {
+		t.Fatalf("insert test user token claim: %v", err)
+	}
 }
 
 func setTestTokenEnabledState(t *testing.T, store *database.Store, tokenID int64, enabled bool) {
