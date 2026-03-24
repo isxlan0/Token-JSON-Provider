@@ -366,7 +366,7 @@ func (s *Service) claimResultFromPayload(c echo.Context, userID int64, apiKeyID 
 		return nil, echo.NewHTTPError(http.StatusBadRequest, "count must be greater than or equal to 1")
 	}
 
-	result, err := s.createQueuedClaimRequest(c.Request().Context(), userID, apiKeyID, payload.Count, "", "")
+	result, err := s.claimTokens(c.Request().Context(), userID, apiKeyID, payload.Count, "", "")
 	if err != nil {
 		return nil, err
 	}

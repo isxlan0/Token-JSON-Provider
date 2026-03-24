@@ -54,6 +54,7 @@ const (
 	envUploadMaxFiles           = "TOKEN_UPLOAD_MAX_FILES_PER_REQUEST"
 	envUploadMaxFileSize        = "TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES"
 	envUploadMaxSuccessPerHour  = "TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR"
+	envQueueEnabled             = "TOKEN_QUEUE_ENABLED"
 	envPort                     = "PORT"
 
 	defaultNonHealthyScope = "all_unfinished"
@@ -103,6 +104,7 @@ var knownEnvKeys = []string{
 	envUploadMaxFiles,
 	envUploadMaxFileSize,
 	envUploadMaxSuccessPerHour,
+	envQueueEnabled,
 	envPort,
 }
 
@@ -204,6 +206,7 @@ type UploadConfig struct {
 
 type ServerConfig struct {
 	ProviderBaseURL string
+	QueueEnabled    bool
 	Port            int
 }
 
@@ -303,6 +306,7 @@ func loadFromPath(path string) (Config, error) {
 		},
 		Server: ServerConfig{
 			ProviderBaseURL: strings.TrimRight(source.rawTrimmed(envProviderBaseURL, ""), "/"),
+			QueueEnabled:    source.cleanedBool(envQueueEnabled, true),
 			Port:            source.cleanedInt(envPort, 8000),
 		},
 	}
@@ -384,6 +388,21 @@ func (s envSource) cleanedFloat(name string, defaultValue float64) float64 {
 		return defaultValue
 	}
 	return parsed
+}
+
+func (s envSource) cleanedBool(name string, defaultValue bool) bool {
+	value := strings.ToLower(s.cleanedString(name, ""))
+	if value == "" {
+		return defaultValue
+	}
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return defaultValue
+	}
 }
 
 func (s envSource) databasePath(baseDir string) string {

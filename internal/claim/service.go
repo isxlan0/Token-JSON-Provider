@@ -357,23 +357,25 @@ func (s *Service) Start(ctx context.Context) {
 			s.activeUploadProbe().Stop()
 		}()
 
-		ticker := time.NewTicker(queuePumpInterval)
-		s.goWorker(func() {
-			defer ticker.Stop()
-			if !s.waitForStartupReady(ctx) {
-				return
-			}
-			s.safeAdvanceQueue(ctx)
-			for {
-				select {
-				case <-ctx.Done():
+		if s.queueEnabled() {
+			ticker := time.NewTicker(queuePumpInterval)
+			s.goWorker(func() {
+				defer ticker.Stop()
+				if !s.waitForStartupReady(ctx) {
 					return
-				case <-ticker.C:
-				case <-s.wakeCh:
 				}
 				s.safeAdvanceQueue(ctx)
-			}
-		})
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+					case <-s.wakeCh:
+					}
+					s.safeAdvanceQueue(ctx)
+				}
+			})
+		}
 
 		s.goWorker(func() { s.uploadWorkerLoop(ctx) })
 		s.goWorker(func() { s.hideClaimsWorkerLoop(ctx) })
@@ -414,10 +416,17 @@ func (s *Service) safeAdvanceQueue(ctx context.Context) {
 }
 
 func (s *Service) wakeQueuePump() {
+	if !s.queueEnabled() {
+		return
+	}
 	select {
 	case s.wakeCh <- struct{}{}:
 	default:
 	}
+}
+
+func (s *Service) queueEnabled() bool {
+	return s != nil && s.cfg.Server.QueueEnabled
 }
 
 func (s *Service) activeClaimProbe() claimProbe {
@@ -455,6 +464,9 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 }
 
 func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, apiKeyID *int64, count int, originSessionID string, originTabID string) (*claimResult, error) {
+	if !s.queueEnabled() {
+		return nil, echo.NewHTTPError(http.StatusConflict, "排队机制已禁用，请直接领取或稍后重试")
+	}
 	requested := maxInt(1, count)
 	now := time.Now().Unix()
 	originSessionID = strings.TrimSpace(originSessionID)
@@ -645,9 +657,13 @@ func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64
 			return claimBootstrap{}, echo.NewHTTPError(http.StatusTooManyRequests, "您当前小时内的兑换额度已用完")
 		}
 
-		hasPending, err := s.hasPendingQueueTx(ctx, tx)
-		if err != nil {
-			return claimBootstrap{}, err
+		hasPending := false
+		if s.queueEnabled() {
+			var err error
+			hasPending, err = s.hasPendingQueueTx(ctx, tx)
+			if err != nil {
+				return claimBootstrap{}, err
+			}
 		}
 		if hasPending {
 			queueState, assessErr := s.assessQueueAdvanceQueryer(ctx, tx, userQueueEntry{
@@ -741,6 +757,9 @@ func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64
 	}
 
 	if len(items) == 0 {
+		if !s.queueEnabled() {
+			return nil, echo.NewHTTPError(http.StatusConflict, "排队机制已禁用，当前没有可直接领取的账号，请稍后重试")
+		}
 		policy, policyErr := s.getInventoryPolicy(ctx)
 		if policyErr != nil {
 			return nil, policyErr

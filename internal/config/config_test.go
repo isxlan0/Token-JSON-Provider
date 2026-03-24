@@ -29,6 +29,7 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 		"TOKEN_NON_HEALTHY_MAX_CLAIMS_SCOPE=bad-value\n" +
 		"TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE=-3\n" +
 		"TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES=16\n" +
+		"TOKEN_QUEUE_ENABLED=false\n" +
 		"PORT=not-a-number\n"
 
 	if err := os.WriteFile(envPath, []byte(envBody), 0o644); err != nil {
@@ -85,6 +86,9 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 	if cfg.Upload.MaxFileSizeBytes != 1024 {
 		t.Fatalf("unexpected upload max file size: %d", cfg.Upload.MaxFileSizeBytes)
 	}
+	if cfg.Server.QueueEnabled {
+		t.Fatalf("expected queue to be disabled from env file")
+	}
 	if cfg.Server.Port != 8000 {
 		t.Fatalf("unexpected port: %d", cfg.Server.Port)
 	}
@@ -120,6 +124,7 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	t.Setenv(envCacheBackend, "AUTO")
 	t.Setenv(envTokenFilesDir, filepath.Join(dir, "process-token-dir"))
 	t.Setenv(envDBMaxIdleConns, "5")
+	t.Setenv(envQueueEnabled, "true")
 
 	cfg, err := loadFromPath(envPath)
 	if err != nil {
@@ -140,6 +145,9 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	}
 	if cfg.Database.MaxIdleConns != 5 {
 		t.Fatalf("unexpected database max idle conns: %d", cfg.Database.MaxIdleConns)
+	}
+	if !cfg.Server.QueueEnabled {
+		t.Fatalf("expected process env to enable queue")
 	}
 	if len(cfg.APIKeys.AdminIdentities.IDs) != 0 {
 		t.Fatalf("expected process env to replace file admin identities")
@@ -180,6 +188,9 @@ func TestLoadFromPathUsesOneHourCacheDefaults(t *testing.T) {
 	}
 	if cfg.Files.TokenDir != filepath.Join(dir, "token") {
 		t.Fatalf("unexpected token files dir default: %q", cfg.Files.TokenDir)
+	}
+	if !cfg.Server.QueueEnabled {
+		t.Fatalf("expected queue to be enabled by default")
 	}
 }
 

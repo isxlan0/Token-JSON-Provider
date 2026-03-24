@@ -75,6 +75,90 @@ func TestCreateClaimRequestPublishesTerminalSnapshotWhenInventoryIsReady(t *test
 	}
 }
 
+func TestCreateClaimRequestSkipsQueueWhenQueueDisabled(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	service.cfg.Server.QueueEnabled = false
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "4011", "realtime-queue-disabled-user")
+	insertTestToken(t, store, "realtime-queue-disabled.json", `{"access_token":"realtime-queue-disabled","refresh_token":"realtime-queue-disabled-r","account_id":"acct-realtime-queue-disabled"}`, 0, 1)
+
+	requestContext := &auth.RequestContext{
+		UserID:    userID,
+		SessionID: "session-disabled",
+		User: auth.UserPayload{
+			ID:         "4011",
+			Username:   "realtime-queue-disabled-user",
+			Name:       "realtime-queue-disabled-user",
+			TrustLevel: 2,
+		},
+	}
+
+	accepted, err := service.CreateClaimRequest(ctx, requestContext, nil, 1, "tab-disabled")
+	if err != nil {
+		t.Fatalf("create direct claim request with queue disabled: %v", err)
+	}
+	if accepted == nil || accepted.Queued {
+		t.Fatalf("expected direct accepted payload while queue disabled, got %+v", accepted)
+	}
+
+	var queuedRows int
+	if err := store.DB().QueryRow(`
+		SELECT COUNT(*)
+		FROM claim_queue
+		WHERE user_id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+	`, userID).Scan(&queuedRows); err != nil {
+		t.Fatalf("count queued rows: %v", err)
+	}
+	if queuedRows != 0 {
+		t.Fatalf("expected queue-disabled request to avoid active queue rows, got %d", queuedRows)
+	}
+}
+
+func TestCreateClaimRequestReturnsConflictWhenQueueDisabledAndInventoryUnavailable(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	service.cfg.Server.QueueEnabled = false
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "4012", "realtime-queue-disabled-empty-user")
+	requestContext := &auth.RequestContext{
+		UserID:    userID,
+		SessionID: "session-disabled-empty",
+		User: auth.UserPayload{
+			ID:         "4012",
+			Username:   "realtime-queue-disabled-empty-user",
+			Name:       "realtime-queue-disabled-empty-user",
+			TrustLevel: 2,
+		},
+	}
+
+	accepted, err := service.CreateClaimRequest(ctx, requestContext, nil, 1, "tab-disabled-empty")
+	if err == nil {
+		t.Fatalf("expected queue-disabled request without inventory to fail, got %+v", accepted)
+	}
+	httpErr, ok := err.(*echo.HTTPError)
+	if !ok {
+		t.Fatalf("expected echo http error, got %T %v", err, err)
+	}
+	if httpErr.Code != http.StatusConflict {
+		t.Fatalf("expected conflict status, got %+v", httpErr)
+	}
+
+	var queuedRows int
+	if err := store.DB().QueryRow(`
+		SELECT COUNT(*)
+		FROM claim_queue
+		WHERE user_id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+	`, userID).Scan(&queuedRows); err != nil {
+		t.Fatalf("count queued rows: %v", err)
+	}
+	if queuedRows != 0 {
+		t.Fatalf("expected queue-disabled failure to avoid active queue rows, got %d", queuedRows)
+	}
+}
+
 func TestCreateClaimRequestSnapshotRebuildsFromTerminalClaimQueueLedger(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
