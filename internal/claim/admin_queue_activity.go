@@ -211,6 +211,8 @@ func describeAdminQueueCancelReason(reason string) string {
 		return "关联用户已被封禁，队列已取消"
 	case trimmed == queueCancelReasonAPIKeyUnavailable:
 		return "关联 API Key 不可用，队列已取消"
+	case trimmed == queueBlockReasonHourlyQuotaExhausted:
+		return "用户小时额度已用尽，剩余部分已结束"
 	default:
 		return truncateAdminQueueActivityText(trimmed, 120)
 	}
@@ -385,8 +387,12 @@ func (s *Service) publishAdminQueueFailure(entry userQueueEntry, reason string, 
 }
 
 func (s *Service) publishAdminQueueTerminal(entry userQueueEntry, status string, reason string) {
+	kind := "error"
 	message := "排队已结束"
 	switch strings.TrimSpace(status) {
+	case queueStatusPartial:
+		kind = "info"
+		message = "排队部分完成"
 	case queueStatusCancelled:
 		message = "排队已取消"
 	case queueStatusExpired:
@@ -394,11 +400,12 @@ func (s *Service) publishAdminQueueTerminal(entry userQueueEntry, status string,
 	case queueStatusFailed:
 		message = "排队处理失败"
 	case queueStatusSucceeded:
+		kind = "info"
 		message = "排队已完成"
 	}
 
 	s.publishAdminQueueActivity(adminQueueActivityEvent{
-		Kind:          "error",
+		Kind:          kind,
 		Stage:         "queue_terminal",
 		Message:       message,
 		Detail:        fmt.Sprintf("队列 #%d：%s", entry.ID, describeAdminQueueCancelReason(reason)),

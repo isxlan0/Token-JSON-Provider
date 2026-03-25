@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,6 +66,8 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	logger = newConfiguredLogger(cfg.Logging.Level)
+	slog.SetDefault(logger)
 
 	store, err := dbstore.OpenWithOptions(cfg.Database.Path, dbstore.OpenOptions{
 		MaxOpenConns: cfg.Database.MaxOpenConns,
@@ -158,6 +161,25 @@ func run(logger *slog.Logger) error {
 			return errors.Join(fmt.Errorf("start server: %w", err), cleanupErr)
 		}
 		return cleanupErr
+	}
+}
+
+func newConfiguredLogger(level string) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: parseSlogLevel(level),
+	}))
+}
+
+func parseSlogLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
 

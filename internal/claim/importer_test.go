@@ -106,3 +106,38 @@ func TestTokenImportLoopRetriesUntilJSONWriteCompletes(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 }
+
+func TestPollTokenDirectoryChangesIgnoresContentOnlyUpdates(t *testing.T) {
+	service, _ := newClaimTestService(t)
+
+	restoreWD := pushTempWorkingDir(t)
+	defer restoreWD()
+
+	if err := service.ensureTokenDir(); err != nil {
+		t.Fatalf("ensure token dir: %v", err)
+	}
+
+	fileName := "content-only.json"
+	filePath := filepath.Join(service.tokenDirPath(), fileName)
+	if err := os.WriteFile(filePath, []byte(`{"account_id":"acct-1","access_token":"token-1","refresh_token":"refresh-1"}`), 0o644); err != nil {
+		t.Fatalf("write initial token file: %v", err)
+	}
+
+	previous := service.listTokenFileNamesSnapshot()
+
+	if err := os.WriteFile(filePath, []byte(`{"account_id":"acct-2","access_token":"token-2","refresh_token":"refresh-2"}`), 0o644); err != nil {
+		t.Fatalf("rewrite token file: %v", err)
+	}
+
+	current := service.pollTokenDirectoryChanges(context.Background(), previous)
+	if _, ok := current[fileName]; !ok {
+		t.Fatalf("expected file to stay present after content-only update")
+	}
+
+	service.tokenImportMu.Lock()
+	_, pending := service.tokenImportPending[fileName]
+	service.tokenImportMu.Unlock()
+	if pending {
+		t.Fatalf("expected content-only update to avoid enqueueing import")
+	}
+}

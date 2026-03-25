@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	startupReconcileRetryDelay = 1 * time.Second
-	tokenDeleteRetryBaseDelay  = 250 * time.Millisecond
-	tokenDeleteRetryMaxDelay   = 2 * time.Second
+	tokenDeleteRetryBaseDelay = 250 * time.Millisecond
+	tokenDeleteRetryMaxDelay  = 2 * time.Second
 )
 
 func (s *Service) setLifecycleContext(ctx context.Context) {
@@ -68,6 +67,7 @@ func (s *Service) markStartupReconcileAttempt(attempt int) {
 	s.startupLastStartedAt = isoformatNow()
 	s.startupLastError = ""
 	s.startupMu.Unlock()
+	s.claimTrace("startup reconcile attempt started", "attempt", attempt)
 }
 
 func (s *Service) markStartupReconcileError(err error) {
@@ -77,6 +77,7 @@ func (s *Service) markStartupReconcileError(err error) {
 		s.startupLastError = err.Error()
 	}
 	s.startupMu.Unlock()
+	s.claimTrace("startup reconcile attempt failed", "error", err)
 }
 
 func (s *Service) markStartupReconcileCanceled(err error) {
@@ -86,6 +87,7 @@ func (s *Service) markStartupReconcileCanceled(err error) {
 		s.startupLastError = err.Error()
 	}
 	s.startupMu.Unlock()
+	s.claimTrace("startup reconcile cancelled", "error", err)
 }
 
 func (s *Service) markStartupReady(summary map[string]int) {
@@ -100,6 +102,7 @@ func (s *Service) markStartupReady(summary map[string]int) {
 	s.startupReadyOnce.Do(func() {
 		close(s.startupReadyCh)
 	})
+	s.claimTrace("startup reconcile ready", "summary", summary)
 }
 
 func (s *Service) isStartupReady() bool {
@@ -108,12 +111,38 @@ func (s *Service) isStartupReady() bool {
 	return s.startupReady
 }
 
-func (s *Service) waitForStartupReady(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-s.startupReadyCh:
+func (s *Service) waitForStartupReady(ctx context.Context, component string) bool {
+	component = strings.TrimSpace(component)
+	if component == "" {
+		component = "unknown"
+	}
+	if s.isStartupReady() {
+		s.claimTrace("startup already ready", "component", component)
 		return true
+	}
+
+	s.claimTrace("waiting for startup ready", "component", component, "startup", s.startupHealthPayload())
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.claimTrace("startup wait cancelled", "component", component, "reason", ctx.Err())
+			return false
+		case <-s.startupReadyCh:
+			s.claimTrace("startup wait finished", "component", component, "startup", s.startupHealthPayload())
+			return true
+		case <-ticker.C:
+			if s.claimTraceEnabled() {
+				s.logger.Warn(
+					"startup ready wait still blocked",
+					"trace", "claim",
+					"component", component,
+					"startup", s.startupHealthPayload(),
+				)
+			}
+		}
 	}
 }
 

@@ -170,6 +170,29 @@ test("accepted queued request does not fake queue total from queue position", ()
   });
 });
 
+test("accepted terminal request finishes immediately without waiting for stream", () => {
+  const result = applyClaimAcceptedState(createInitialClaimRealtimeState(), {
+    request_id: "req-direct-accepted",
+    status: "succeeded",
+    queued: false,
+    requested: 1,
+    granted: 1,
+    remaining: 0,
+    items: [{ token_id: 7, file_name: "direct.json" }],
+    reason_message: "",
+    terminal: true,
+  }, { tabId: "tab-a", emitToasts: true });
+
+  assert.equal(result.activeRequest?.status, "succeeded");
+  assert.equal(result.activeRequest?.terminal, true);
+  assert.equal(result.queueRequest, null);
+  assert.equal(result.effects.filter((effect) => effect.type === "terminal").length, 1);
+  assert.deepEqual(
+    result.effects.filter((effect) => effect.type === "toast").map((effect) => effect.title),
+    ["申请成功"]
+  );
+});
+
 test("other session delivery emits explicit other session toast", () => {
   const result = applyClaimSnapshotState(createInitialClaimRealtimeState(), {
     requests: [{

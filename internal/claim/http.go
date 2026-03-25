@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -18,6 +19,37 @@ type claimRequestPayload struct {
 
 type hideClaimsPayload struct {
 	ClaimIDs []int64 `json:"claim_ids"`
+}
+
+func (s *Service) logClaimHTTPRequest(
+	message string,
+	startedAt time.Time,
+	c echo.Context,
+	requestContext *auth.RequestContext,
+	apiKeyID *int64,
+	payload claimRequestPayload,
+	result *claimRequestAccepted,
+	err error,
+) {
+	if s == nil || !s.claimTraceEnabled() {
+		return
+	}
+
+	args := append([]any{}, claimTraceRequestContextArgs(requestContext)...)
+	args = append(args,
+		"api_key_id", nullableInt64(apiKeyID),
+		"count", payload.Count,
+		"client_tab_id", strings.TrimSpace(payload.ClientTabID),
+		"duration_ms", durationMillis(time.Since(startedAt)),
+	)
+	args = append(args, claimTraceEchoRequestArgs(c)...)
+	if result != nil {
+		args = append(args, "result", claimTraceClaimAcceptedSummary(result))
+	}
+	if err != nil {
+		args = append(args, "error", err)
+	}
+	s.claimTraceWithDB(message, args...)
 }
 
 func (s *Service) RegisterRoutes(e *echo.Echo) {
@@ -324,20 +356,20 @@ func (s *Service) claimBySession(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
-	payload := claimRequestPayload{Count: 1}
-	if c.Request().ContentLength > 0 {
-		if err := c.Bind(&payload); err != nil && err != io.EOF {
-			return echo.NewHTTPError(http.StatusBadRequest, "Invalid JSON body.")
-		}
+	startedAt := time.Now()
+	payload, err := parseClaimRequestPayload(c)
+	if err != nil {
+		s.logClaimHTTPRequest("claim http request rejected", startedAt, c, requestContext, nil, payload, nil, err)
+		return err
 	}
-	if payload.Count < 1 {
-		return echo.NewHTTPError(http.StatusBadRequest, "count must be greater than or equal to 1")
-	}
+	s.logClaimHTTPRequest("claim http request started", startedAt, c, requestContext, nil, payload, nil, nil)
 
 	result, err := s.CreateClaimRequest(c.Request().Context(), requestContext, nil, payload.Count, payload.ClientTabID)
 	if err != nil {
+		s.logClaimHTTPRequest("claim http request failed", startedAt, c, requestContext, nil, payload, nil, err)
 		return err
 	}
+	s.logClaimHTTPRequest("claim http request completed", startedAt, c, requestContext, nil, payload, result, nil)
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -347,34 +379,77 @@ func (s *Service) claimByAPIKey(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Invalid API key.")
 	}
 
-	apiKeyID := record.APIKeyID
-	result, err := s.claimResultFromPayload(c, record.UserID, &apiKeyID)
+	startedAt := time.Now()
+	payload, err := parseClaimRequestPayload(c)
 	if err != nil {
+		s.logClaimHTTPRequest(
+			"api claim http request rejected",
+			startedAt,
+			c,
+			&auth.RequestContext{UserID: record.UserID},
+			&record.APIKeyID,
+			payload,
+			nil,
+			err,
+		)
 		return err
 	}
+	s.logClaimHTTPRequest(
+		"api claim http request started",
+		startedAt,
+		c,
+		&auth.RequestContext{UserID: record.UserID},
+		&record.APIKeyID,
+		payload,
+		nil,
+		nil,
+	)
+
+	apiKeyID := record.APIKeyID
+	result, err := s.CreateClaimRequest(
+		c.Request().Context(),
+		&auth.RequestContext{UserID: record.UserID},
+		&apiKeyID,
+		payload.Count,
+		payload.ClientTabID,
+	)
+	if err != nil {
+		s.logClaimHTTPRequest(
+			"api claim http request failed",
+			startedAt,
+			c,
+			&auth.RequestContext{UserID: record.UserID},
+			&apiKeyID,
+			payload,
+			nil,
+			err,
+		)
+		return err
+	}
+	s.logClaimHTTPRequest(
+		"api claim http request completed",
+		startedAt,
+		c,
+		&auth.RequestContext{UserID: record.UserID},
+		&apiKeyID,
+		payload,
+		result,
+		nil,
+	)
 	return c.JSON(http.StatusOK, result)
 }
 
-func (s *Service) claimResultFromPayload(c echo.Context, userID int64, apiKeyID *int64) (*claimResult, error) {
+func parseClaimRequestPayload(c echo.Context) (claimRequestPayload, error) {
 	payload := claimRequestPayload{Count: 1}
 	if c.Request().ContentLength > 0 {
 		if err := c.Bind(&payload); err != nil && err != io.EOF {
-			return nil, echo.NewHTTPError(http.StatusBadRequest, "Invalid JSON body.")
+			return claimRequestPayload{}, echo.NewHTTPError(http.StatusBadRequest, "Invalid JSON body.")
 		}
 	}
 	if payload.Count < 1 {
-		return nil, echo.NewHTTPError(http.StatusBadRequest, "count must be greater than or equal to 1")
+		return claimRequestPayload{}, echo.NewHTTPError(http.StatusBadRequest, "count must be greater than or equal to 1")
 	}
-
-	result, err := s.claimTokens(c.Request().Context(), userID, apiKeyID, payload.Count, "", "")
-	if err != nil {
-		return nil, err
-	}
-
-	for index := range result.Items {
-		result.Items[index].DownloadURL = s.buildDownloadURL(c, result.Items[index].TokenID)
-	}
-	return result, nil
+	return payload, nil
 }
 
 func (s *Service) getClaimRequestByAPIKey(c echo.Context) error {

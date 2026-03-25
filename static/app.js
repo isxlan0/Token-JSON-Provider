@@ -4,7 +4,15 @@ import {
   applyClaimSnapshotState,
   buildQueueStatusFromRequest,
   createInitialClaimRealtimeState,
-} from "./app/claim-realtime.js?v=20260324d";
+} from "./app/claim-realtime.js?v=20260325b";
+import {
+  CLAIM_DEBUG_STORAGE_KEY,
+  resolveClaimDebugMode,
+  resolveServerClaimDebug,
+  summarizeClaimAcceptedPayload,
+  summarizeClaimRealtimePayload,
+  summarizeQueueStatusPayload,
+} from "./app/claim-debug.js?v=20260325c";
 import { createSummarySyncController } from "./app/summary-sync.js?v=20260323i";
 
 const APP_BUILD = (() => {
@@ -64,6 +72,22 @@ function persistClaimToastKeys(toastKeys = {}) {
   }
 }
 
+function readClaimDebugStorageValue() {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      return window.localStorage.getItem(CLAIM_DEBUG_STORAGE_KEY);
+    }
+  } catch (error) {
+    console.warn("读取领取调试开关失败，忽略本地设置", error);
+  }
+  return null;
+}
+
+const initialClaimDebug = resolveClaimDebugMode({
+  search: typeof window !== "undefined" ? window.location.search : "",
+  storageValue: readClaimDebugStorageValue(),
+});
+
 const state = {
   user: null,
   authErrorParam: "",
@@ -105,6 +129,10 @@ const state = {
   queueStream: null,
   claimRealtimeState: createInitialClaimRealtimeState({ toastKeys: loadClaimToastKeys() }),
   activeClaimRequestId: "",
+  claimDebugEnabled: initialClaimDebug.enabled,
+  claimDebugSource: initialClaimDebug.source,
+  claimDebugServer: null,
+  claimDebugStartupLogged: false,
   claimStreamConnected: false,
   claimStreamRetryTimer: null,
   claimStreamRetryCount: 0,
@@ -708,6 +736,7 @@ function applyRuntimeSnapshot(payload) {
   if (!payload) {
     return;
   }
+  applyClaimDebugSettings(payload.debug, "runtime-snapshot");
   state.runtimeSnapshotMeta = extractPayloadMeta(payload);
   if (payload.user) {
     state.user = payload.user;
@@ -734,6 +763,11 @@ function applyRuntimeSnapshot(payload) {
   if (payload.upload_results?.summary) {
     applyUploadResultsSummaryPayload(payload.upload_results);
   }
+  logClaimClientEvent("runtime snapshot applied", {
+    data_source: payload?.data_source || "",
+    degraded: Boolean(payload?.degraded),
+    debug: payload?.debug || null,
+  });
   updateSummaryOriginBadge();
 }
 
@@ -768,10 +802,55 @@ function applyDashboardSummary(summary) {
   updateSummaryOriginBadge();
 }
 
+function applyClaimDebugSettings(debugPayload, reason = "server") {
+  const previousEnabled = state.claimDebugEnabled;
+  const previousSource = state.claimDebugSource;
+  const previousServer = state.claimDebugServer;
+  const serverDebug = resolveServerClaimDebug(debugPayload);
+  const resolved = resolveClaimDebugMode({
+    search: typeof window !== "undefined" ? window.location.search : "",
+    storageValue: readClaimDebugStorageValue(),
+    serverDebug,
+    currentEnabled: state.claimDebugEnabled,
+    currentSource: state.claimDebugSource,
+  });
+
+  state.claimDebugEnabled = resolved.enabled;
+  state.claimDebugSource = resolved.source;
+  state.claimDebugServer = serverDebug;
+
+  const changed = previousEnabled !== state.claimDebugEnabled
+    || previousSource !== state.claimDebugSource
+    || previousServer !== state.claimDebugServer;
+  const shouldLogStartup = reason === "startup" && state.claimDebugEnabled && !state.claimDebugStartupLogged;
+  if (!changed && !shouldLogStartup) {
+    return;
+  }
+
+  if (reason === "startup" && state.claimDebugEnabled) {
+    state.claimDebugStartupLogged = true;
+  }
+
+  console.info(`[claim] debug ${state.claimDebugEnabled ? "enabled" : "disabled"}`, {
+    reason,
+    enabled: state.claimDebugEnabled,
+    source: state.claimDebugSource,
+    server_debug: state.claimDebugServer,
+    server_payload: debugPayload || null,
+    tab_id: state.tabId,
+    app_build: APP_BUILD,
+  });
+}
+
 function logClaimClientEvent(message, details = {}) {
+  if (!state.claimDebugEnabled) {
+    return;
+  }
   const payload = {
     tab_id: state.tabId,
     active_request_id: state.activeClaimRequestId || null,
+    debug_source: state.claimDebugSource,
+    server_debug: state.claimDebugServer,
     ...details,
   };
   console.info(`[claim] ${message}`, payload);
@@ -780,11 +859,12 @@ function logClaimClientEvent(message, details = {}) {
 function describeClaimTerminalSummary(request) {
   const granted = request?.granted || 0;
   const requested = request?.requested || granted;
+  const remaining = Math.max(0, request?.remaining || Math.max(0, requested - granted));
   switch (request?.status) {
     case "succeeded":
       return `已领取 ${granted} / 请求 ${requested}。`;
     case "partial":
-      return request.reason_message || `已领取 ${granted} / 请求 ${requested}，仍有 ${request.remaining || 0} 个未完成。`;
+      return `成功 ${granted} 个，失败 ${remaining} 个（共处理 ${requested} 个）。`;
     case "cancelled":
     case "expired":
     case "failed":
@@ -976,6 +1056,14 @@ function applyClaimRealtimePayload(payload, options = {}) {
   if (result.activeRequest?.terminal) {
     setClaimSubmitting(false);
   }
+  logClaimClientEvent("claim realtime payload applied", {
+    from_stream: Boolean(options.fromStream),
+    broadcast: options.broadcast !== false,
+    emit_toasts: options.emitToasts !== false,
+    summary: summarizeClaimRealtimePayload(payload || {}),
+    effect_types: (result.effects || []).map((effect) => effect.type),
+    active_request_after: state.activeClaimRequestId || null,
+  });
   broadcastClaimRealtimePayload(payload || {}, options);
   handleClaimRealtimeEffects(result.effects || []);
   syncQueueRealtimeTransport();
@@ -1061,6 +1149,9 @@ function mergeQueuedRequestWithStatus(queueRequest, status = {}) {
 function applyQueueStatusPayload(payload) {
   state.queueStatus = normalizeQueueStatusPayload(payload || {});
   renderQueueStatus();
+  logClaimClientEvent("queue status applied", {
+    summary: summarizeQueueStatusPayload(payload || {}),
+  });
   syncQueueRealtimeTransport();
   updateSummaryOriginBadge();
   return state.queueStatus;
@@ -1068,6 +1159,7 @@ function applyQueueStatusPayload(payload) {
 
 function applyBootstrapPayload(payload) {
   resetCrossTabSummaryState("bootstrap");
+  applyClaimDebugSettings(payload?.debug, "bootstrap");
   const profile = payload?.profile || {};
   state.user = profile.user || null;
   state.quota = profile.quota || null;
@@ -1089,6 +1181,10 @@ function applyBootstrapPayload(payload) {
   applyDashboardSummary(payload?.dashboard || {});
   renderUploadResults();
   applyUploadResultsSummaryPayload(payload?.upload_results || {});
+  logClaimClientEvent("bootstrap payload applied", {
+    data_source: payload?.data_source || "",
+    debug: payload?.debug || null,
+  });
 }
 
 function applyDocsBaseUrl() {
@@ -2422,6 +2518,9 @@ function renderClaimResults() {
 
 async function loadQueueStatus() {
   const payload = await fetchJson("/me/queue-status");
+  logClaimClientEvent("queue status fetched", {
+    summary: summarizeQueueStatusPayload(payload || {}),
+  });
   applyQueueStatusPayload(payload || {});
   return payload;
 }
@@ -2442,6 +2541,8 @@ async function bootstrapAppShell() {
   if (state.bootstrapPromise) {
     return state.bootstrapPromise;
   }
+
+  applyClaimDebugSettings(null, "startup");
 
   setLoadingState({
     title: "正在加载",
@@ -2568,6 +2669,9 @@ async function revokeApiKey(keyId) {
 
 async function claimTokens() {
   if (state.isClaimSubmitting || state.isClaimQueued) {
+    logClaimClientEvent("submit ignored", {
+      reason: state.isClaimSubmitting ? "already_submitting" : "already_queued",
+    });
     return;
   }
   elements.claimSummary.classList.add("hidden");
@@ -2575,6 +2679,10 @@ async function claimTokens() {
 
   const count = Number.parseInt(elements.claimCount.value, 10);
   if (!Number.isFinite(count) || count < 1) {
+    logClaimClientEvent("submit rejected", {
+      reason: "invalid_count",
+      raw_value: elements.claimCount.value,
+    });
     elements.claimError.textContent = "请输入有效数量。";
     elements.claimError.classList.remove("hidden");
     return;
@@ -2587,6 +2695,7 @@ async function claimTokens() {
   elements.claimSummary.classList.remove("hidden");
   logClaimClientEvent("submit click", { requested: count });
 
+  const requestStartedAt = Date.now();
   try {
     const result = await fetchJson("/me/claim", {
       method: "POST",
@@ -2598,11 +2707,11 @@ async function claimTokens() {
     state.activeClaimRequestId = accepted.state.activeRequestId || "";
     persistClaimToastKeys(state.claimRealtimeState.toastKeys);
     updateClaimRequestUI(accepted.activeRequest, accepted.queueRequest);
+    handleClaimRealtimeEffects(accepted.effects || []);
     syncQueueRealtimeTransport();
     logClaimClientEvent("request accepted", {
-      request_id: result?.request_id,
-      status: result?.status,
-      queued: Boolean(result?.queued),
+      duration_ms: Date.now() - requestStartedAt,
+      result: summarizeClaimAcceptedPayload(result || {}),
     });
   } catch (error) {
     setClaimQueued(false);
@@ -2611,6 +2720,12 @@ async function claimTokens() {
     elements.claimSummary.classList.add("hidden");
     elements.claimError.textContent = error.message;
     elements.claimError.classList.remove("hidden");
+    logClaimClientEvent("request failed", {
+      duration_ms: Date.now() - requestStartedAt,
+      status: error?.status || null,
+      message: error?.message || "",
+      payload: error?.payload || null,
+    });
   }
 }
 
@@ -2876,16 +2991,32 @@ function clearClaimStreamRetry() {
   }
 }
 
-function closeQueueStream() {
+function buildQueueStreamURL() {
+  const params = new URLSearchParams();
+  if (state.tabId) {
+    params.set("client_tab_id", state.tabId);
+  }
+  const query = params.toString();
+  return query ? `/me/queue-stream?${query}` : "/me/queue-stream";
+}
+
+function closeQueueStream(reason = "close") {
   if (state.queueStream) {
+    logClaimClientEvent("queue stream closing", { reason });
     state.queueStream.close();
     state.queueStream = null;
   }
 }
 
-function stopQueueRealtime() {
+function stopQueueRealtime(reason = "stop") {
   clearClaimStreamRetry();
-  closeQueueStream();
+  closeQueueStream(reason);
+  if (state.claimStreamConnected || state.claimStreamError) {
+    logClaimClientEvent("queue realtime stopped", {
+      reason,
+      retry_count: state.claimStreamRetryCount,
+    });
+  }
   state.claimStreamConnected = false;
 }
 
@@ -2900,7 +3031,7 @@ function canUseLeaderQueueTransport() {
 function syncQueueRealtimeTransport() {
   if (!canUseLeaderQueueTransport()) {
     state.claimStreamError = "";
-    stopQueueRealtime();
+    stopQueueRealtime("not-needed");
     return;
   }
   if (state.queueStream) {
@@ -2918,6 +3049,10 @@ function scheduleClaimStreamReconnect() {
     CLAIM_STREAM_RETRY_MAX_MS,
     CLAIM_STREAM_RETRY_BASE_MS * (2 ** Math.max(0, state.claimStreamRetryCount))
   );
+  logClaimClientEvent("queue stream reconnect scheduled", {
+    retry_count: state.claimStreamRetryCount,
+    delay_ms: delay,
+  });
   state.claimStreamRetryTimer = setTimeout(() => {
     state.claimStreamRetryTimer = null;
     startQueueRealtime();
@@ -2926,35 +3061,55 @@ function scheduleClaimStreamReconnect() {
 
 function startQueueRealtime() {
   if (!canUseLeaderQueueTransport()) {
-    stopQueueRealtime();
+    stopQueueRealtime("not-needed");
     return;
   }
   if (typeof EventSource === "undefined") {
     state.claimStreamConnected = false;
     state.claimStreamError = "当前浏览器不支持实时推送连接。";
+    logClaimClientEvent("queue stream unsupported", {
+      reason: "eventsource_unavailable",
+    });
     updateClaimRequestUI();
     return;
   }
   if (state.queueStream) {
     return;
   }
-  const stream = new EventSource("/me/queue-stream");
+  const streamUrl = buildQueueStreamURL();
+  logClaimClientEvent("queue stream starting", {
+    url: streamUrl,
+    pending_requests: Object.keys(state.claimRealtimeState?.requestsById || {}).length,
+  });
+  const stream = new EventSource(streamUrl);
   state.queueStream = stream;
+  stream.onopen = () => {
+    logClaimClientEvent("queue stream open", { url: streamUrl });
+  };
   stream.addEventListener("stream_status", () => {
     state.claimStreamConnected = true;
     state.claimStreamError = "";
     state.claimStreamRetryCount = 0;
+    logClaimClientEvent("queue stream ready", { url: streamUrl });
     updateClaimRequestUI();
   });
   stream.addEventListener("claim_snapshot", (event) => {
     try {
       const payload = JSON.parse(event.data || "{}");
+      logClaimClientEvent("queue stream snapshot received", {
+        url: streamUrl,
+        summary: summarizeClaimRealtimePayload(payload || {}),
+      });
       applyClaimRealtimePayload(payload || { requests: [] }, {
         fromStream: true,
         broadcast: true,
         emitToasts: true,
       });
     } catch (error) {
+      logClaimClientEvent("queue stream snapshot parse failed", {
+        url: streamUrl,
+        message: error?.message || String(error),
+      });
       console.error("解析领取实时事件失败", error);
     }
   });
@@ -2962,10 +3117,14 @@ function startQueueRealtime() {
     if (state.queueStream !== stream) {
       return;
     }
-    closeQueueStream();
+    closeQueueStream("stream-error");
     state.claimStreamConnected = false;
     state.claimStreamRetryCount += 1;
     state.claimStreamError = "实时连接中断，正在重连...";
+    logClaimClientEvent("queue stream error", {
+      url: streamUrl,
+      retry_count: state.claimStreamRetryCount,
+    });
     updateClaimRequestUI();
     scheduleClaimStreamReconnect();
   };

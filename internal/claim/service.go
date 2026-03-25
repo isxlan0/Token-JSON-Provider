@@ -34,6 +34,7 @@ const (
 	queueAdvanceMaxResolvedHeadTurns = 8
 	queueNotifyBatchWindow           = 100 * time.Millisecond
 	queueNotifyBatchMaxUsers         = 64
+	directClaimSyncMaxCount          = queueAdvanceMaxGrantsPerTick
 )
 
 var errRetryAllocation = errors.New("retry allocation")
@@ -170,11 +171,43 @@ type claimResult struct {
 	QueueStatus    string              `json:"queue_status,omitempty"`
 	QueueID        int64               `json:"queue_id,omitempty"`
 	QueuePosition  int                 `json:"queue_position,omitempty"`
+	QueueTotal     int                 `json:"queue_total,omitempty"`
 	QueueRemaining int                 `json:"queue_remaining,omitempty"`
 	BlockReason    string              `json:"block_reason,omitempty"`
 	LastProgressAt string              `json:"last_progress_at,omitempty"`
 	NextRetryAt    string              `json:"next_retry_at,omitempty"`
 	Quota          quotaUsage          `json:"quota"`
+	TerminalStatus string              `json:"-"`
+	TerminalReason string              `json:"-"`
+}
+
+func claimResultTerminalStatus(result *claimResult) string {
+	if result == nil {
+		return claimStatusFailed
+	}
+	if status := strings.ToLower(strings.TrimSpace(result.TerminalStatus)); isClaimTerminalStatus(status) {
+		return status
+	}
+	if result.Granted <= 0 {
+		return claimStatusFailed
+	}
+	if result.Granted < result.Requested {
+		return claimStatusPartial
+	}
+	return claimStatusSucceeded
+}
+
+func claimResultTerminalReason(result *claimResult) string {
+	if result == nil {
+		return ""
+	}
+	if reason := strings.TrimSpace(result.TerminalReason); reason != "" {
+		return reason
+	}
+	if status := claimResultTerminalStatus(result); isClaimTerminalStatus(status) {
+		return strings.TrimSpace(result.BlockReason)
+	}
+	return ""
 }
 
 type providerPayload struct {
@@ -303,6 +336,7 @@ type runtimeSnapshotPayload struct {
 	APIKeys        map[string]apiKeySummaryPayload `json:"api_keys"`
 	Uploads        map[string]int                  `json:"uploads,omitempty"`
 	UploadResults  map[string]any                  `json:"upload_results"`
+	Debug          debugSettingsPayload            `json:"debug"`
 	DataSource     string                          `json:"data_source,omitempty"`
 	GeneratedAt    string                          `json:"generated_at,omitempty"`
 	StaleAt        string                          `json:"stale_at,omitempty"`
@@ -357,29 +391,36 @@ func (s *Service) Start(ctx context.Context) {
 			s.activeUploadProbe().Stop()
 		}()
 
-		if s.queueEnabled() {
-			ticker := time.NewTicker(queuePumpInterval)
-			s.goWorker(func() {
-				defer ticker.Stop()
-				if !s.waitForStartupReady(ctx) {
+		ticker := time.NewTicker(queuePumpInterval)
+		s.goWorker(func() {
+			s.claimTrace("queue pump worker started", "interval_ms", durationMillis(queuePumpInterval))
+			defer ticker.Stop()
+			if !s.waitForStartupReady(ctx, "queue_pump") {
+				s.claimTrace("queue pump worker stopped before startup ready", "reason", ctx.Err())
+				return
+			}
+			s.safeAdvanceQueue(ctx)
+			for {
+				trigger := "ticker"
+				select {
+				case <-ctx.Done():
+					s.claimTrace("queue pump worker stopped", "reason", ctx.Err())
 					return
+				case <-ticker.C:
+				case <-s.wakeCh:
+					trigger = "wake"
+				}
+				if trigger == "wake" {
+					s.claimTraceWithDB("queue pump wake received")
 				}
 				s.safeAdvanceQueue(ctx)
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-					case <-s.wakeCh:
-					}
-					s.safeAdvanceQueue(ctx)
-				}
-			})
-		}
+			}
+		})
 
 		s.goWorker(func() { s.uploadWorkerLoop(ctx) })
 		s.goWorker(func() { s.hideClaimsWorkerLoop(ctx) })
 		s.goWorker(func() { s.tokenImportLoop(ctx) })
+		s.goWorker(func() { s.awaitStartupReconcile(ctx) })
 		s.goWorker(func() { s.tokenWatchLoop(ctx) })
 		s.goWorker(func() { s.queueNotificationWorkerLoop(ctx) })
 		s.goWorker(func() { s.warmReadCaches(ctx) })
@@ -416,12 +457,11 @@ func (s *Service) safeAdvanceQueue(ctx context.Context) {
 }
 
 func (s *Service) wakeQueuePump() {
-	if !s.queueEnabled() {
-		return
-	}
 	select {
 	case s.wakeCh <- struct{}{}:
+		s.claimTraceWithDB("queue pump wake signalled", "delivered", true)
 	default:
+		s.claimTraceWithDB("queue pump wake signalled", "delivered", false, "reason", "already_pending")
 	}
 }
 
@@ -464,16 +504,23 @@ func (s *Service) ClaimTokens(ctx context.Context, userID int64, apiKeyID *int64
 }
 
 func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, apiKeyID *int64, count int, originSessionID string, originTabID string) (*claimResult, error) {
-	if !s.queueEnabled() {
-		return nil, echo.NewHTTPError(http.StatusConflict, "排队机制已禁用，请直接领取或稍后重试")
-	}
 	requested := maxInt(1, count)
 	now := time.Now().Unix()
 	originSessionID = strings.TrimSpace(originSessionID)
 	originTabID = strings.TrimSpace(originTabID)
+	s.claimTraceWithDB(
+		"create queued claim request started",
+		"user_id", userID,
+		"api_key_id", nullableInt64(apiKeyID),
+		"requested_count", requested,
+		"origin_session_id", originSessionID,
+		"origin_tab_id", originTabID,
+		"startup_ready", s.isStartupReady(),
+	)
 
 	type claimRequestBootstrap struct {
 		Item      *userQueueEntry
+		Terminal  *claimResult
 		Used      int
 		Limit     int
 		Remaining int
@@ -507,6 +554,47 @@ func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, ap
 		if assessErr != nil {
 			return claimRequestBootstrap{}, assessErr
 		}
+		s.claimTraceWithDB(
+			"queued claim request assessed",
+			"user_id", userID,
+			"requested_count", requested,
+			"used_quota", used,
+			"hourly_limit", policy.HourlyLimit,
+			"remaining_quota", maxInt(0, policy.HourlyLimit-used),
+			"queue_status", queueState.Status,
+			"block_reason", queueState.BlockReason,
+			"next_retry_at_ts", queueState.NextRetryAtTS,
+		)
+
+		remainingQuota := maxInt(0, policy.HourlyLimit-used)
+		if strings.TrimSpace(queueState.BlockReason) == queueBlockReasonHourlyQuotaExhausted {
+			requestID, err := randomRequestID()
+			if err != nil {
+				return claimRequestBootstrap{}, fmt.Errorf("generate request id: %w", err)
+			}
+			return claimRequestBootstrap{
+				Terminal: &claimResult{
+					RequestID:      requestID,
+					Items:          []claimResponseItem{},
+					Requested:      requested,
+					Granted:        0,
+					Queued:         false,
+					QueueStatus:    queueStatusPartial,
+					QueueRemaining: requested,
+					BlockReason:    queueBlockReasonHourlyQuotaExhausted,
+					Quota: quotaUsage{
+						Used:      used,
+						Limit:     policy.HourlyLimit,
+						Remaining: remainingQuota,
+					},
+					TerminalStatus: claimStatusPartial,
+					TerminalReason: queueBlockReasonHourlyQuotaExhausted,
+				},
+				Used:      used,
+				Limit:     policy.HourlyLimit,
+				Remaining: remainingQuota,
+			}, nil
+		}
 
 		queueItem, _, err := s.enqueueClaimTx(
 			ctx,
@@ -535,6 +623,18 @@ func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, ap
 		return nil, err
 	}
 
+	if initial.Terminal != nil {
+		if err := s.recordTerminalClaimRequest(ctx, userID, apiKeyID, originSessionID, originTabID, initial.Terminal); err != nil {
+			return nil, err
+		}
+		s.claimTraceWithDB(
+			"create queued claim request completed",
+			"user_id", userID,
+			"result", claimTraceClaimResultSummary(initial.Terminal),
+		)
+		return initial.Terminal, nil
+	}
+
 	result := &claimResult{
 		RequestID:      initial.Item.RequestID,
 		Items:          []claimResponseItem{},
@@ -544,6 +644,7 @@ func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, ap
 		QueueStatus:    initial.Item.Status,
 		QueueID:        initial.Item.ID,
 		QueuePosition:  initial.Item.QueueRank,
+		QueueTotal:     initial.Item.QueueRank,
 		QueueRemaining: initial.Item.Remaining,
 		BlockReason:    strings.TrimSpace(initial.Item.BlockReason.String),
 		LastProgressAt: isoformatFromNullableTS(initial.Item.LastProgressAtTS),
@@ -558,6 +659,11 @@ func (s *Service) createQueuedClaimRequest(ctx context.Context, userID int64, ap
 	s.afterQueueMutation(ctx, userID)
 	s.wakeQueuePump()
 	s.publishAdminQueueEnqueued(*initial.Item)
+	s.claimTraceWithDB(
+		"create queued claim request completed",
+		"user_id", userID,
+		"result", claimTraceClaimResultSummary(result),
+	)
 	return result, nil
 }
 
@@ -596,12 +702,21 @@ func (s *Service) GetClaimRequest(ctx context.Context, userID int64, requestID s
 	}
 	if queued {
 		result.QueuePosition = entry.QueueRank
+		queueTotal, err := s.getTotalQueued(ctx, s.store.DB())
+		if err != nil {
+			return nil, err
+		}
+		result.QueueTotal = maxInt(queueTotal, entry.QueueRank)
+	} else {
+		result.TerminalStatus = claimRealtimeStatusFromQueueEntry(*entry)
+		result.TerminalReason = strings.TrimSpace(entry.CancelReason.String)
 	}
 	return result, nil
 }
 
 func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64, count int, originSessionID string, originTabID string) (*claimResult, error) {
 	requested := maxInt(1, count)
+	originalRequested := requested
 	now := time.Now().Unix()
 	originSessionID = strings.TrimSpace(originSessionID)
 	originTabID = strings.TrimSpace(originTabID)
@@ -658,14 +773,8 @@ func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64
 		}
 
 		hasPending := false
-		if s.queueEnabled() {
-			var err error
-			hasPending, err = s.hasPendingQueueTx(ctx, tx)
-			if err != nil {
-				return claimBootstrap{}, err
-			}
-		}
-		if hasPending {
+		shouldPreferQueue := false
+		enqueueForAsyncProcessing := func() (claimBootstrap, error) {
 			queueState, assessErr := s.assessQueueAdvanceQueryer(ctx, tx, userQueueEntry{
 				UserID:       userID,
 				APIKeyID:     sqlNullInt64(apiKeyID),
@@ -697,6 +806,7 @@ func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64
 					QueueStatus:    queueItem.Status,
 					QueueID:        queueItem.ID,
 					QueuePosition:  queueItem.QueueRank,
+					QueueTotal:     queueItem.QueueRank,
 					QueueRemaining: queueItem.Remaining,
 					BlockReason:    strings.TrimSpace(queueItem.BlockReason.String),
 					LastProgressAt: isoformatFromNullableTS(queueItem.LastProgressAtTS),
@@ -708,6 +818,17 @@ func (s *Service) claimTokens(ctx context.Context, userID int64, apiKeyID *int64
 					},
 				},
 			}, nil
+		}
+		if s.queueEnabled() {
+			shouldPreferQueue = originalRequested > directClaimSyncMaxCount
+			var err error
+			hasPending, err = s.hasPendingQueueTx(ctx, tx)
+			if err != nil {
+				return claimBootstrap{}, err
+			}
+		}
+		if hasPending || shouldPreferQueue {
+			return enqueueForAsyncProcessing()
 		}
 
 		return claimBootstrap{
@@ -817,6 +938,14 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if s.claimTraceEnabled() {
+		s.claimTraceWithDB(
+			"advance queue pass started",
+			"hourly_limit", policy.HourlyLimit,
+			"max_claims", policy.MaxClaims,
+			"startup_ready", s.isStartupReady(),
+		)
+	}
 
 	affectedUsers := make(map[int64]struct{}, queueAdvanceMaxResolvedHeadTurns+1)
 	claimedUsers := make(map[int64]struct{}, queueAdvanceMaxResolvedHeadTurns+1)
@@ -828,6 +957,7 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 		if row == nil {
 			break
 		}
+		s.claimTraceWithDB("advance queue picked head", "resolved_heads", resolvedHeads, "queue_entry", claimTraceQueueEntrySummary(*row))
 		result, err := s.advanceQueueRow(ctx, *row, policy)
 		if err != nil {
 			s.logger.Warn(
@@ -913,6 +1043,13 @@ func (s *Service) AdvanceQueue(ctx context.Context) error {
 		}
 		s.invalidateInventoryCache()
 		s.invalidateDashboardClaimCaches()
+	}
+	if s.claimTraceEnabled() {
+		s.claimTraceWithDB(
+			"advance queue pass completed",
+			"affected_users", len(affectedUsers),
+			"claimed_users", len(claimedUsers),
+		)
 	}
 	return nil
 }
@@ -1132,6 +1269,7 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 		payload.Degraded = result.Degraded
 		payload.DegradedReason = result.DegradedReason
 	}
+	payload.Debug = s.debugSettingsPayload()
 
 	logArgs := []any{
 		"user_id", userID,
@@ -1770,6 +1908,7 @@ func (s *Service) enqueueClaim(ctx context.Context, userID int64, apiKeyID *int6
 		QueueStatus:    inserted.Item.Status,
 		QueueID:        inserted.Item.ID,
 		QueuePosition:  inserted.Item.QueueRank,
+		QueueTotal:     inserted.Item.QueueRank,
 		QueueRemaining: inserted.Item.Remaining,
 		BlockReason:    strings.TrimSpace(inserted.Item.BlockReason.String),
 		LastProgressAt: isoformatFromNullableTS(inserted.Item.LastProgressAtTS),
@@ -1887,15 +2026,15 @@ func (s *Service) recordTerminalClaimRequest(ctx context.Context, userID int64, 
 	requested := maxInt(0, result.Requested)
 	granted := maxInt(0, result.Granted)
 	remaining := maxInt(0, requested-granted)
-	status := queueStatusFailed
-	switch {
-	case granted >= requested && requested > 0:
-		status = queueStatusSucceeded
-	case granted > 0:
-		status = queueStatusPartial
-	}
+	status := claimResultTerminalStatus(result)
+	reasonCode := claimResultTerminalReason(result)
 
 	nowTS := time.Now().Unix()
+	var cancelledAtArg any
+	switch status {
+	case queueStatusCancelled, queueStatusExpired, queueStatusFailed:
+		cancelledAtArg = nowTS
+	}
 	var apiKeyArg any
 	if apiKeyID != nil {
 		apiKeyArg = *apiKeyID
@@ -1934,14 +2073,14 @@ func (s *Service) recordTerminalClaimRequest(ctx context.Context, userID int64, 
 				    next_retry_at_ts = NULL,
 				    last_progress_at_ts = ?,
 				    terminal_at_ts = ?,
-				    cancel_reason = NULL,
-				    cancelled_at_ts = NULL,
+				    cancel_reason = ?,
+				    cancelled_at_ts = ?,
 				    cancelled_by_user_id = NULL,
 				    last_error_reason = NULL,
 				    last_error_at_ts = NULL,
 				    failure_count = 0
 				WHERE id = ?
-			`, apiKeyArg, requested, remaining, status, originSessionArg, originTabArg, nowTS, nowTS, existingID); err != nil {
+			`, apiKeyArg, requested, remaining, status, originSessionArg, originTabArg, nowTS, nowTS, nullIfEmpty(reasonCode), cancelledAtArg, existingID); err != nil {
 				return 0, fmt.Errorf("update terminal claim request %s: %w", result.RequestID, err)
 			}
 			return existingID, nil
@@ -1965,9 +2104,11 @@ func (s *Service) recordTerminalClaimRequest(ctx context.Context, userID int64, 
 				block_reason,
 				next_retry_at_ts,
 				last_progress_at_ts,
-				terminal_at_ts
-			) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-		`, userID, apiKeyArg, requested, remaining, nowTS, result.RequestID, status, originSessionArg, originTabArg, nowTS, nowTS)
+				terminal_at_ts,
+				cancel_reason,
+				cancelled_at_ts
+			) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+		`, userID, apiKeyArg, requested, remaining, nowTS, result.RequestID, status, originSessionArg, originTabArg, nowTS, nowTS, nullIfEmpty(reasonCode), cancelledAtArg)
 		if err != nil {
 			return 0, fmt.Errorf("insert terminal claim request %s: %w", result.RequestID, err)
 		}

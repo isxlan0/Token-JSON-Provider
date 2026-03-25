@@ -115,7 +115,7 @@ func TestRecordQueueFailureCancelsAfterThreshold(t *testing.T) {
 	}
 }
 
-func TestAdvanceQueueMarksHourlyQuotaBlocked(t *testing.T) {
+func TestAdvanceQueueFinalizesHourlyQuotaAsPartial(t *testing.T) {
 	service, store := newClaimTestService(t)
 	ctx := context.Background()
 
@@ -132,25 +132,92 @@ func TestAdvanceQueueMarksHourlyQuotaBlocked(t *testing.T) {
 	}
 
 	var (
-		status      string
-		blockReason sql.NullString
-		nextRetry   sql.NullInt64
+		status       string
+		blockReason  sql.NullString
+		nextRetry    sql.NullInt64
+		cancelReason sql.NullString
 	)
 	if err := store.DB().QueryRow(`
-		SELECT status, block_reason, next_retry_at_ts
+		SELECT status, block_reason, next_retry_at_ts, cancel_reason
 		FROM claim_queue
 		WHERE id = ?
-	`, queueID).Scan(&status, &blockReason, &nextRetry); err != nil {
-		t.Fatalf("load hourly blocked queue row: %v", err)
+	`, queueID).Scan(&status, &blockReason, &nextRetry, &cancelReason); err != nil {
+		t.Fatalf("load hourly partial queue row: %v", err)
 	}
-	if status != queueStatusQueuedBlocked {
-		t.Fatalf("expected queued_blocked status, got %q", status)
+	if status != queueStatusPartial {
+		t.Fatalf("expected partial status, got %q", status)
 	}
-	if !blockReason.Valid || blockReason.String != queueBlockReasonHourlyQuotaExhausted {
-		t.Fatalf("unexpected hourly block reason: %+v", blockReason)
+	if blockReason.Valid {
+		t.Fatalf("expected block reason to be cleared, got %+v", blockReason)
 	}
-	if !nextRetry.Valid || nextRetry.Int64 != earliestClaimTS+3600 {
-		t.Fatalf("unexpected hourly next retry: %+v", nextRetry)
+	if nextRetry.Valid {
+		t.Fatalf("expected next retry to be cleared, got %+v", nextRetry)
+	}
+	if !cancelReason.Valid || cancelReason.String != queueBlockReasonHourlyQuotaExhausted {
+		t.Fatalf("unexpected hourly terminal reason: %+v", cancelReason)
+	}
+
+	queueStatus, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get queue status after hourly terminalization: %v", err)
+	}
+	if queueStatus.Queued {
+		t.Fatalf("expected queue to be cleared after hourly exhaustion, got %+v", queueStatus)
+	}
+}
+
+func TestAdvanceQueueFinalizesPartialAfterConsumingLastHourlyQuota(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	service.cfg.Inventory.Limits.Healthy.Hourly = 1
+	service.cfg.Inventory.Limits.Warning.Hourly = 1
+	service.cfg.Inventory.Limits.Critical.Hourly = 1
+
+	userID := insertTestUser(t, store, "300211", "hourly-partial-user")
+	queueID := insertTestQueuedEntry(t, store, userID, nil, 2, 2, 1, "hourly-partial-row", time.Now().Add(-time.Minute).Unix())
+	insertTestToken(t, store, "hourly-partial.json", `{"access_token":"hourly-partial","refresh_token":"hourly-partial-r","account_id":"acct-hourly-partial"}`, 0, 1)
+
+	if err := service.AdvanceQueue(ctx); err != nil {
+		t.Fatalf("advance queue with remaining hourly quota: %v", err)
+	}
+
+	var (
+		status       string
+		remaining    int
+		cancelReason sql.NullString
+	)
+	if err := store.DB().QueryRow(`
+		SELECT status, remaining, cancel_reason
+		FROM claim_queue
+		WHERE id = ?
+	`, queueID).Scan(&status, &remaining, &cancelReason); err != nil {
+		t.Fatalf("load partial queue row: %v", err)
+	}
+	if status != queueStatusPartial {
+		t.Fatalf("expected partial status after consuming last hourly quota, got %q", status)
+	}
+	if remaining != 1 {
+		t.Fatalf("expected one request to remain unfulfilled, got %d", remaining)
+	}
+	if !cancelReason.Valid || cancelReason.String != queueBlockReasonHourlyQuotaExhausted {
+		t.Fatalf("unexpected partial terminal reason: %+v", cancelReason)
+	}
+
+	queueStatus, err := service.GetQueueStatus(ctx, userID)
+	if err != nil {
+		t.Fatalf("get queue status after partial completion: %v", err)
+	}
+	if queueStatus.Queued {
+		t.Fatalf("expected partial completion to leave no active queue row, got %+v", queueStatus)
+	}
+
+	var claimCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM token_claims WHERE user_id = ?`, userID).Scan(&claimCount); err != nil {
+		t.Fatalf("count claims after partial completion: %v", err)
+	}
+	if claimCount != 1 {
+		t.Fatalf("expected one successful grant before terminal partial, got %d", claimCount)
 	}
 }
 
@@ -291,12 +358,17 @@ func TestAdvanceQueueReassessesInventoryRetryWindowWhenTokensBecomeAvailable(t *
 	}
 }
 
-func TestAdvanceQueueStillHonorsQuotaRetryWindow(t *testing.T) {
+func TestAdvanceQueueConvertsHourlyRetryWindowToTerminalPartial(t *testing.T) {
 	service, store := newClaimTestService(t)
 	ctx := context.Background()
 
 	userID := insertTestUser(t, store, "300232", "quota-retry-user")
 	queueID := insertTestQueuedEntry(t, store, userID, nil, 1, 1, 1, "quota-retry-row", time.Now().Add(-time.Minute).Unix())
+	tokenID := insertTestToken(t, store, "quota-retry-token.json", `{"access_token":"quota-retry","refresh_token":"quota-retry-r","account_id":"acct-quota-retry"}`, 0, 1)
+	earliestClaimTS := time.Now().Add(-30 * time.Minute).Unix()
+	for index := 0; index < service.cfg.Inventory.Limits.Healthy.Hourly; index++ {
+		insertTestClaimRecord(t, store, tokenID, userID, nil, earliestClaimTS+int64(index), "quota-retry-seed")
+	}
 	nextRetryTS := time.Now().Add(10 * time.Minute).Unix()
 	if _, err := store.DB().Exec(`
 		UPDATE claim_queue
@@ -308,8 +380,6 @@ func TestAdvanceQueueStillHonorsQuotaRetryWindow(t *testing.T) {
 		t.Fatalf("seed quota retry queue row: %v", err)
 	}
 
-	insertTestToken(t, store, "quota-retry-token.json", `{"access_token":"quota-retry","refresh_token":"quota-retry-r","account_id":"acct-quota-retry"}`, 0, 1)
-
 	if err := service.AdvanceQueue(ctx); err != nil {
 		t.Fatalf("advance queue with quota retry window: %v", err)
 	}
@@ -318,22 +388,34 @@ func TestAdvanceQueueStillHonorsQuotaRetryWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get queue status after quota retry advance: %v", err)
 	}
-	if !queueStatus.Queued {
-		t.Fatalf("expected quota retry window to remain deferred, got %+v", queueStatus)
-	}
-	if queueStatus.Status != queueStatusQueuedBlocked {
-		t.Fatalf("expected quota retry queue status to stay blocked, got %+v", queueStatus)
-	}
-	if queueStatus.BlockReason != queueBlockReasonHourlyQuotaExhausted {
-		t.Fatalf("expected quota retry block reason to be preserved, got %+v", queueStatus)
+	if queueStatus.Queued {
+		t.Fatalf("expected hourly retry window to be closed immediately, got %+v", queueStatus)
 	}
 
 	var claimCount int
 	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM token_claims WHERE user_id = ?`, userID).Scan(&claimCount); err != nil {
 		t.Fatalf("count claims after quota retry advance: %v", err)
 	}
-	if claimCount != 0 {
-		t.Fatalf("expected no claims while quota retry window is active, got %d", claimCount)
+	if claimCount != service.cfg.Inventory.Limits.Healthy.Hourly {
+		t.Fatalf("expected no additional claims after hourly retry terminalization, got %d", claimCount)
+	}
+
+	var (
+		status       string
+		cancelReason sql.NullString
+	)
+	if err := store.DB().QueryRow(`
+		SELECT status, cancel_reason
+		FROM claim_queue
+		WHERE id = ?
+	`, queueID).Scan(&status, &cancelReason); err != nil {
+		t.Fatalf("load terminalized quota retry row: %v", err)
+	}
+	if status != queueStatusPartial {
+		t.Fatalf("expected blocked quota retry row to become partial, got %q", status)
+	}
+	if !cancelReason.Valid || cancelReason.String != queueBlockReasonHourlyQuotaExhausted {
+		t.Fatalf("unexpected quota retry terminal reason: %+v", cancelReason)
 	}
 }
 

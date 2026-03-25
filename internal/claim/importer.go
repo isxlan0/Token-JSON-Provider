@@ -23,18 +23,17 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 		return nil, err
 	}
 
-	entries, err := s.listTokenDirEntries()
+	fileNames, err := s.listTokenFileNames()
 	if err != nil {
 		return nil, err
 	}
 
-	existingNames := make(map[string]struct{}, len(entries))
+	existingNames := make(map[string]struct{}, len(fileNames))
 	imported := 0
-	for _, entry := range entries {
+	for _, fileName := range fileNames {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		fileName := entry.Name()
 		existingNames[fileName] = struct{}{}
 		changed, err := s.importTokenFile(ctx, fileName)
 		if err != nil {
@@ -65,10 +64,112 @@ func (s *Service) reconcileTokenFiles(ctx context.Context) (map[string]int, erro
 	}
 
 	return map[string]int{
-		"total":       len(entries),
+		"total":       len(fileNames),
 		"imported":    imported,
 		"deactivated": deactivated,
 	}, nil
+}
+
+type storedTokenFileState struct {
+	isActive bool
+}
+
+func (s *Service) startupSyncTokenFileNames(ctx context.Context) (map[string]int, error) {
+	startedAt := time.Now()
+	s.claimTrace("startup token name sync started")
+
+	if err := s.ensureTokenDir(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	fileNames, err := s.listTokenFileNames()
+	if err != nil {
+		return nil, err
+	}
+	stored, err := s.listStoredTokenFileStates(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	existingNames := make(map[string]struct{}, len(fileNames))
+	importCandidates := make([]string, 0, len(fileNames))
+	summary := map[string]int{
+		"disk_count":        len(fileNames),
+		"db_count":          len(stored),
+		"disk_only":         0,
+		"reactivate_needed": 0,
+		"db_only_active":    0,
+		"enqueued_imports":  0,
+		"deactivated":       0,
+	}
+
+	for _, fileName := range fileNames {
+		existingNames[fileName] = struct{}{}
+		state, exists := stored[fileName]
+		if !exists {
+			summary["disk_only"]++
+			importCandidates = append(importCandidates, fileName)
+			continue
+		}
+		if !state.isActive {
+			summary["reactivate_needed"]++
+			importCandidates = append(importCandidates, fileName)
+		}
+	}
+
+	deactivated, err := s.deactivateMissingTokenFiles(ctx, existingNames)
+	if err != nil {
+		return nil, err
+	}
+	summary["db_only_active"] = deactivated
+	summary["deactivated"] = deactivated
+	summary["enqueued_imports"] = s.enqueueTokenImportsAsync(importCandidates, "startup_sync")
+
+	if summary["enqueued_imports"] > 0 || deactivated > 0 {
+		s.invalidateInventoryCache()
+		s.invalidateDashboardUploadCaches()
+		s.invalidateAdminCache()
+		s.wakeQueuePump()
+	}
+
+	s.claimTrace(
+		"startup token name sync completed",
+		"summary",
+		summary,
+		"duration_ms",
+		durationMillis(time.Since(startedAt)),
+	)
+	return summary, nil
+}
+
+func (s *Service) listStoredTokenFileStates(ctx context.Context) (map[string]storedTokenFileState, error) {
+	rows, err := s.store.DB().QueryContext(ctx, `
+		SELECT file_name, is_active
+		FROM tokens
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list stored token file states: %w", err)
+	}
+	defer rows.Close()
+
+	stored := make(map[string]storedTokenFileState)
+	for rows.Next() {
+		var (
+			fileName string
+			isActive int
+		)
+		if err := rows.Scan(&fileName, &isActive); err != nil {
+			return nil, fmt.Errorf("scan stored token file state: %w", err)
+		}
+		stored[fileName] = storedTokenFileState{isActive: isActive != 0}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stored token file states: %w", err)
+	}
+	return stored, nil
 }
 
 func (s *Service) importTokenFile(ctx context.Context, fileName string) (bool, error) {

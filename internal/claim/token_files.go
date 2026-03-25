@@ -3,33 +3,33 @@ package claim
 import (
 	"fmt"
 	"os"
-	"sort"
-	"strings"
 )
 
-func (s *Service) listTokenDirEntries() ([]os.DirEntry, error) {
+func (s *Service) listTokenFileNames() ([]string, error) {
 	entries, err := os.ReadDir(s.tokenDirPath())
 	if err != nil {
 		return nil, fmt.Errorf("read token directory: %w", err)
 	}
 
-	tokenEntries := make([]os.DirEntry, 0, len(entries))
+	fileNames := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !isJSONFileName(entry.Name()) {
 			continue
 		}
-		tokenEntries = append(tokenEntries, entry)
+		fileNames = append(fileNames, entry.Name())
+	}
+	return fileNames, nil
+}
+
+func (s *Service) listTokenFileNameSet() map[string]struct{} {
+	fileNames, err := s.listTokenFileNames()
+	if err != nil {
+		return map[string]struct{}{}
 	}
 
-	sort.Slice(tokenEntries, func(i int, j int) bool {
-		left := tokenEntries[i].Name()
-		right := tokenEntries[j].Name()
-		leftLower := strings.ToLower(left)
-		rightLower := strings.ToLower(right)
-		if leftLower == rightLower {
-			return left < right
-		}
-		return leftLower < rightLower
-	})
-	return tokenEntries, nil
+	names := make(map[string]struct{}, len(fileNames))
+	for _, fileName := range fileNames {
+		names[fileName] = struct{}{}
+	}
+	return names
 }

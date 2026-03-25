@@ -9,10 +9,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-type tokenFileStat struct {
-	size    int64
-	modTime int64
-}
+type tokenFileStat struct{}
 
 func (s *Service) tokenWatchLoop(ctx context.Context) {
 	if err := s.ensureTokenDir(); err != nil {
@@ -34,7 +31,7 @@ func (s *Service) tokenWatchLoop(ctx context.Context) {
 		return
 	}
 
-	snapshot := s.listTokenFileStats()
+	snapshot := s.listTokenFileNamesSnapshot()
 	pollTicker := time.NewTicker(5 * time.Second)
 	defer pollTicker.Stop()
 
@@ -47,7 +44,7 @@ func (s *Service) tokenWatchLoop(ctx context.Context) {
 				return
 			}
 			s.handleTokenFileEvent(ctx, event)
-			snapshot = s.listTokenFileStats()
+			snapshot = s.listTokenFileNamesSnapshot()
 		case err, ok := <-watcher.Errors:
 			if ok {
 				s.logger.Error("token watcher error", "error", err)
@@ -60,7 +57,7 @@ func (s *Service) tokenWatchLoop(ctx context.Context) {
 
 func (s *Service) runTokenPollingLoop(ctx context.Context, snapshot map[string]tokenFileStat) {
 	if snapshot == nil {
-		snapshot = s.listTokenFileStats()
+		snapshot = s.listTokenFileNamesSnapshot()
 	}
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -89,16 +86,15 @@ func (s *Service) handleTokenFileEvent(ctx context.Context, event fsnotify.Event
 		if _, err := s.deactivateTokenFile(ctx, fileName); err != nil {
 			s.logger.Error("deactivate token file after watcher event", "error", err, "file_name", fileName)
 		}
-	case event.Has(fsnotify.Create), event.Has(fsnotify.Write), event.Has(fsnotify.Chmod):
+	case event.Has(fsnotify.Create):
 		s.enqueueTokenImport(ctx, fileName, "watch")
 	}
 }
 
 func (s *Service) pollTokenDirectoryChanges(ctx context.Context, previous map[string]tokenFileStat) map[string]tokenFileStat {
-	current := s.listTokenFileStats()
-	for fileName, stat := range current {
-		old, ok := previous[fileName]
-		if !ok || old != stat {
+	current := s.listTokenFileNamesSnapshot()
+	for fileName := range current {
+		if _, ok := previous[fileName]; !ok {
 			if !s.shouldIgnoreInternalTokenWrite(fileName) {
 				s.enqueueTokenImport(ctx, fileName, "poll")
 			}
@@ -115,27 +111,13 @@ func (s *Service) pollTokenDirectoryChanges(ctx context.Context, previous map[st
 	return current
 }
 
-func (s *Service) listTokenFileStats() map[string]tokenFileStat {
-	entries, err := s.listTokenDirEntries()
-	if err != nil {
-		return map[string]tokenFileStat{}
+func (s *Service) listTokenFileNamesSnapshot() map[string]tokenFileStat {
+	names := s.listTokenFileNameSet()
+	snapshot := make(map[string]tokenFileStat, len(names))
+	for fileName := range names {
+		snapshot[fileName] = tokenFileStat{}
 	}
-
-	stats := make(map[string]tokenFileStat, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !isJSONFileName(entry.Name()) {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		stats[entry.Name()] = tokenFileStat{
-			size:    info.Size(),
-			modTime: info.ModTime().UnixNano(),
-		}
-	}
-	return stats
+	return snapshot
 }
 
 func isJSONFileName(fileName string) bool {

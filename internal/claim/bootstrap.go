@@ -147,6 +147,7 @@ func (s *Service) GetBootstrap(ctx context.Context, requestContext *auth.Request
 		"claim_realtime": claimRealtime,
 		"queue_status":   queueStatus,
 		"upload_results": uploadResults,
+		"debug":          s.debugSettingsPayload(),
 		"sources": map[string]any{
 			"profile":        profileSource,
 			"dashboard":      dashboardSource,
@@ -273,7 +274,7 @@ func (s *Service) GetAdminBootstrap(ctx context.Context, requestContext *auth.Re
 }
 
 func (s *Service) warmReadCaches(ctx context.Context) {
-	if ctx.Err() != nil || !s.waitForStartupReady(ctx) {
+	if ctx.Err() != nil || !s.waitForStartupReady(ctx, "warm_read_caches") {
 		return
 	}
 

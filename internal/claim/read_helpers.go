@@ -363,6 +363,7 @@ func (s *Service) mergeRuntimeSnapshotWithRequestContext(payload runtimeSnapshot
 	if payload.UploadResults == nil {
 		payload.UploadResults = buildUploadResultsSummaryPayload(nil)
 	}
+	payload.Debug = s.debugSettingsPayload()
 	return payload
 }
 
@@ -566,6 +567,7 @@ func (s *Service) defaultBootstrapPayload(requestContext *auth.RequestContext) m
 		"claim_realtime": s.emptyClaimRealtimeSnapshot(),
 		"queue_status":   s.defaultQueueStatusPayload(),
 		"upload_results": buildUploadResultsSummaryPayload(nil),
+		"debug":          s.debugSettingsPayload(),
 		"sources": map[string]any{
 			"profile":        dataSourceUnavailable,
 			"dashboard":      dataSourceUnavailable,

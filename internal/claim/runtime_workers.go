@@ -13,6 +13,8 @@ const (
 	tokenImportMaxAttempts    = 6
 	tokenImportRetryBaseDelay = 250 * time.Millisecond
 	tokenImportRetryMaxDelay  = 2 * time.Second
+	startupQueueResetTimeout  = 3 * time.Second
+	startupTokenSyncTimeout   = 3 * time.Second
 )
 
 type hideClaimsTask struct {
@@ -51,10 +53,6 @@ func (s *Service) hideClaimsWorkerLoop(ctx context.Context) {
 }
 
 func (s *Service) tokenImportLoop(ctx context.Context) {
-	if !s.awaitStartupReconcile(ctx) {
-		return
-	}
-
 	for {
 		if ctx.Err() != nil {
 			return
@@ -146,7 +144,7 @@ func (s *Service) ensureTokenDir() error {
 }
 
 func (s *Service) startupReconcileTokenFiles(ctx context.Context) {
-	if _, err := s.reconcileTokenFiles(ctx); err != nil {
+	if _, err := s.startupSyncTokenFileNames(ctx); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			s.logger.Info("startup reconcile token files cancelled")
 			return
@@ -156,51 +154,123 @@ func (s *Service) startupReconcileTokenFiles(ctx context.Context) {
 }
 
 func (s *Service) awaitStartupReconcile(ctx context.Context) bool {
-	for attempt := 1; ; attempt++ {
+	if ctx.Err() != nil {
+		s.markStartupReconcileCanceled(ctx.Err())
+		return false
+	}
+
+	const attempt = 1
+	s.markStartupReconcileAttempt(attempt)
+
+	summary := make(map[string]int)
+	failOpen := false
+
+	queueSummary, queueErr := s.runStartupReconcileStage(ctx, "queue reset", startupQueueResetTimeout, s.startupReconcileQueue)
+	if queueErr != nil {
 		if ctx.Err() != nil {
 			s.markStartupReconcileCanceled(ctx.Err())
 			return false
 		}
-
-		s.markStartupReconcileAttempt(attempt)
-		tokenSummary, err := s.reconcileTokenFiles(ctx)
-		if err == nil {
-			queueSummary, queueErr := s.startupReconcileQueue(ctx)
-			if queueErr == nil {
-				s.markStartupReady(mergeStartupReconcileSummary(tokenSummary, queueSummary))
-				return true
-			}
-			err = queueErr
+		failOpen = true
+		summary["queue_failed_open"] = 1
+		s.logger.Warn("startup queue reconcile failed open", "trace", "claim", "error", queueErr)
+	} else {
+		for key, value := range queueSummary {
+			summary["queue_"+key] = value
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			s.logger.Info("startup reconcile token files cancelled")
-			s.markStartupReconcileCanceled(err)
-			return false
-		}
+	}
 
-		s.markStartupReconcileError(err)
-		s.logger.Error("startup reconcile token files", "error", err, "attempt", attempt)
-
-		timer := time.NewTimer(startupReconcileRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+	tokenSummary, tokenErr := s.runStartupReconcileStage(ctx, "token name sync", startupTokenSyncTimeout, s.startupSyncTokenFileNames)
+	if tokenErr != nil {
+		if ctx.Err() != nil {
 			s.markStartupReconcileCanceled(ctx.Err())
 			return false
-		case <-timer.C:
+		}
+		failOpen = true
+		summary["token_sync_failed_open"] = 1
+		s.logger.Warn("startup token name sync failed open", "trace", "claim", "error", tokenErr)
+	} else {
+		for key, value := range tokenSummary {
+			summary[key] = value
 		}
 	}
+
+	if !failOpen {
+		s.claimTrace("startup reconcile attempt succeeded", "attempt", attempt, "summary", summary)
+	} else {
+		s.claimTrace("startup reconcile completed with fail-open", "attempt", attempt, "summary", summary)
+	}
+	s.markStartupReady(summary)
+	return true
 }
 
-func mergeStartupReconcileSummary(tokenSummary map[string]int, queueSummary map[string]int) map[string]int {
-	merged := cloneIntMap(tokenSummary)
-	if merged == nil {
-		merged = make(map[string]int)
+func (s *Service) runStartupReconcileStage(ctx context.Context, stage string, timeout time.Duration, fn func(context.Context) (map[string]int, error)) (map[string]int, error) {
+	stageCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	s.claimTrace("startup reconcile stage started", "stage", stage, "timeout_ms", durationMillis(timeout))
+	startedAt := time.Now()
+	summary, err := fn(stageCtx)
+	if err != nil {
+		s.claimTrace(
+			"startup reconcile stage failed",
+			"stage",
+			stage,
+			"duration_ms",
+			durationMillis(time.Since(startedAt)),
+			"error",
+			err,
+		)
+		return nil, err
 	}
-	for key, value := range queueSummary {
-		merged["queue_"+key] = value
+	s.claimTrace(
+		"startup reconcile stage completed",
+		"stage",
+		stage,
+		"duration_ms",
+		durationMillis(time.Since(startedAt)),
+		"summary",
+		summary,
+	)
+	return summary, nil
+}
+
+func (s *Service) enqueueTokenImportsAsync(fileNames []string, reason string) int {
+	requests := make([]tokenImportRequest, 0, len(fileNames))
+
+	s.tokenImportMu.Lock()
+	for _, fileName := range fileNames {
+		trimmed := strings.TrimSpace(fileName)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := s.tokenImportPending[trimmed]; ok {
+			continue
+		}
+		s.tokenImportPending[trimmed] = 1
+		requests = append(requests, tokenImportRequest{fileName: trimmed, reason: reason})
 	}
-	return merged
+	s.tokenImportMu.Unlock()
+
+	if len(requests) == 0 {
+		return 0
+	}
+
+	dispatchCtx, ok := s.serviceContext()
+	if !ok || dispatchCtx == nil {
+		dispatchCtx = context.Background()
+	}
+
+	s.goWorker(func() {
+		for _, request := range requests {
+			select {
+			case <-dispatchCtx.Done():
+				s.finishTokenImport(request.fileName)
+			case s.tokenImportCh <- request:
+			}
+		}
+	})
+	return len(requests)
 }
 
 func (s *Service) enqueueTokenImport(ctx context.Context, fileName string, reason string) {

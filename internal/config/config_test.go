@@ -30,6 +30,8 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 		"TOKEN_APIKEY_RATE_LIMIT_PER_MINUTE=-3\n" +
 		"TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES=16\n" +
 		"TOKEN_QUEUE_ENABLED=false\n" +
+		"TOKEN_LOG_LEVEL=TRACE\n" +
+		"TOKEN_CLAIM_TRACE=true\n" +
 		"PORT=not-a-number\n"
 
 	if err := os.WriteFile(envPath, []byte(envBody), 0o644); err != nil {
@@ -92,6 +94,12 @@ func TestLoadFromPathUsesDefaultsAndAliasFallbacks(t *testing.T) {
 	if cfg.Server.Port != 8000 {
 		t.Fatalf("unexpected port: %d", cfg.Server.Port)
 	}
+	if cfg.Logging.Level != "info" {
+		t.Fatalf("unexpected normalized log level: %q", cfg.Logging.Level)
+	}
+	if !cfg.Logging.ClaimTrace {
+		t.Fatalf("expected claim trace to be enabled from env file")
+	}
 	if _, ok := cfg.LinuxDO.AllowedIDs["12"]; !ok {
 		t.Fatalf("missing allowed id 12")
 	}
@@ -125,6 +133,8 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	t.Setenv(envTokenFilesDir, filepath.Join(dir, "process-token-dir"))
 	t.Setenv(envDBMaxIdleConns, "5")
 	t.Setenv(envQueueEnabled, "true")
+	t.Setenv(envLogLevel, "DEBUG")
+	t.Setenv(envClaimTrace, "false")
 
 	cfg, err := loadFromPath(envPath)
 	if err != nil {
@@ -148,6 +158,12 @@ func TestLoadFromPathPrefersProcessEnv(t *testing.T) {
 	}
 	if !cfg.Server.QueueEnabled {
 		t.Fatalf("expected process env to enable queue")
+	}
+	if cfg.Logging.Level != "debug" {
+		t.Fatalf("unexpected process env log level: %q", cfg.Logging.Level)
+	}
+	if cfg.Logging.ClaimTrace {
+		t.Fatalf("expected process env to disable claim trace")
 	}
 	if len(cfg.APIKeys.AdminIdentities.IDs) != 0 {
 		t.Fatalf("expected process env to replace file admin identities")

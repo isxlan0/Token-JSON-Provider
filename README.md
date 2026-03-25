@@ -65,6 +65,10 @@ TOKEN_CODEX_PROBE_RESERVE_SEC=30
 # 服务地址
 TOKEN_PROVIDER_BASE_URL=http://127.0.0.1:8000
 PORT=8000
+
+# 调试日志
+TOKEN_LOG_LEVEL=info
+TOKEN_CLAIM_TRACE=false
 ```
 
 LinuxDo OAuth2 配置步骤：
@@ -107,6 +111,61 @@ http://<服务器IP>:8000/
 3. 在页面查看额度、库存与统计
 4. 创建 API Key（只展示一次，请及时保存）
 5. 领取账号并下载 JSON
+
+## 问题排查
+
+### 1. 打开后端调试日志
+
+在 `.env` 中增加或修改：
+
+```dotenv
+TOKEN_LOG_LEVEL=debug
+TOKEN_CLAIM_TRACE=true
+```
+
+说明：
+
+- `TOKEN_LOG_LEVEL=debug`：打开更详细的服务日志
+- `TOKEN_CLAIM_TRACE=true`：额外输出领取、排队推进、SSE 推送、启动等待等全链路日志
+
+修改后重启服务，再观察服务端控制台输出。
+
+### 2. 打开前端控制台调试
+
+推荐直接在页面地址后拼接查询参数：
+
+```text
+http://127.0.0.1:8000/?claim_debug=1
+```
+
+然后打开浏览器开发者工具 Console，点击“申请账号”后会看到从按钮点击开始的完整日志，包括：
+
+- 提交领取请求
+- `/me/claim` 返回是否已受理
+- 当前 `request_id` 与 `client_tab_id`
+- `/me/queue-stream` SSE 建连、断开、重连
+- 实时队列快照与终态事件
+
+也可以在浏览器控制台手动持久开启：
+
+```js
+localStorage.setItem("token_atlas_claim_debug", "1");
+location.reload();
+```
+
+关闭方法：
+
+```js
+localStorage.removeItem("token_atlas_claim_debug");
+location.reload();
+```
+
+调试开关优先级如下：
+
+1. URL 参数 `?claim_debug=1`
+2. 浏览器 `localStorage["token_atlas_claim_debug"]`
+3. 服务端返回的 `debug` 配置
+
 
 ## 接口
 

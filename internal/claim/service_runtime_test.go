@@ -31,6 +31,13 @@ func TestServiceStartMarksReadyAfterInitialReconcile(t *testing.T) {
 	service.Start(ctx)
 
 	waitForTestCondition(t, 2*time.Second, service.isStartupReady)
+	waitForTestCondition(t, 2*time.Second, func() bool {
+		var count int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM tokens WHERE file_name = 'startup-ready.json'`).Scan(&count); err != nil {
+			t.Fatalf("count imported tokens: %v", err)
+		}
+		return count == 1
+	})
 
 	var count int
 	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM tokens WHERE file_name = 'startup-ready.json'`).Scan(&count); err != nil {

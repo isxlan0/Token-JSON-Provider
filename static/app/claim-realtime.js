@@ -2,6 +2,13 @@ const TERMINAL_STATUSES = new Set(["succeeded", "partial", "failed", "cancelled"
 const QUEUED_STATUSES = new Set(["queued", "queued_waiting", "queued_blocked"]);
 const SILENT_TERMINAL_REASON_CODES = new Set(["system_startup_reset"]);
 
+function buildPartialClaimMessage(request = {}) {
+  const granted = Math.max(0, Number(request.granted) || 0);
+  const requested = Math.max(granted, Number(request.requested) || 0);
+  const remaining = Math.max(0, Number(request.remaining) || Math.max(0, requested - granted));
+  return `成功 ${granted} 个，失败 ${remaining} 个（共处理 ${requested} 个）。`;
+}
+
 function normalizeNumber(value, fallback = 0) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -119,7 +126,7 @@ function buildToastEffect(request) {
         type: "toast",
         requestId: request.request_id,
         title: request.source === "other_session" ? "其他会话部分到账" : "申请部分完成",
-        message: request.reason_message || `已到账 ${granted} 个账号，仍有 ${request.remaining} 个未完成。`,
+        message: buildPartialClaimMessage(request),
       };
     case "failed":
       return {
@@ -207,11 +214,12 @@ export function applyClaimAcceptedState(previousState, accepted = {}, context = 
 
   const prior = previousState || createInitialClaimRealtimeState();
   const requestsById = { ...(prior.requestsById || {}) };
-  requestsById[requestId] = normalizeRequest({
+  const acceptedRequest = normalizeRequest({
     request_id: requestId,
     status: accepted.status || (accepted.queued ? "queued_waiting" : "processing"),
     requested: accepted.requested,
-    remaining: accepted.queue_remaining ?? accepted.requested,
+    granted: accepted.granted,
+    remaining: accepted.remaining ?? accepted.queue_remaining ?? accepted.requested,
     queued: accepted.queued,
     queue_id: accepted.queue_id,
     queue_position: accepted.queue_position,
@@ -219,25 +227,53 @@ export function applyClaimAcceptedState(previousState, accepted = {}, context = 
     block_reason: accepted.block_reason,
     last_progress_at: accepted.last_progress_at,
     next_retry_at: accepted.next_retry_at,
+    items: accepted.items,
+    reason_message: accepted.reason_message,
     source: "self",
     origin_tab_id: context.tabId || "",
-    terminal: false,
   });
+  if (!acceptedRequest) {
+    return {
+      state: prior,
+      requests: sortRequests(Object.values(requestsById).filter(Boolean)),
+      activeRequest: null,
+      queueRequest: null,
+      effects: [],
+    };
+  }
+  requestsById[requestId] = acceptedRequest;
   const requests = sortRequests(Object.values(requestsById).filter(Boolean));
   const activeRequest = requests.find((request) => request.request_id === requestId) || null;
   const queueRequest = activeRequest?.queued
     ? activeRequest
     : requests.find((request) => request.queued) || null;
+  const toastKeys = { ...(prior.toastKeys || {}) };
+  const effects = [];
+  if (acceptedRequest.terminal) {
+    effects.push({
+      type: "terminal",
+      requestId: acceptedRequest.request_id,
+      status: acceptedRequest.status,
+    });
+    const toastKey = `${acceptedRequest.request_id}:${acceptedRequest.status}`;
+    if (!toastKeys[toastKey] && shouldEmitToast(acceptedRequest, { ...context, activeRequestId: requestId, emitToasts: context.emitToasts !== false })) {
+      const toast = buildToastEffect(acceptedRequest);
+      if (toast) {
+        toastKeys[toastKey] = true;
+        effects.push(toast);
+      }
+    }
+  }
   return {
     state: {
       requestsById,
-      toastKeys: { ...(prior.toastKeys || {}) },
+      toastKeys,
       activeRequestId: requestId,
     },
     requests,
     activeRequest,
     queueRequest,
-    effects: [],
+    effects,
   };
 }
 

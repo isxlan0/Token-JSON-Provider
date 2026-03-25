@@ -88,6 +88,15 @@ func isQueueActiveStatus(status string) bool {
 	}
 }
 
+func isQueueTerminalStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case queueStatusSucceeded, queueStatusPartial, queueStatusFailed, queueStatusCancelled, queueStatusExpired:
+		return true
+	default:
+		return false
+	}
+}
+
 func isQueueWaitingStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case queueStatusQueued, queueStatusQueuedWaiting:
@@ -239,6 +248,47 @@ func (s *Service) updateQueueActiveState(ctx context.Context, queueID int64, sta
 			WHERE id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
 		`, normalizedStatus, nullIfEmpty(normalizedBlockReason), nextRetryArg, queueID); err != nil {
 			return false, fmt.Errorf("update queue active state %d: %w", queueID, err)
+		}
+		if err := s.normalizeActiveQueueStateTx(ctx, tx); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func (s *Service) finishActiveQueueEntry(ctx context.Context, queueID int64, status string, reason string) (bool, error) {
+	normalizedStatus := strings.ToLower(strings.TrimSpace(status))
+	if queueID <= 0 || !isQueueTerminalStatus(normalizedStatus) {
+		return false, nil
+	}
+
+	nowTS := time.Now().Unix()
+	return withTx(ctx, s.store.DB(), func(tx *sql.Tx) (bool, error) {
+		record, err := tx.ExecContext(ctx, `
+			UPDATE claim_queue
+			SET status = ?,
+			    queue_rank = 0,
+			    block_reason = NULL,
+			    next_retry_at_ts = NULL,
+			    last_progress_at_ts = ?,
+			    terminal_at_ts = ?,
+			    cancel_reason = ?,
+			    cancelled_at_ts = NULL,
+			    cancelled_by_user_id = NULL,
+			    last_error_reason = NULL,
+			    last_error_at_ts = NULL,
+			    failure_count = 0
+			WHERE id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+		`, normalizedStatus, nowTS, nowTS, nullIfEmpty(reason), queueID)
+		if err != nil {
+			return false, fmt.Errorf("finish queue row %d: %w", queueID, err)
+		}
+		affected, err := record.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read finished queue row count %d: %w", queueID, err)
+		}
+		if affected <= 0 {
+			return false, nil
 		}
 		if err := s.normalizeActiveQueueStateTx(ctx, tx); err != nil {
 			return false, err
@@ -520,12 +570,13 @@ func shouldHonorQueueRetryTimer(row userQueueEntry, nowTS int64) bool {
 		return false
 	}
 
-	// Quota-derived retry windows are deterministic hard stops. Inventory-derived
+	// API key minute-rate windows are deterministic hard stops. Inventory-derived
 	// retry hints can become stale when probe locks clear or new tokens arrive, so
 	// the queue pump must keep reassessing them instead of sleeping until the old
-	// timestamp.
+	// timestamp. Hourly quota exhaustion is converted into a terminal partial state
+	// instead of leaving the request deferred in queue.
 	switch strings.TrimSpace(row.BlockReason.String) {
-	case queueBlockReasonHourlyQuotaExhausted, queueBlockReasonAPIKeyRateLimited:
+	case queueBlockReasonAPIKeyRateLimited:
 		return true
 	default:
 		return false
@@ -533,6 +584,7 @@ func shouldHonorQueueRetryTimer(row userQueueEntry, nowTS int64) bool {
 }
 
 func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, policy inventoryPolicy) (queueAdvanceResult, error) {
+	s.claimTraceWithDB("advance queue row started", "queue_entry", claimTraceQueueEntrySummary(row))
 	validation, err := s.validateQueueEntry(ctx, row)
 	if err != nil {
 		return queueAdvanceResult{}, err
@@ -580,7 +632,31 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 	if err != nil {
 		return queueAdvanceResult{}, err
 	}
+	s.claimTraceWithDB(
+		"advance queue row assessed",
+		"queue_entry", claimTraceQueueEntrySummary(row),
+		"can_advance", assessment.CanAdvance,
+		"assessment_status", assessment.Status,
+		"block_reason", assessment.BlockReason,
+		"next_retry_at_ts", assessment.NextRetryAtTS,
+		"remaining_quota", assessment.RemainingQuota,
+		"remaining_minute", nullableInt(assessment.RemainingMinute),
+		"allowed", assessment.Allowed,
+	)
 	if !assessment.CanAdvance {
+		if strings.TrimSpace(assessment.BlockReason) == queueBlockReasonHourlyQuotaExhausted {
+			changed, finishErr := s.finishActiveQueueEntry(ctx, row.ID, queueStatusPartial, queueBlockReasonHourlyQuotaExhausted)
+			if finishErr != nil {
+				return queueAdvanceResult{}, finishErr
+			}
+			s.logQueueAdvanceAttempt(row, assessment.RemainingQuota, assessment.RemainingMinute, assessment.Allowed, 0, row.Remaining, false, false, queueBlockReasonHourlyQuotaExhausted)
+			if changed {
+				if publishErr := s.publishQueueTerminalState(ctx, row, queueStatusPartial, queueBlockReasonHourlyQuotaExhausted); publishErr != nil {
+					s.logger.Warn("publish hourly quota terminal state", "queue_id", row.ID, "user_id", row.UserID, "request_id", row.RequestID, "error", publishErr)
+				}
+			}
+			return queueAdvanceResult{Changed: changed, Terminal: changed}, nil
+		}
 		changed, updateErr := s.updateQueueActiveState(ctx, row.ID, assessment.Status, assessment.BlockReason, assessment.NextRetryAtTS)
 		if updateErr != nil {
 			return queueAdvanceResult{}, updateErr
@@ -599,6 +675,19 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 	maxGrants := minInt(assessment.Allowed, queueAdvanceMaxGrantsPerTick)
 	if maxGrants <= 0 {
 		return queueAdvanceResult{}, nil
+	}
+	if publishErr := s.publishQueueProcessingStarted(ctx, row); publishErr != nil {
+		s.logger.Warn(
+			"publish queue processing state",
+			"queue_id",
+			row.ID,
+			"user_id",
+			row.UserID,
+			"request_id",
+			row.RequestID,
+			"error",
+			publishErr,
+		)
 	}
 	s.publishAdminQueueProbeStarted(row, maxGrants)
 	rowDeadline := time.Now().Add(queueAdvanceRowTimeout)
@@ -621,6 +710,13 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 		if err != nil {
 			return queueAdvanceResult{}, err
 		}
+		s.claimTraceWithDB(
+			"advance queue allocation attempt finished",
+			"queue_entry", claimTraceQueueEntrySummary(row),
+			"remaining_budget_ms", durationMillis(remainingBudget),
+			"allocation_found", item != nil,
+			"granted_so_far", granted,
+		)
 		if item == nil {
 			reserveMiss = true
 			break
@@ -633,6 +729,24 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 		nextAssessment, assessErr := s.assessQueueAdvanceQueryer(ctx, s.store.DB(), row, policy)
 		if assessErr != nil {
 			return queueAdvanceResult{}, assessErr
+		}
+		if strings.TrimSpace(nextAssessment.BlockReason) == queueBlockReasonHourlyQuotaExhausted {
+			changed, finishErr := s.finishActiveQueueEntry(ctx, row.ID, queueStatusPartial, queueBlockReasonHourlyQuotaExhausted)
+			if finishErr != nil {
+				return queueAdvanceResult{}, finishErr
+			}
+			s.logQueueAdvanceAttempt(row, nextAssessment.RemainingQuota, nextAssessment.RemainingMinute, nextAssessment.Allowed, granted, row.Remaining, reserveHit, reserveMiss, queueBlockReasonHourlyQuotaExhausted)
+			if changed {
+				if publishErr := s.publishQueueTerminalState(ctx, row, queueStatusPartial, queueBlockReasonHourlyQuotaExhausted); publishErr != nil {
+					s.logger.Warn("publish hourly quota terminal after allocation miss", "queue_id", row.ID, "user_id", row.UserID, "request_id", row.RequestID, "error", publishErr)
+				}
+			}
+			s.claimTraceWithDB(
+				"advance queue row finished after hourly quota exhaustion",
+				"queue_entry", claimTraceQueueEntrySummary(row),
+				"remaining_quota", nextAssessment.RemainingQuota,
+			)
+			return queueAdvanceResult{Changed: changed, Terminal: changed}, nil
 		}
 		nextStatus := queueStatusQueuedWaiting
 		nextReason := ""
@@ -652,6 +766,13 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 		}
 		s.logQueueAdvanceAttempt(row, nextAssessment.RemainingQuota, nextAssessment.RemainingMinute, nextAssessment.Allowed, granted, row.Remaining, reserveHit, reserveMiss, stopReason)
 		s.publishAdminQueueBlocked(row, nextStatus, nextReason, nextRetryAtTS)
+		s.claimTraceWithDB(
+			"advance queue row blocked after allocation miss",
+			"queue_entry", claimTraceQueueEntrySummary(row),
+			"next_status", nextStatus,
+			"next_reason", nextReason,
+			"next_retry_at_ts", nextRetryAtTS,
+		)
 		return queueAdvanceResult{Changed: changed}, nil
 	}
 	completed, err := s.consumeQueueGrant(ctx, row.ID, granted)
@@ -675,8 +796,44 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 				publishErr,
 			)
 		}
+		s.claimTraceWithDB(
+			"advance queue row completed",
+			"queue_entry", claimTraceQueueEntrySummary(row),
+			"granted", granted,
+			"remaining_after", remainingAfter,
+		)
 		return queueAdvanceResult{Changed: true, Claimed: true, Terminal: true}, nil
 	} else {
+		if remainingAfter > 0 && assessment.RemainingQuota > 0 && granted >= assessment.RemainingQuota {
+			changed, finishErr := s.finishActiveQueueEntry(ctx, row.ID, queueStatusPartial, queueBlockReasonHourlyQuotaExhausted)
+			if finishErr != nil {
+				return queueAdvanceResult{}, finishErr
+			}
+			row.Remaining = remainingAfter
+			s.logQueueAdvanceAttempt(row, assessment.RemainingQuota, assessment.RemainingMinute, assessment.Allowed, granted, remainingAfter, reserveHit, reserveMiss, queueBlockReasonHourlyQuotaExhausted)
+			if changed {
+				if publishErr := s.publishQueueTerminalState(ctx, row, queueStatusPartial, queueBlockReasonHourlyQuotaExhausted); publishErr != nil {
+					s.logger.Warn(
+						"publish queue partial completion after hourly quota exhaustion",
+						"queue_id",
+						row.ID,
+						"user_id",
+						row.UserID,
+						"request_id",
+						row.RequestID,
+						"error",
+						publishErr,
+					)
+				}
+			}
+			s.claimTraceWithDB(
+				"advance queue row partially completed by hourly quota exhaustion",
+				"queue_entry", claimTraceQueueEntrySummary(row),
+				"granted", granted,
+				"remaining_after", remainingAfter,
+			)
+			return queueAdvanceResult{Changed: true, Claimed: true, Terminal: changed}, nil
+		}
 		queueTotal, totalErr := s.getTotalQueued(ctx, s.store.DB())
 		if totalErr != nil {
 			return queueAdvanceResult{}, totalErr
@@ -696,6 +853,13 @@ func (s *Service) advanceQueueRow(ctx context.Context, row userQueueEntry, polic
 				publishErr,
 			)
 		}
+		s.claimTraceWithDB(
+			"advance queue row progressed",
+			"queue_entry", claimTraceQueueEntrySummary(row),
+			"granted", granted,
+			"remaining_after", remainingAfter,
+			"queue_total", queueTotal,
+		)
 	}
 	return queueAdvanceResult{Changed: true, Claimed: true}, nil
 }

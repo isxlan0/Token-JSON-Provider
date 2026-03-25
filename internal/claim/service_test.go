@@ -362,6 +362,38 @@ func TestBootstrapCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
 	}
 }
 
+func TestBootstrapIncludesDebugSettingsPayload(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cfg.Logging.Level = "debug"
+	service.cfg.Logging.ClaimTrace = true
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "10033", "bootstrap-debug-user")
+	requestContext := &auth.RequestContext{
+		UserID: userID,
+		User: auth.UserPayload{
+			ID:         "10033",
+			Username:   "bootstrap-debug-user",
+			Name:       "bootstrap-debug-user",
+			TrustLevel: 2,
+		},
+	}
+
+	payload, err := service.GetBootstrap(ctx, requestContext)
+	if err != nil {
+		t.Fatalf("get bootstrap: %v", err)
+	}
+
+	debugPayload, ok := payload["debug"].(debugSettingsPayload)
+	if !ok {
+		t.Fatalf("unexpected bootstrap debug payload: %#v", payload["debug"])
+	}
+	if debugPayload.LogLevel != "debug" || !debugPayload.ClaimTrace {
+		t.Fatalf("unexpected bootstrap debug settings: %+v", debugPayload)
+	}
+}
+
 func TestDashboardSummaryCachesColdAndHotReads(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
@@ -410,6 +442,9 @@ func TestRuntimeSnapshotCacheRefreshesWhenUploadSnapshotChanges(t *testing.T) {
 	}
 	if first.UploadResults["batch_id"] != nil {
 		t.Fatalf("expected empty upload batch id before upload snapshot, got %#v", first.UploadResults["batch_id"])
+	}
+	if first.Debug.LogLevel != "info" || first.Debug.ClaimTrace {
+		t.Fatalf("unexpected runtime snapshot debug payload: %+v", first.Debug)
 	}
 
 	service.setUploadSnapshot(userID, uploadSnapshot{
@@ -939,6 +974,9 @@ func newClaimTestService(t *testing.T) (*Service, *database.Store) {
 			MaxFilesPerRequest: 10,
 			MaxFileSizeBytes:   10 * 1024,
 			MaxSuccessPerHour:  20,
+		},
+		Server: config.ServerConfig{
+			QueueEnabled: true,
 		},
 	}
 

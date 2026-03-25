@@ -209,18 +209,21 @@ func TestAPIClaimRoutesUseQueuedRequestLifecycle(t *testing.T) {
 		t.Fatalf("unexpected post status: %d body=%s", postRecorder.Code, postRecorder.Body.String())
 	}
 
-	var accepted claimResult
+	var accepted claimRequestAccepted
 	if err := json.Unmarshal(postRecorder.Body.Bytes(), &accepted); err != nil {
-		t.Fatalf("decode queued api claim result: %v", err)
+		t.Fatalf("decode queued api claim ack: %v", err)
 	}
 	if accepted.RequestID == "" {
 		t.Fatalf("expected request id in queued api response: %+v", accepted)
 	}
-	if !accepted.Queued || accepted.QueueStatus != queueStatusQueuedWaiting {
+	if !accepted.Queued || accepted.Status != claimStatusQueuedWaiting {
 		t.Fatalf("expected queued_waiting api ack, got %+v", accepted)
 	}
-	if accepted.Granted != 0 || len(accepted.Items) != 0 {
+	if accepted.Granted != 0 || len(accepted.Items) != 0 || accepted.Terminal {
 		t.Fatalf("api claim ack should not synchronously grant items: %+v", accepted)
+	}
+	if accepted.QueuePosition != 1 || accepted.QueueTotal != 1 {
+		t.Fatalf("expected api claim ack to include queue placement, got %+v", accepted)
 	}
 
 	getQueuedRequest := httptest.NewRequest(http.MethodGet, "/api/claims/"+accepted.RequestID, nil).WithContext(ctx)

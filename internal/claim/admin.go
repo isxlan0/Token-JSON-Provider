@@ -1101,3 +1101,10 @@ func nullableInt64(value *int64) any {
 	}
 	return *value
 }
+
+func nullableInt(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}

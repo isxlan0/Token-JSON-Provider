@@ -37,6 +37,28 @@ func (s *Service) getQueueStream(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "Authentication required.")
 	}
 
+	startedAt := time.Now()
+	clientTabID := strings.TrimSpace(c.QueryParam("client_tab_id"))
+	logQueueStreamEvent := func(message string, snapshot *claimRealtimeSnapshot, brokerVersion int, err error) {
+		if s == nil || !s.claimTraceEnabled() {
+			return
+		}
+		args := append([]any{}, claimTraceRequestContextArgs(requestContext)...)
+		args = append(args,
+			"client_tab_id", clientTabID,
+			"broker_version", brokerVersion,
+			"duration_ms", durationMillis(time.Since(startedAt)),
+		)
+		args = append(args, claimTraceEchoRequestArgs(c)...)
+		if snapshot != nil {
+			args = append(args, "snapshot", claimTraceRealtimeSnapshotSummary(*snapshot))
+		}
+		if err != nil {
+			args = append(args, "error", err)
+		}
+		s.claimTraceWithDB(message, args...)
+	}
+
 	response := c.Response()
 	response.Header().Set(echo.HeaderContentType, "text/event-stream")
 	response.Header().Set(echo.HeaderCacheControl, "no-cache")
@@ -52,28 +74,36 @@ func (s *Service) getQueueStream(c echo.Context) error {
 	subscription, lastVersion := s.claimEvents.subscribe(requestContext.UserID)
 	defer s.claimEvents.unsubscribe(subscription)
 
-	writeStatus := func() error {
+	logQueueStreamEvent("queue stream connected", nil, lastVersion, nil)
+
+	writeStatus := func(brokerVersion int) error {
 		payload, err := s.GetClaimRealtimeSnapshot(c.Request().Context(), requestContext.UserID, requestContext.SessionID)
 		if err != nil {
+			logQueueStreamEvent("queue stream snapshot load failed", nil, brokerVersion, err)
 			return err
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
+			logQueueStreamEvent("queue stream snapshot encode failed", &payload, brokerVersion, err)
 			return err
 		}
 		if _, err := response.Write([]byte("event: claim_snapshot\ndata: " + string(body) + "\n\n")); err != nil {
+			logQueueStreamEvent("queue stream snapshot write failed", &payload, brokerVersion, err)
 			return err
 		}
 		flusher.Flush()
+		logQueueStreamEvent("queue stream snapshot sent", &payload, brokerVersion, nil)
 		return nil
 	}
 
 	if _, err := response.Write([]byte("event: stream_status\ndata: {\"status\":\"ready\",\"transport\":\"sse\"}\n\n")); err != nil {
+		logQueueStreamEvent("queue stream ready event write failed", nil, lastVersion, err)
 		return nil
 	}
 	flusher.Flush()
+	logQueueStreamEvent("queue stream ready event sent", nil, lastVersion, nil)
 
-	if err := writeStatus(); err != nil {
+	if err := writeStatus(lastVersion); err != nil {
 		return err
 	}
 
@@ -87,17 +117,19 @@ func (s *Service) getQueueStream(c echo.Context) error {
 	for {
 		select {
 		case <-c.Request().Context().Done():
+			logQueueStreamEvent("queue stream disconnected", nil, lastVersion, c.Request().Context().Err())
 			return nil
 		case version := <-subscription.ch:
 			if version == lastVersion {
 				continue
 			}
 			lastVersion = version
-			if err := writeStatus(); err != nil {
+			if err := writeStatus(version); err != nil {
 				return nil
 			}
 		case <-keepAliveTicker.C:
 			if _, err := response.Write([]byte(": keepalive\n\n")); err != nil {
+				logQueueStreamEvent("queue stream keepalive failed", nil, lastVersion, err)
 				return nil
 			}
 			flusher.Flush()

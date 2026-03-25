@@ -3,6 +3,7 @@ package claim
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +17,7 @@ import (
 	"token-atlas/internal/runtimecache"
 )
 
-func TestCreateClaimRequestPublishesTerminalSnapshotWhenInventoryIsReady(t *testing.T) {
+func TestCreateClaimRequestQueuesThenPublishesTerminalSnapshotWhenInventoryIsReady(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
 	ctx := context.Background()
@@ -42,8 +43,17 @@ func TestCreateClaimRequestPublishesTerminalSnapshotWhenInventoryIsReady(t *test
 	if accepted == nil || accepted.RequestID == "" {
 		t.Fatalf("expected accepted request payload, got %+v", accepted)
 	}
-	if accepted.Queued {
-		t.Fatalf("expected ready inventory request to complete directly, got %+v", accepted)
+	if !accepted.Queued {
+		t.Fatalf("expected request acceptance to stay asynchronous, got %+v", accepted)
+	}
+	if accepted.Status != claimStatusQueuedWaiting || accepted.Terminal {
+		t.Fatalf("expected accepted ack to remain queued until queue pump runs, got %+v", accepted)
+	}
+	if accepted.Granted != 0 || accepted.Remaining != 1 || len(accepted.Items) != 0 {
+		t.Fatalf("expected accepted ack to avoid synchronous grants, got %+v", accepted)
+	}
+	if accepted.QueuePosition != 1 || accepted.QueueTotal != 1 {
+		t.Fatalf("expected accepted ack to include queue placement, got %+v", accepted)
 	}
 
 	selfSnapshot, err := service.GetClaimRealtimeSnapshot(ctx, userID, "session-self")
@@ -56,8 +66,8 @@ func TestCreateClaimRequestPublishesTerminalSnapshotWhenInventoryIsReady(t *test
 	if selfSnapshot.Requests[0].RequestID != accepted.RequestID {
 		t.Fatalf("unexpected request id in snapshot: %+v", selfSnapshot.Requests[0])
 	}
-	if selfSnapshot.Requests[0].Status != claimStatusSucceeded || !selfSnapshot.Requests[0].Terminal {
-		t.Fatalf("expected terminal success snapshot, got %+v", selfSnapshot.Requests[0])
+	if selfSnapshot.Requests[0].Status != claimStatusQueuedWaiting || selfSnapshot.Requests[0].Terminal {
+		t.Fatalf("expected queued snapshot before queue advance, got %+v", selfSnapshot.Requests[0])
 	}
 	if selfSnapshot.Requests[0].Source != claimSourceSelf {
 		t.Fatalf("expected self source for same session, got %+v", selfSnapshot.Requests[0])
@@ -73,9 +83,27 @@ func TestCreateClaimRequestPublishesTerminalSnapshotWhenInventoryIsReady(t *test
 	if otherSnapshot.Requests[0].Source != claimSourceOtherSession {
 		t.Fatalf("expected other_session source, got %+v", otherSnapshot.Requests[0])
 	}
+
+	if err := service.AdvanceQueue(ctx); err != nil {
+		t.Fatalf("advance queue: %v", err)
+	}
+
+	finalSnapshot, err := service.GetClaimRealtimeSnapshot(ctx, userID, "session-self")
+	if err != nil {
+		t.Fatalf("get final snapshot: %v", err)
+	}
+	if len(finalSnapshot.Requests) != 1 {
+		t.Fatalf("expected one realtime request after advance, got %+v", finalSnapshot.Requests)
+	}
+	if finalSnapshot.Requests[0].Status != claimStatusSucceeded || !finalSnapshot.Requests[0].Terminal {
+		t.Fatalf("expected terminal success snapshot after advance, got %+v", finalSnapshot.Requests[0])
+	}
+	if finalSnapshot.Requests[0].Queued {
+		t.Fatalf("expected final request to leave queued state, got %+v", finalSnapshot.Requests[0])
+	}
 }
 
-func TestCreateClaimRequestSkipsQueueWhenQueueDisabled(t *testing.T) {
+func TestCreateClaimRequestQueuesWhenQueueDisabled(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
 	service.cfg.Server.QueueEnabled = false
@@ -97,10 +125,13 @@ func TestCreateClaimRequestSkipsQueueWhenQueueDisabled(t *testing.T) {
 
 	accepted, err := service.CreateClaimRequest(ctx, requestContext, nil, 1, "tab-disabled")
 	if err != nil {
-		t.Fatalf("create direct claim request with queue disabled: %v", err)
+		t.Fatalf("create queued claim request with queue disabled: %v", err)
 	}
-	if accepted == nil || accepted.Queued {
-		t.Fatalf("expected direct accepted payload while queue disabled, got %+v", accepted)
+	if accepted == nil || !accepted.Queued {
+		t.Fatalf("expected accepted payload to enqueue even when direct queueing is disabled, got %+v", accepted)
+	}
+	if accepted.Status != claimStatusQueuedWaiting || accepted.Terminal {
+		t.Fatalf("expected queue-disabled accepted ack to remain queued, got %+v", accepted)
 	}
 
 	var queuedRows int
@@ -111,12 +142,24 @@ func TestCreateClaimRequestSkipsQueueWhenQueueDisabled(t *testing.T) {
 	`, userID).Scan(&queuedRows); err != nil {
 		t.Fatalf("count queued rows: %v", err)
 	}
-	if queuedRows != 0 {
-		t.Fatalf("expected queue-disabled request to avoid active queue rows, got %d", queuedRows)
+	if queuedRows != 1 {
+		t.Fatalf("expected queue-disabled request to persist one active queue row, got %d", queuedRows)
+	}
+
+	if err := service.AdvanceQueue(ctx); err != nil {
+		t.Fatalf("advance queue with queue disabled: %v", err)
+	}
+
+	finalSnapshot, err := service.GetClaimRealtimeSnapshot(ctx, userID, "session-disabled")
+	if err != nil {
+		t.Fatalf("get final snapshot with queue disabled: %v", err)
+	}
+	if len(finalSnapshot.Requests) != 1 || finalSnapshot.Requests[0].Status != claimStatusSucceeded || !finalSnapshot.Requests[0].Terminal {
+		t.Fatalf("expected queue-disabled accepted request to complete through queue pump, got %+v", finalSnapshot.Requests)
 	}
 }
 
-func TestCreateClaimRequestReturnsConflictWhenQueueDisabledAndInventoryUnavailable(t *testing.T) {
+func TestCreateClaimRequestQueuesBlockedWhenQueueDisabledAndInventoryUnavailable(t *testing.T) {
 	service, store := newClaimTestService(t)
 	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
 	service.cfg.Server.QueueEnabled = false
@@ -135,15 +178,14 @@ func TestCreateClaimRequestReturnsConflictWhenQueueDisabledAndInventoryUnavailab
 	}
 
 	accepted, err := service.CreateClaimRequest(ctx, requestContext, nil, 1, "tab-disabled-empty")
-	if err == nil {
-		t.Fatalf("expected queue-disabled request without inventory to fail, got %+v", accepted)
+	if err != nil {
+		t.Fatalf("expected blocked queued request instead of conflict, got %v", err)
 	}
-	httpErr, ok := err.(*echo.HTTPError)
-	if !ok {
-		t.Fatalf("expected echo http error, got %T %v", err, err)
+	if accepted == nil || !accepted.Queued {
+		t.Fatalf("expected blocked accepted payload, got %+v", accepted)
 	}
-	if httpErr.Code != http.StatusConflict {
-		t.Fatalf("expected conflict status, got %+v", httpErr)
+	if accepted.Status != claimStatusQueuedBlocked || accepted.BlockReason != queueBlockReasonInventoryUnavailable {
+		t.Fatalf("expected inventory-unavailable blocked ack, got %+v", accepted)
 	}
 
 	var queuedRows int
@@ -154,8 +196,179 @@ func TestCreateClaimRequestReturnsConflictWhenQueueDisabledAndInventoryUnavailab
 	`, userID).Scan(&queuedRows); err != nil {
 		t.Fatalf("count queued rows: %v", err)
 	}
-	if queuedRows != 0 {
-		t.Fatalf("expected queue-disabled failure to avoid active queue rows, got %d", queuedRows)
+	if queuedRows != 1 {
+		t.Fatalf("expected blocked request to keep one active queue row, got %d", queuedRows)
+	}
+}
+
+func TestCreateClaimRequestReturnsTerminalPartialWhenHourlyQuotaIsExhausted(t *testing.T) {
+	service, store := newClaimTestService(t)
+	service.cache = runtimecache.New(context.Background(), config.CacheConfig{Backend: "memory"}, nil)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "40121", "realtime-hourly-partial-user")
+	tokenID := insertTestToken(t, store, "realtime-hourly-partial.json", `{"access_token":"realtime-hourly-partial","refresh_token":"realtime-hourly-partial-r","account_id":"acct-realtime-hourly-partial"}`, 0, 1)
+	earliestClaimTS := time.Now().Add(-30 * time.Minute).Unix()
+	for index := 0; index < service.cfg.Inventory.Limits.Healthy.Hourly; index++ {
+		insertTestClaimRecord(t, store, tokenID, userID, nil, earliestClaimTS+int64(index), fmt.Sprintf("hourly-seed-%d", index))
+	}
+
+	requestContext := &auth.RequestContext{
+		UserID:    userID,
+		SessionID: "session-hourly-partial",
+		User: auth.UserPayload{
+			ID:         "40121",
+			Username:   "realtime-hourly-partial-user",
+			Name:       "realtime-hourly-partial-user",
+			TrustLevel: 2,
+		},
+	}
+
+	accepted, err := service.CreateClaimRequest(ctx, requestContext, nil, 6, "tab-hourly-partial")
+	if err != nil {
+		t.Fatalf("create hourly exhausted claim request: %v", err)
+	}
+	if accepted == nil {
+		t.Fatal("expected accepted response for exhausted hourly quota request")
+	}
+	if accepted.Queued || !accepted.Terminal {
+		t.Fatalf("expected hourly exhausted request to finish immediately, got %+v", accepted)
+	}
+	if accepted.Status != claimStatusPartial {
+		t.Fatalf("expected hourly exhausted request to be partial, got %+v", accepted)
+	}
+	if accepted.Granted != 0 || accepted.Remaining != accepted.Requested || accepted.Requested != 6 {
+		t.Fatalf("unexpected accepted counts for hourly exhausted request: %+v", accepted)
+	}
+	if !strings.Contains(accepted.ReasonMessage, "额度已用尽") {
+		t.Fatalf("expected quota exhaustion reason message, got %+v", accepted)
+	}
+
+	var activeRows int
+	if err := store.DB().QueryRow(`
+		SELECT COUNT(*)
+		FROM claim_queue
+		WHERE user_id = ? AND status IN ('queued', 'queued_waiting', 'queued_blocked') AND remaining > 0
+	`, userID).Scan(&activeRows); err != nil {
+		t.Fatalf("count active queue rows: %v", err)
+	}
+	if activeRows != 0 {
+		t.Fatalf("expected no active queue rows for exhausted hourly quota request, got %d", activeRows)
+	}
+
+	var (
+		status       string
+		remaining    int
+		cancelReason sql.NullString
+	)
+	if err := store.DB().QueryRow(`
+		SELECT status, remaining, cancel_reason
+		FROM claim_queue
+		WHERE user_id = ? AND request_id = ?
+	`, userID, accepted.RequestID).Scan(&status, &remaining, &cancelReason); err != nil {
+		t.Fatalf("load terminal claim ledger row: %v", err)
+	}
+	if status != queueStatusPartial || remaining != 6 {
+		t.Fatalf("unexpected terminal claim ledger row: status=%q remaining=%d", status, remaining)
+	}
+	if !cancelReason.Valid || cancelReason.String != queueBlockReasonHourlyQuotaExhausted {
+		t.Fatalf("unexpected terminal reason for exhausted hourly quota request: %+v", cancelReason)
+	}
+
+	snapshot, err := service.GetClaimRealtimeSnapshot(ctx, userID, requestContext.SessionID)
+	if err != nil {
+		t.Fatalf("get realtime snapshot for hourly exhausted request: %v", err)
+	}
+	var request *claimRealtimeRequest
+	for index := range snapshot.Requests {
+		if snapshot.Requests[index].RequestID == accepted.RequestID {
+			request = &snapshot.Requests[index]
+			break
+		}
+	}
+	if request == nil {
+		t.Fatalf("expected realtime snapshot to include hourly exhausted request %q, got %+v", accepted.RequestID, snapshot.Requests)
+	}
+	if request.Status != claimStatusPartial || request.Queued || !request.Terminal {
+		t.Fatalf("unexpected realtime request for hourly exhausted claim: %+v", request)
+	}
+	if request.Granted != 0 || request.Remaining != 6 {
+		t.Fatalf("unexpected realtime counts for hourly exhausted claim: %+v", request)
+	}
+	if request.ReasonCode != queueBlockReasonHourlyQuotaExhausted {
+		t.Fatalf("unexpected realtime reason code for hourly exhausted claim: %+v", request)
+	}
+}
+
+func TestClaimTokensQueuesLargeDirectRequestToAvoidBlockingResponse(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "4013", "queued-large-direct-user")
+	for index := 0; index < directClaimSyncMaxCount+2; index++ {
+		insertTestToken(
+			t,
+			store,
+			fmt.Sprintf("bulk-%d.json", index),
+			fmt.Sprintf(`{"access_token":"bulk-%d","refresh_token":"bulk-%d-r","account_id":"acct-bulk-%d"}`, index, index, index),
+			0,
+			1,
+		)
+	}
+
+	result, err := service.ClaimTokens(ctx, userID, nil, directClaimSyncMaxCount+2)
+	if err != nil {
+		t.Fatalf("claim large direct batch: %v", err)
+	}
+	if !result.Queued {
+		t.Fatalf("expected large batch request to be queued for async processing, got %+v", result)
+	}
+	if result.Requested != directClaimSyncMaxCount+2 {
+		t.Fatalf("unexpected requested count in queued large batch: %+v", result)
+	}
+	if result.QueueID <= 0 {
+		t.Fatalf("expected queued large batch to have queue id, got %+v", result)
+	}
+}
+
+func TestClaimTokensQueuesLargeOriginalRequestEvenWhenQuotaClampLowersTarget(t *testing.T) {
+	service, store := newClaimTestService(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, store, "4014", "queued-large-clamped-user")
+	seedTokenID := insertTestToken(
+		t,
+		store,
+		"clamped-seed.json",
+		`{"access_token":"clamped-seed","refresh_token":"clamped-seed-r","account_id":"acct-clamped-seed"}`,
+		0,
+		100,
+	)
+	for index := 0; index < 4; index++ {
+		insertTestToken(
+			t,
+			store,
+			fmt.Sprintf("clamped-%d.json", index),
+			fmt.Sprintf(`{"access_token":"clamped-%d","refresh_token":"clamped-%d-r","account_id":"acct-clamped-%d"}`, index, index, index),
+			0,
+			1,
+		)
+	}
+
+	for index := 0; index < 26; index++ {
+		requestID := fmt.Sprintf("seed-claim-%d", index)
+		insertTestClaimRecord(t, store, seedTokenID, userID, nil, time.Now().Add(-5*time.Minute).Unix(), requestID)
+	}
+
+	result, err := service.ClaimTokens(ctx, userID, nil, 5)
+	if err != nil {
+		t.Fatalf("claim clamped large batch: %v", err)
+	}
+	if !result.Queued {
+		t.Fatalf("expected clamped large request to be queued, got %+v", result)
+	}
+	if result.Requested != 4 {
+		t.Fatalf("expected queued request to honor remaining quota 4, got %+v", result)
 	}
 }
 
@@ -182,6 +395,9 @@ func TestCreateClaimRequestSnapshotRebuildsFromTerminalClaimQueueLedger(t *testi
 	if err != nil {
 		t.Fatalf("create direct claim request: %v", err)
 	}
+	if err := service.AdvanceQueue(ctx); err != nil {
+		t.Fatalf("advance queue for terminal ledger rebuild: %v", err)
+	}
 
 	var (
 		status          string
@@ -196,7 +412,7 @@ func TestCreateClaimRequestSnapshotRebuildsFromTerminalClaimQueueLedger(t *testi
 		t.Fatalf("load persisted claim request row: %v", err)
 	}
 	if status != queueStatusSucceeded {
-		t.Fatalf("expected accepted request to persist as succeeded, got %q", status)
+		t.Fatalf("expected accepted request to persist as succeeded after queue advance, got %q", status)
 	}
 	if !originSessionID.Valid || originSessionID.String != "session-ledger" {
 		t.Fatalf("unexpected persisted origin session: %+v", originSessionID)

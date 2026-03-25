@@ -55,6 +55,8 @@ const (
 	envUploadMaxFileSize        = "TOKEN_UPLOAD_MAX_FILE_SIZE_BYTES"
 	envUploadMaxSuccessPerHour  = "TOKEN_UPLOAD_MAX_SUCCESS_PER_HOUR"
 	envQueueEnabled             = "TOKEN_QUEUE_ENABLED"
+	envLogLevel                 = "TOKEN_LOG_LEVEL"
+	envClaimTrace               = "TOKEN_CLAIM_TRACE"
 	envPort                     = "PORT"
 
 	defaultNonHealthyScope = "all_unfinished"
@@ -105,6 +107,8 @@ var knownEnvKeys = []string{
 	envUploadMaxFileSize,
 	envUploadMaxSuccessPerHour,
 	envQueueEnabled,
+	envLogLevel,
+	envClaimTrace,
 	envPort,
 }
 
@@ -119,6 +123,7 @@ type Config struct {
 	Probe     ProbeConfig
 	Upload    UploadConfig
 	Server    ServerConfig
+	Logging   LoggingConfig
 }
 
 type SessionConfig struct {
@@ -208,6 +213,11 @@ type ServerConfig struct {
 	ProviderBaseURL string
 	QueueEnabled    bool
 	Port            int
+}
+
+type LoggingConfig struct {
+	Level      string
+	ClaimTrace bool
 }
 
 type envSource struct {
@@ -309,9 +319,22 @@ func loadFromPath(path string) (Config, error) {
 			QueueEnabled:    source.cleanedBool(envQueueEnabled, true),
 			Port:            source.cleanedInt(envPort, 8000),
 		},
+		Logging: LoggingConfig{
+			Level:      normalizeLogLevel(source.cleanedString(envLogLevel, "info")),
+			ClaimTrace: source.cleanedBool(envClaimTrace, false),
+		},
 	}
 
 	return cfg, nil
+}
+
+func normalizeLogLevel(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "debug", "info", "warn", "error":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "info"
+	}
 }
 
 func (s envSource) lookup(name string) (string, bool) {
