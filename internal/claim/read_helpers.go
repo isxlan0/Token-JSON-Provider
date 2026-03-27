@@ -150,6 +150,7 @@ func loadCachedReadResult[T any](
 	s *Service,
 	primaryKey string,
 	staleKey string,
+	aliasKey string,
 	ttlSec int,
 	loader func(context.Context) (T, error),
 ) (cachedReadResult[T], error) {
@@ -194,6 +195,13 @@ func loadCachedReadResult[T any](
 			}
 		}
 		return result, err
+	}
+	if s.cache != nil && strings.TrimSpace(aliasKey) != "" && strings.TrimSpace(primaryKey) != "" {
+		previousKey, _ := s.cache.GetText(aliasKey)
+		s.cache.SetText(aliasKey, primaryKey, ttlSec)
+		if previousKey != "" && previousKey != primaryKey {
+			s.cache.Delete(previousKey)
+		}
 	}
 
 	if cacheState == runtimecache.CacheStateMiss {

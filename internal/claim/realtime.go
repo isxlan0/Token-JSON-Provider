@@ -300,6 +300,7 @@ func (s *Service) setClaimRealtimeSnapshot(userID int64, payload claimRealtimeSn
 	}
 
 	key := s.userClaimRealtimeCacheKey(userID)
+	previousKey := key
 	var previous claimRealtimeSnapshot
 	hadPrevious := s.cache.GetJSON(key, &previous)
 	changed := !hadPrevious || !reflect.DeepEqual(previous.Requests, payload.Requests) || previous.StreamRequired != payload.StreamRequired || previous.Transport != payload.Transport
@@ -308,6 +309,9 @@ func (s *Service) setClaimRealtimeSnapshot(userID int64, payload claimRealtimeSn
 		key = s.userClaimRealtimeCacheKey(userID)
 	}
 	s.cache.SetJSON(key, payload, s.claimRealtimeTTL())
+	if changed && hadPrevious && previousKey != key {
+		s.cache.Delete(previousKey)
+	}
 	if changed && s.claimEvents != nil {
 		s.claimEvents.notify(userID)
 	}

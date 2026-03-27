@@ -80,6 +80,7 @@ func (s *Service) GetDashboardSummaryWithOptions(ctx context.Context, userID int
 		s,
 		s.dashboardSummaryCacheKey(userID, options),
 		s.dashboardSummaryStaleCacheKey(userID, options),
+		s.dashboardSummaryAliasKey(userID, options),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) (map[string]any, error) {
 			var (
@@ -411,6 +412,7 @@ func (s *Service) getLeaderboardObserved(ctx context.Context, windowSeconds int,
 		s,
 		s.dashboardCacheKey("dashboard-leaderboard", nil, windowSeconds, limit),
 		s.dashboardStaleCacheKey("dashboard-leaderboard", nil, windowSeconds, limit),
+		s.dashboardSectionAliasKey("dashboard-leaderboard", nil, windowSeconds, limit),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) (map[string]any, error) {
 			return s.loadLeaderboard(loadCtx, windowSeconds, limit)
@@ -476,6 +478,7 @@ func (s *Service) getRecentClaimsObserved(ctx context.Context, limit int) (cache
 		s,
 		s.dashboardCacheKey("dashboard-recent", nil, limit),
 		s.dashboardStaleCacheKey("dashboard-recent", nil, limit),
+		s.dashboardSectionAliasKey("dashboard-recent", nil, limit),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) ([]map[string]any, error) {
 			return s.loadRecentClaims(loadCtx, limit)
@@ -536,6 +539,7 @@ func (s *Service) getContributorLeaderboardObserved(ctx context.Context, limit i
 		s,
 		s.dashboardCacheKey("dashboard-contributors", nil, limit),
 		s.dashboardStaleCacheKey("dashboard-contributors", nil, limit),
+		s.dashboardSectionAliasKey("dashboard-contributors", nil, limit),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) ([]map[string]any, error) {
 			return s.loadContributorLeaderboard(loadCtx, limit)
@@ -604,6 +608,7 @@ func (s *Service) getRecentContributorsObserved(ctx context.Context, limit int) 
 		s,
 		s.dashboardCacheKey("dashboard-recent-contributors", nil, limit),
 		s.dashboardStaleCacheKey("dashboard-recent-contributors", nil, limit),
+		s.dashboardSectionAliasKey("dashboard-recent-contributors", nil, limit),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) ([]map[string]any, error) {
 			return s.loadRecentContributors(loadCtx, limit)
@@ -663,6 +668,7 @@ func (s *Service) getClaimTrendsObserved(ctx context.Context, windowSeconds int,
 		s,
 		s.dashboardCacheKey("dashboard-trends", nil, windowSeconds, bucketSeconds),
 		s.dashboardStaleCacheKey("dashboard-trends", nil, windowSeconds, bucketSeconds),
+		s.dashboardSectionAliasKey("dashboard-trends", nil, windowSeconds, bucketSeconds),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) ([]map[string]any, error) {
 			return s.loadClaimTrends(loadCtx, windowSeconds, bucketSeconds)

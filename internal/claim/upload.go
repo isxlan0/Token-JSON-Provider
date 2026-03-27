@@ -1334,6 +1334,7 @@ func (s *Service) persistUploadSnapshotLocked(userID int64) {
 	payload := snapshot.payload()
 	if s.cache != nil {
 		key := s.userUploadResultsCacheKey(userID)
+		previousKey := key
 		var previous map[string]any
 		changed := !s.cache.GetJSON(key, &previous) || !reflect.DeepEqual(previous, payload)
 		if changed {
@@ -1341,6 +1342,9 @@ func (s *Service) persistUploadSnapshotLocked(userID int64) {
 			key = s.userUploadResultsCacheKey(userID)
 		}
 		s.cache.SetJSON(key, payload, s.uploadResultsTTL())
+		if changed && previousKey != key {
+			s.cache.Delete(previousKey)
+		}
 	}
 	if s.uploadEvents != nil {
 		s.uploadEvents.notify(userID)

@@ -24,14 +24,22 @@ func (s *Service) snapshotCacheKey(prefix string, parts ...any) string {
 	return runtimecache.BuildSnapshotCacheKey(prefix, parts...)
 }
 
+func cacheAliasKey(stableKey string) string {
+	return runtimecache.BuildCacheKey("cache-alias", stableKey)
+}
+
+func stableDashboardCacheKey(prefix string, userID *int64, parts ...any) string {
+	arguments := make([]any, 0, len(parts)+1)
+	if userID != nil {
+		arguments = append(arguments, *userID)
+	}
+	arguments = append(arguments, parts...)
+	return runtimecache.BuildCacheKey(prefix, arguments...)
+}
+
 func (s *Service) dashboardCacheKey(prefix string, userID *int64, parts ...any) string {
 	if s.cache == nil {
-		arguments := make([]any, 0, len(parts)+1)
-		if userID != nil {
-			arguments = append(arguments, *userID)
-		}
-		arguments = append(arguments, parts...)
-		return runtimecache.BuildCacheKey(prefix, arguments...)
+		return stableDashboardCacheKey(prefix, userID, parts...)
 	}
 
 	dashboardVersion := s.cache.ScopeVersion(prefix)
@@ -88,6 +96,27 @@ func (s *Service) dashboardSummaryStaleCacheKey(userID int64, options dashboardS
 		normalized.ContributorLimit,
 		normalized.RecentContributorLimit,
 	)
+}
+
+func (s *Service) dashboardSummaryAliasKey(userID int64, options dashboardSummaryOptions) string {
+	normalized := normalizeDashboardSummaryOptions(options)
+	return cacheAliasKey(
+		s.snapshotCacheKey(
+			"dashboard-summary",
+			userID,
+			normalized.WindowSeconds,
+			normalized.BucketSeconds,
+			normalized.LeaderboardWindow,
+			normalized.LeaderboardLimit,
+			normalized.RecentLimit,
+			normalized.ContributorLimit,
+			normalized.RecentContributorLimit,
+		),
+	)
+}
+
+func (s *Service) dashboardSectionAliasKey(prefix string, userID *int64, parts ...any) string {
+	return cacheAliasKey(stableDashboardCacheKey(prefix, userID, parts...))
 }
 
 func (s *Service) adminCacheKey(prefix string, parts ...any) string {
@@ -147,6 +176,10 @@ func (s *Service) userRuntimeSnapshotCacheKey(userID int64) string {
 		fmt.Sprintf("urv%d", s.cacheScopeVersion("user-upload-results", userID)),
 		fmt.Sprintf("ipv%d", s.inventoryPolicyScopeVersion()),
 	)
+}
+
+func (s *Service) userRuntimeSnapshotAliasKey(userID int64) string {
+	return cacheAliasKey(s.snapshotCacheKey("user-runtime-snapshot", userID))
 }
 
 func (s *Service) userRuntimeSnapshotStaleCacheKey(userID int64) string {
@@ -256,6 +289,7 @@ func (s *Service) invalidateUserQueueCache(userID int64) {
 	if s.cache == nil {
 		return
 	}
+	s.cache.Delete(s.userQueueCacheKey(userID))
 	s.cache.BumpScope("user-queue", userID)
 }
 
@@ -270,6 +304,7 @@ func (s *Service) invalidateUserUploadResultsCache(userID int64) {
 	if s.cache == nil {
 		return
 	}
+	s.cache.Delete(s.userUploadResultsCacheKey(userID))
 	s.cache.BumpScope("user-upload-results", userID)
 }
 
@@ -589,6 +624,7 @@ func (s *Service) setQueueStatusSnapshot(userID int64, payload queueStatusPayloa
 	payload = withQueueStatusMetadata(payload, dataSourceLive, payload.GeneratedAt, "", "", false)
 
 	key := s.userQueueCacheKey(userID)
+	previousKey := key
 	var previous queueStatusPayload
 	hadPrevious := s.cache.GetJSON(key, &previous)
 	changed := !hadPrevious || !reflect.DeepEqual(previous, payload)
@@ -597,6 +633,9 @@ func (s *Service) setQueueStatusSnapshot(userID int64, payload queueStatusPayloa
 		key = s.userQueueCacheKey(userID)
 	}
 	s.cache.SetJSON(key, payload, s.queueSnapshotTTL())
+	if changed && hadPrevious && previousKey != key {
+		s.cache.Delete(previousKey)
+	}
 	s.cache.SetJSON(s.userQueueStaleCacheKey(userID), payload, s.queueSnapshotTTL())
 	if changed {
 		s.queueEvents.notify(userID)

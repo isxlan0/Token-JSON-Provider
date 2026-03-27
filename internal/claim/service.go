@@ -1209,6 +1209,7 @@ func (s *Service) GetRuntimeSnapshot(ctx context.Context, userID int64) (runtime
 		s,
 		s.userRuntimeSnapshotCacheKey(userID),
 		s.userRuntimeSnapshotStaleCacheKey(userID),
+		s.userRuntimeSnapshotAliasKey(userID),
 		s.cfg.Cache.MeTTL,
 		func(loadCtx context.Context) (runtimeSnapshotPayload, error) {
 			quotaStage := startObservedReadStage(loadCtx)
@@ -1808,6 +1809,7 @@ func (s *Service) getSystemStatusObserved(ctx context.Context) (cachedReadResult
 		s,
 		s.dashboardCacheKey("dashboard-system", nil),
 		s.dashboardStaleCacheKey("dashboard-system", nil),
+		s.dashboardSectionAliasKey("dashboard-system", nil),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) (map[string]any, error) {
 			return s.loadSystemStatus(loadCtx)
@@ -1870,6 +1872,7 @@ func (s *Service) getDashboardStatsObserved(ctx context.Context, userID int64) (
 		s,
 		s.dashboardCacheKey("dashboard-stats", &userID),
 		s.dashboardStaleCacheKey("dashboard-stats", &userID),
+		s.dashboardSectionAliasKey("dashboard-stats", &userID),
 		s.cfg.Cache.DashboardTTL,
 		func(loadCtx context.Context) (map[string]int, error) {
 			return s.loadDashboardStats(loadCtx, userID)
