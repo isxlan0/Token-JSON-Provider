@@ -956,7 +956,8 @@ func normalizeUploadContent(payload any) (map[string]any, error) {
 		candidate = storage
 	}
 
-	required := []string{"access_token", "refresh_token", "account_id"}
+	// refresh_token 不再强制要求，有则保留，无则跳过
+	required := []string{"access_token", "account_id"}
 	normalized := make(map[string]any, len(candidate))
 	for key, value := range candidate {
 		normalized[key] = value
